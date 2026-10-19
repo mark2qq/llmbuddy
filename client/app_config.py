@@ -44,7 +44,7 @@ CLIENT_DIR = _base_dir()
 
 # 产品名与版本号（窗口标题 / 导航标题 / 托盘提示统一取用）
 APP_NAME = "llmBuddy"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.5"
 APP_TITLE = f"{APP_NAME}  v{APP_VERSION}"
 
 
@@ -126,7 +126,10 @@ class Config:
     models_dir: str = DEFAULT_MODELS_DIR
 
     # 加载参数
-    n_ctx: int = 8192
+    # n_ctx 默认 32768：WorkBuddy 等 Agent 客户端单次请求（系统提示 + 上百个工具
+    # 定义 + 历史）常达 3 万 tokens，8192 会直接触发引擎「exceeds context size」。
+    # 7B 模型 32k 上下文 KV 缓存约 1.8GB，16GB 内存机器可承受。
+    n_ctx: int = 32768
     n_threads: int = 0                     # 0 表示使用 os.cpu_count()
     n_gpu_layers: int = 0
 
@@ -180,6 +183,22 @@ class Config:
             cfg = Config()
         # 运行时始终填充安装路径
         cfg.install_path = CLIENT_DIR
+        # 自愈：安装目录迁移/重装后，配置里保存的绝对路径可能指向旧位置。
+        # 历史现象：换了安装目录（LLMDesktop -> llmBuddy）后 engine_exe 失效，
+        # 引擎进程起不来，加载模型报 1003 engine error 且引擎日志 0 字节。
+        # 这里在路径不存在时回退到「按当前安装目录解析出的默认值」并回写。
+        healed = False
+        if not cfg.engine_exe or not os.path.exists(cfg.engine_exe):
+            cfg.engine_exe = DEFAULT_ENGINE_EXE
+            healed = True
+        if not cfg.python_exe or not os.path.exists(cfg.python_exe):
+            cfg.python_exe = DEFAULT_PYTHON_EXE
+            healed = True
+        if healed and os.path.exists(target):
+            try:
+                cfg.save(target)
+            except Exception:
+                pass
         # n_threads 为 0 时按 CPU 逻辑核数
         if not cfg.n_threads or cfg.n_threads < 1:
             cfg.n_threads = os.cpu_count() or 8

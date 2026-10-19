@@ -27,6 +27,9 @@ from core.config import KEYS_PATH
 # ---------------------------------------------------------------------------
 TEST_PORT = 8011
 TEST_ENGINE_PORT = 8019
+# 测试专属引擎端口区间：测试自身从 8019 起 +2 递增分配，最多 1~2 个模型，故 8019~8029。
+# 8030 以上留给手工 E2E / 其他 teammate 的实例，绝不误杀（2026-10-19 修复）。
+TEST_ENGINE_PORT_MAX = 8029
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # E:/llm-service
 BASE_URL = f"http://127.0.0.1:{TEST_PORT}"
 
@@ -95,24 +98,24 @@ def server():
 
 
 def _kill_engines() -> None:
-    """终止所有游离的 llama-server.exe（引擎子进程可能脱离 uvicorn 树存活，占用大量内存）。"""
+    """终止测试区间（8019~8029，见 helpers.TEST_ENGINE_PORT_MAX）内游离的 llama-server.exe。
+
+    ⚠️ 2026-10-19 修正：旧实现按映像名 `taskkill /IM llama-server.exe` 全杀，
+    会连带杀掉用户正在使用的安装版引擎（7999）和其他并行任务的实例，污染回归结论。
+    现在只按命令行 `--port` 落在测试区间、且父进程已消失（orphan）来匹配。
+    注：8030 以上属手工 E2E/其他会话的端口段，刻意不清理。
+    """
     try:
-        import psutil
-        for p in psutil.process_iter(["pid", "name"]):
+        from helpers import iter_test_engines
+        # 只清「父进程已消失」的游离引擎：正在跑的其它测试会话/手工 E2E 不受影响
+        for p in list(iter_test_engines(orphans_only=True)):
             try:
-                name = (p.info.get("name") or "").lower()
-                if "llama-server.exe" in name:
-                    p.kill()
+                p.kill()
             except Exception:
                 pass
     except Exception:
-        # psutil 不可用时回退到 taskkill（用 /IM 按映像名杀，避免解析编码问题）
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10, shell=True)
-        except Exception:
-            pass
+        # psutil 不可用时保守处理：不再按映像名全杀（宁可残留也不误杀用户引擎）
+        pass
 
 
 def _terminate(proc: subprocess.Popen) -> None:

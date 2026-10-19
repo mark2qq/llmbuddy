@@ -13,6 +13,7 @@ API Key 按模型绑定测试（test_keys.py）。
 所有测试结束后由 _restore_keys 把 cache/keys.json 还原为测试前状态
 （默认不存在则删除），不影响后续测试模块。
 """
+import json
 import os
 import time
 

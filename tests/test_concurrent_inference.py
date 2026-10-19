@@ -81,23 +81,19 @@ def _start_server() -> subprocess.Popen:
 
 
 def _kill_engines() -> None:
-    """终止所有游离的 llama-server.exe（引擎子进程可能脱离 uvicorn 树存活）。"""
+    """终止测试区间（8019~8099）内游离的 llama-server.exe。
+
+    与 conftest._kill_engines 一致：不再按映像名全杀，避免误杀用户安装版引擎（7999）。
+    """
     try:
-        import psutil
-        for p in psutil.process_iter(["pid", "name"]):
+        from helpers import iter_test_engines
+        for p in list(iter_test_engines()):
             try:
-                name = (p.info.get("name") or "").lower()
-                if "llama-server.exe" in name:
-                    p.kill()
+                p.kill()
             except Exception:
                 pass
     except Exception:
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10, shell=True)
-        except Exception:
-            pass
+        pass
 
 
 def _terminate(proc: subprocess.Popen) -> None:

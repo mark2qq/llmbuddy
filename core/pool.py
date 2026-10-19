@@ -291,7 +291,7 @@ class ModelPool:
             port = self.alloc_port()
 
         # 3) 引擎参数默认值
-        n_ctx = n_ctx or int(os.environ.get("LLM_N_CTX", "8192"))
+        n_ctx = n_ctx or int(os.environ.get("LLM_N_CTX", "32768"))
         n_threads = n_threads or int(os.environ.get("LLM_N_THREADS", str(os.cpu_count() or 8)))
         n_gpu_layers = n_gpu_layers if n_gpu_layers is not None \
             else int(os.environ.get("LLM_N_GPU_LAYERS", "0"))
