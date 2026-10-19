@@ -1,0 +1,452 @@
+/* -*- coding: utf-8 -*- */
+/*
+ * 现代深色主题（styles.qss）
+ * 参考豆包 / workbuddy / codex 观感：深背景 + 蓝紫渐变强调色 + 圆角卡片。
+ * 主色 #6c8cff，背景 #0f1117，卡片 #1a1d27。
+ */
+QWidget {
+    background-color: #0f1117;
+    color: #d7dbe5;
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    font-size: 13px;
+}
+
+/* ---------------- 主窗口 / 面板 ---------------- */
+QMainWindow {
+    background-color: #0f1117;
+}
+
+#NavPanel {
+    background-color: #14161f;
+    border-right: 1px solid #232734;
+}
+
+#NavTitle {
+    background: transparent;
+    color: #aeb6c8;
+    font-size: 13px;
+    font-weight: 600;
+    border: none;
+}
+
+#NavButton {
+    background-color: transparent;
+    color: #c2c8d6;
+    border: none;
+    border-left: 3px solid transparent;
+    text-align: left;
+    padding-left: 18px;
+    border-radius: 0;
+}
+
+#NavButton:hover {
+    background-color: #1d2230;
+    color: #ffffff;
+}
+
+#NavButton:checked {
+    background-color: #20263a;
+    color: #ffffff;
+    border-left: 3px solid #6c8cff;
+}
+
+/* ---------------- 卡片 ---------------- */
+QGroupBox#Card {
+    background-color: #1a1d27;
+    border: 1px solid #262b3a;
+    border-radius: 12px;
+    margin-top: 12px;
+    padding: 14px;
+}
+
+QGroupBox#Card::title {
+    subcontrol-origin: margin;
+    left: 14px;
+    padding: 0 6px;
+    color: #9aa3b8;
+    font-weight: 600;
+}
+
+/* ---------------- 按钮 ---------------- */
+QPushButton {
+    background-color: #262b3a;
+    color: #e6e9f2;
+    border: 1px solid #323849;
+    border-radius: 8px;
+    padding: 7px 14px;
+}
+
+QPushButton:hover {
+    background-color: #2f3548;
+    border-color: #3d4456;
+}
+
+QPushButton:pressed {
+    background-color: #20242f;
+}
+
+QPushButton:disabled {
+    background-color: #1b1e29;
+    color: #5b6275;
+    border-color: #232734;
+}
+
+#PrimaryBtn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #6c8cff, stop:1 #8a6cff);
+    color: #ffffff;
+    border: none;
+    font-weight: 600;
+}
+
+#PrimaryBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #7d9bff, stop:1 #9a7dff);
+}
+
+#DangerBtn {
+    background-color: #3a2230;
+    border: 1px solid #5a2f44;
+    color: #ff9bb3;
+}
+
+#DangerBtn:hover {
+    background-color: #4a2a3b;
+}
+
+#DownloadBtn {
+    background-color: transparent;
+    color: #8b9bff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    min-height: 24px;
+    max-height: 30px;
+}
+
+#DownloadBtn:hover {
+    background-color: rgba(124, 140, 255, 0.14);
+    color: #aeb9ff;
+}
+
+#DownloadBtn:pressed {
+    background-color: rgba(124, 140, 255, 0.22);
+}
+
+/* 模型库操作列紧凑按钮（删除 / 重新下载） */
+#CellBtn {
+    background-color: transparent;
+    color: #c9d0e0;
+    border: 1px solid #323849;
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 12px;
+    min-height: 22px;
+    max-height: 26px;
+}
+#CellBtn:hover { background-color: #262b3a; border-color: #3d4456; }
+#LocalBadge {
+    background-color: rgba(61, 220, 132, 0.12); color: #3ddc84;
+    border: 1px solid rgba(61, 220, 132, 0.35); border-radius: 10px;
+    padding: 2px 12px; font-size: 12px; font-weight: 600;
+}
+#TinyBtn { padding: 2px 12px; font-size: 12px; min-height: 20px; max-height: 24px; border-radius: 6px; }
+#TinyDangerBtn { padding: 2px 12px; font-size: 12px; min-height: 20px; max-height: 24px; border-radius: 6px;
+    background-color: #3a2230; border: 1px solid #5a2f44; color: #ff9bb3; }
+#TinyDangerBtn:hover { background-color: #4a2a3b; }
+
+/* 对话页：底部「+ 模型」按钮 + 当前模型标签（参考豆包） */
+#ModelAddBtn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #6c8cff, stop:1 #8a6cff);
+    color: #ffffff;
+    border: none;
+    border-radius: 7px;
+    padding: 5px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    min-height: 26px;
+    max-height: 30px;
+}
+#ModelAddBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #7d9bff, stop:1 #9a7dff);
+}
+
+/* 对话页：底部模型下拉按钮（WorkBuddy 式）+ 圆形发送/停止按钮 */
+#ModelDropBtn {
+    background-color: #232734;
+    color: #c9d0e0;
+    border: 1px solid #323849;
+    border-radius: 7px;
+    padding: 5px 12px;
+    font-size: 13px;
+    min-height: 26px;
+    max-height: 30px;
+    text-align: left;
+}
+#ModelDropBtn:hover { background-color: #2d3242; border-color: #3d4456; }
+#SendCircleBtn {
+    background-color: #2f3b66;
+    border: none;
+    border-radius: 20px;
+}
+#SendCircleBtn:hover { background-color: #3a4a7d; }
+#SendCircleBtn:pressed { background-color: #26305a; }
+#ModelChip {
+    background-color: #181b26;
+    border: 1px solid #262b3a;
+    border-radius: 7px;
+    color: #c9d0e0;
+    padding: 4px 12px;
+    font-size: 13px;
+    min-height: 24px;
+}
+
+/* 对话页「+ 模型」选择面板（参考 WorkBuddy：深色圆角面板、条目悬浮高亮、分组标题置灰） */
+QMenu#ModelMenu {
+    background-color: #1a1e2b;
+    border: 1px solid #2c3142;
+    border-radius: 10px;
+    padding: 6px;
+}
+QMenu#ModelMenu::item {
+    padding: 7px 14px;
+    border-radius: 6px;
+    color: #e6e9f2;
+    font-size: 13px;
+    background-color: transparent;
+}
+QMenu#ModelMenu::item:selected { background-color: #2c3550; }
+QMenu#ModelMenu::item:disabled { color: #8a93a8; font-size: 12px; padding: 5px 14px 3px 14px; }
+QMenu#ModelMenu::separator { height: 1px; background-color: #2c3142; margin: 6px 8px; }
+
+/* 控制台「已加载模型」卡片行：正常尺寸按钮，清晰可读 */
+#LoadedScroll { background-color: transparent; border: none; }
+#LoadedCard {
+    background-color: #181b26;
+    border: 1px solid #262b3a;
+    border-radius: 10px;
+}
+#LoadedName { color: #e6e9f2; font-size: 14px; font-weight: 600; }
+#MutedLabel { color: #9aa3b8; font-size: 12px; }
+#RowBtn {
+    background-color: #2f3b66; color: #ffffff;
+    border: none; border-radius: 6px;
+    padding: 3px 12px; font-size: 12px; font-weight: 600;
+    min-height: 20px; max-height: 24px;
+}
+#RowBtn:hover { background-color: #3a4a7d; }
+#RowBtn:disabled { background-color: #232734; color: #6b7284; }
+#RowDangerBtn {
+    background-color: #3a2230; color: #ff9bb3;
+    border: 1px solid #5a2f44; border-radius: 6px;
+    padding: 3px 12px; font-size: 12px; font-weight: 600;
+    min-height: 20px; max-height: 24px;
+}
+#RowDangerBtn:hover { background-color: #4a2a3b; }
+#RowCancelBtn {
+    background-color: #232734; color: #c9d0e0;
+    border: 1px solid #323849; border-radius: 6px;
+    padding: 3px 10px; font-size: 12px; font-weight: 600;
+    min-height: 20px; max-height: 24px;
+}
+#RowCancelBtn:hover { background-color: #2d3242; }
+#RowBtn { min-width: 52px; }
+#RowDangerBtn { min-width: 52px; }
+#RowCancelBtn { min-width: 64px; }
+
+/* ---------------- 输入框 / 下拉 ---------------- */
+QLineEdit, QSpinBox, QComboBox, QTextEdit, QPlainTextEdit {
+    background-color: #12141d;
+    color: #e6e9f2;
+    border: 1px solid #2c3142;
+    border-radius: 8px;
+    padding: 6px 8px;
+}
+
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus,
+QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #6c8cff;
+}
+
+QLineEdit:read-only, QTextEdit:read-only {
+    color: #aab0c0;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #1a1d27;
+    color: #e6e9f2;
+    selection-background-color: #2f3548;
+    border: 1px solid #2c3142;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+
+QSpinBox::up-button, QSpinBox::down-button {
+    background-color: #1d2230;
+    border: none;
+    width: 16px;
+}
+
+/* ---------------- 标签 / 信息 ---------------- */
+QLabel {
+    background: transparent;
+    color: #c2c8d6;
+}
+
+#InfoLabel {
+    color: #cdd3e2;
+    line-height: 1.5;
+}
+
+#StatusDot {
+    background: transparent;
+}
+
+#ApiUrlField, #ApiKeyField {
+    font-family: "Consolas", "Courier New", monospace;
+}
+
+/* ---------------- 状态栏 ---------------- */
+#StatusBar {
+    background-color: #14161f;
+    border-top: 1px solid #232734;
+}
+
+#StatusBar QLabel {
+    color: #aab0c0;
+}
+
+/* ---------------- 表格 ---------------- */
+QTableWidget, QListWidget {
+    background-color: #12141d;
+    border: 1px solid #2c3142;
+    border-radius: 8px;
+    gridline-color: #232734;
+}
+
+QTableWidget::item, QListWidget::item {
+    padding: 6px;
+    border-bottom: 1px solid #1d2230;
+}
+
+QTableWidget::item:selected, QListWidget::item:selected {
+    background-color: #2f3548;
+    color: #ffffff;
+}
+
+QHeaderView::section {
+    background-color: #1a1d27;
+    color: #9aa3b8;
+    border: none;
+    border-bottom: 1px solid #2c3142;
+    padding: 6px;
+}
+
+/* ---------------- 聊天气泡 ---------------- */
+#UserBubble {
+    background-color: #2f3b66;
+    color: #ffffff;
+    border-radius: 12px;
+    padding: 10px 12px;
+}
+
+#AssistantBubble {
+    background-color: #1a1d27;
+    color: #e6e9f2;
+    border: 1px solid #262b3a;
+    border-radius: 12px;
+    padding: 10px 12px;
+}
+
+#ChatInput {
+    background-color: #12141d;
+}
+
+#ChatScroll {
+    border: none;
+    background-color: #0f1117;
+}
+
+/* ---------------- 进度条 ---------------- */
+QProgressBar {
+    background-color: #12141d;
+    border: 1px solid #2c3142;
+    border-radius: 6px;
+    height: 16px;
+    text-align: center;
+    color: #cdd3e2;
+}
+
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #6c8cff, stop:1 #8a6cff);
+    border-radius: 5px;
+}
+
+/* ---------------- 滚动条 ---------------- */
+QScrollBar:vertical {
+    background-color: #14161f;
+    width: 10px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #2c3142;
+    border-radius: 5px;
+    min-height: 24px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #3a4156;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+/* ---------------- 对话框 ---------------- */
+QDialog {
+    background-color: #0f1117;
+}
+
+#LogView {
+    background-color: #0c0e15;
+    color: #b6c0d4;
+    font-family: "Consolas", "Courier New", monospace;
+    border: 1px solid #2c3142;
+    border-radius: 8px;
+}
+
+/* ---------------- 系统托盘菜单（启停互斥：禁用项必须肉眼可辨） ---------------- */
+QMenu#TrayMenu {
+    background-color: #1a1e2b;
+    border: 1px solid #2c3142;
+    border-radius: 8px;
+    padding: 6px;
+}
+QMenu#TrayMenu::item {
+    padding: 8px 26px 8px 16px;
+    border-radius: 6px;
+    color: #e6e9f2;
+    font-size: 13px;
+    background-color: transparent;
+}
+QMenu#TrayMenu::item:selected { background-color: #2c3550; }
+/* 禁用（已启动时「启动服务」/已停止时「停止服务」）：明显变灰 */
+QMenu#TrayMenu::item:disabled { color: #5b6377; }
+
+/* ---------------- 控制台「测试结果」：可滚动查看完整输出 ---------------- */
+#TestResult {
+    background-color: #0c0e15;
+    border: 1px solid #2c3142;
+    border-radius: 8px;
+    color: #cfd6e6;
+    font-size: 12px;
+}

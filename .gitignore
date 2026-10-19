@@ -1,0 +1,50 @@
+# ============================================================
+# llmBuddy —— Git 忽略规则
+# 原则：源码 + 构建脚本 + 文档入库；二进制产物、本地依赖、
+#       运行时数据（含 API Key）一律不入库。
+# ============================================================
+
+# ---- 构建产物（PyInstaller / Inno Setup，体积数百 MB~GB）----
+/dist/
+/build/
+/client/build/installer/
+/client/build/pyi/
+*.bak-*
+
+# ---- 推理引擎运行时（llama.cpp 二进制，按需下载，约 2.8GB）----
+/engine/
+/engine-runtime/
+
+# ---- 第三方依赖（本地 vendored site-packages）----
+/lib/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- 运行时数据 / 用户配置（**含 API Key，严禁入库**）----
+/cache/
+/client/config.json
+
+# ---- 日志 ----
+*.log
+
+# ---- WorkBuddy 项目内部数据（会话/记忆，非代码）----
+/.workbuddy/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- 杂项 ----
+/nul
+
+# ---- 手工调试遗留（临时响应抓包 / 一次性排查脚本）----
+/test_*.json
+/test_stream.txt
+/qa_*.py

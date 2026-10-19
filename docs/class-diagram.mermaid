@@ -1,0 +1,90 @@
+classDiagram
+    class ModelInstance {
+        +str name
+        +str gguf_path
+        +str engine_host
+        +int engine_port
+        +str engine_api_key
+        +str status
+        +float progress
+        +datetime loaded_at
+        +int n_ctx
+        +int n_threads
+        +int n_gpu_layers
+    }
+    class PoolEntry {
+        +str model_name
+        +ModelInstance instance
+        +bool cancel_flag
+        +subprocess.Popen proc
+        +threading.Lock lock
+        +thread log_thread
+        +spawn() void
+        +unload() void
+        +wait_ready() bool
+    }
+    class ModelPool {
+        +dict entries
+        +int engine_base_port
+        +int max_concurrent
+        +load(model_name, **kw) PoolEntry
+        +unload(model_name) void
+        +get(model_name) PoolEntry
+        +route(model_name) str
+        +alloc_port() int
+        +list_loaded() list~ModelInstance~
+    }
+    class SystemInfo {
+        +int cpu_count
+        +int cpu_threads
+        +float total_ram_gb
+        +float free_ram_gb
+        +bool gpu_available
+        +float total_vram_gb
+        +float free_vram_gb
+        +int suggested_max_models
+        +detect() SystemInfo
+        +estimate_max_models(models) int
+    }
+    class ModelMeta {
+        +str name
+        +str repo
+        +str quant
+        +float size_gb
+        +float min_ram_gb
+        +int params_b
+        +str gguf_url
+        +str source
+    }
+    class CatalogService {
+        +str cache_path
+        +fetch(force, auth) list~ModelMeta~
+        +search(keyword) list~ModelMeta~
+    }
+    class DownloadService {
+        +download(meta, auth, progress_cb) str
+        +cancel(name) void
+    }
+    class ApiClient {
+        +str base_url
+        +str api_key
+        +get(path) dict
+        +post(path, body) dict
+        +chat_stream(body, cb) void
+    }
+    class BackendLauncher {
+        +str python_exe
+        +str script
+        +dict env
+        +subprocess.Popen proc
+        +start() void
+        +stop() void
+        +is_alive() bool
+        +watch() void
+    }
+    ModelPool "1" *-- "0..*" PoolEntry : owns
+    PoolEntry "1" *-- "1" ModelInstance : wraps
+    CatalogService ..> ModelMeta : returns
+    DownloadService ..> ModelMeta : consumes
+    ApiClient ..> ModelInstance : reads via REST
+    BackendLauncher ..> ModelPool : spawns serve.py that owns

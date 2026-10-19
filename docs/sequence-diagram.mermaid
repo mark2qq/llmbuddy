@@ -1,0 +1,95 @@
+%% 时序图 1：用户点「启动服务」→ 客户端拉起后端 → 健康检查
+sequenceDiagram
+    actor U as 用户
+    participant C as Client(MainWindow)
+    participant L as BackendLauncher
+    participant S as serve.py(后端)
+    participant P as ModelPool
+    U->>C: 点击「启动服务」
+    C->>C: 读 config.json (gateway_port/engine_base)
+    C->>L: start(env={LLM_PORT,LLM_ENGINE_PORT,...})
+    L->>S: spawn 子进程 python serve.py
+    S->>P: 启动初始化(建池/系统检测/起watchdog)
+    L->>S: 轮询 GET /api/v1/health
+    S-->>L: {status:ok, pool:[]}
+    L-->>C: 信号: 服务已就绪
+    C->>C: 状态栏显示 运行中/端口/版本
+
+%% 时序图 2：用户点「加载模型」→ 后端 spawn 引擎 → 进度
+sequenceDiagram
+    actor U as 用户
+    participant C as Client(Dashboard)
+    participant A as ApiClient
+    participant S as serve.py
+    participant P as ModelPool
+    participant E as llama-server.exe
+    U->>C: 选模型 + 点「加载模型」
+    C->>A: POST /api/v1/pool/load {model,n_ctx,...}
+    A->>S: 转发
+    S->>P: load(model)
+    P->>P: alloc_port() 分配空闲引擎端口
+    P->>E: spawn(--port=分配的端口)
+    E-->>P: stdout 日志(loading/ready)
+    P-->>S: status=loading, progress↑
+    S-->>A: 202 {status:loading, engine_port}
+    A-->>C: 轮询 GET /api/v1/pool/:model
+    C->>C: 进度条/日志刷新
+    E-->>P: /health 200
+    P-->>S: status=ready
+    S-->>A: {status:ready}
+    C->>C: 标记已加载, 可对话/测试
+
+%% 时序图 3：对话流（SSE 流式）
+sequenceDiagram
+    actor U as 用户
+    participant C as Client(ChatPage)
+    participant A as ApiClient
+    participant S as serve.py(网关)
+    participant P as ModelPool
+    participant E as 引擎(对应模型端口)
+    U->>C: 输入消息发送
+    C->>A: POST /v1/chat/completions {model,messages,stream:true}
+    A->>S: 转发(Bearer API_KEY)
+    S->>P: route(model)→engine_port
+    alt 模型未加载
+        P->>E: 先 load(model)
+    end
+    S->>E: POST /v1/chat/completions(stream)
+    E-->>S: SSE data:...
+    S-->>A: SSE(改写model字段, 透传)
+    A-->>C: 逐块回调
+    C->>C: 追加显示(打字机)
+    E-->>S: data:[DONE]
+    C->>C: 完成
+
+%% 时序图 4：下拉模型流（含 GitHub auth）
+sequenceDiagram
+    actor U as 用户
+    participant C as Client(LibraryPage)
+    participant A as ApiClient
+    participant S as serve.py
+    participant Cat as CatalogService
+    participant D as DownloadService
+    participant GH as GitHub
+    U->>C: 打开「模型库」
+    C->>A: GET /api/v1/models/catalog
+    A->>S: 转发
+    S->>Cat: fetch(cache or network)
+    Cat->>GH: GET raw catalog.json(可选auth)
+    GH-->>Cat: 模型清单
+    Cat-->>S: [ModelMeta]
+    S-->>A: {items:[...], cached:bool}
+    A-->>C: 渲染列表(按free_ram过滤)
+    U->>C: 选模型+点「下载」(需鉴权时)
+    C->>C: 弹 AuthDialog(账号/Token)
+    C->>A: POST /api/v1/models/pull {name,auth}
+    A->>S: 转发
+    S->>D: download(meta,auth,progress_cb)
+    D->>GH: 流式下载 GGUF(带token)
+    GH-->>D: bytes 流
+    D-->>S: progress 0→100%
+    S-->>A: 轮询/进度
+    A-->>C: 进度条更新
+    D-->>S: 完成, 写入 models_dir
+    S-->>A: {status:done, gguf_path}
+    C->>C: 列表标记「已下载」
