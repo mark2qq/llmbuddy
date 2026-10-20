@@ -1,0 +1,115 @@
+# -*- coding: utf-8 -*-
+"""
+控制台布局回归测试（2026-10-20 红字：内容框下移了，请固定）。
+
+缺陷：窗口高度不足时 QVBoxLayout 压缩「模型加载/测试」卡片，固定高度的
+测试结果框无法压缩，溢出卡片底部、盖住下一张卡片的标题。
+
+修复：
+    1. 页面外层包 QScrollArea（空间不足时整页纵向滚动，而不是压缩卡片）；
+    2. 加载卡垂直方向 Fixed（按内容高度固定，不被压缩）；
+    3. 测试结果框固定 84px + 纵向滚动条；
+    4. 监控卡尺寸收紧，内容最小宽度适配 800px 内容区（无横向滚动）。
+"""
+import os
+import sys
+
+_CLIENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _CLIENT_DIR in sys.path:
+    sys.path.remove(_CLIENT_DIR)
+sys.path.insert(0, _CLIENT_DIR)
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QScrollArea, QSizePolicy, QTextEdit)
+
+app = QApplication.instance() or QApplication(sys.argv)
+
+# 应用真实基线样式（含卡片 padding / 边框），否则测不出真实的最小宽度
+from core.theme import apply_stylesheet  # noqa: E402
+
+apply_stylesheet(app, "")
+
+from ui.pages.dashboard_page import DashboardPage  # noqa: E402
+
+
+class _FakeApi:
+    def system_info(self):
+        return {}
+
+    def concurrency(self):
+        return {}
+
+    def catalog(self, force=False):
+        return {"items": []}
+
+    def pool(self):
+        return {"loaded": []}
+
+
+class _FakeLauncher:
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class _FakeConfig:
+    n_ctx = 4096
+    n_threads = 8
+    n_gpu_layers = 0
+
+
+def _make_page(width=800, height=640):
+    page = DashboardPage(_FakeApi(), _FakeLauncher(), _FakeConfig())
+    page.resize(width, height)
+    page.show()
+    app.processEvents()
+    app.processEvents()
+    return page
+
+
+def test_page_is_scrollable_container():
+    page = _make_page()
+    assert isinstance(page._page_scroll, QScrollArea)
+    assert page._page_scroll.widgetResizable() is True
+    assert page._page_scroll.widget() is not None
+
+
+def test_test_result_box_fixed_height_and_scrollable():
+    page = _make_page()
+    box = page._test_label
+    assert isinstance(box, QTextEdit)
+    assert box.height() == 84, "测试结果框应为固定高度"
+    assert box.minimumHeight() == box.maximumHeight() == 84
+    assert box.verticalScrollBarPolicy() != \
+        Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_load_card_not_compressible():
+    page = _make_page()
+    card = page._test_label.parentWidget()
+    assert card.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Fixed, \
+        "加载卡应按内容固定高度，避免被压缩后内容溢出"
+
+
+def test_test_box_stays_inside_card_at_small_sizes():
+    """窗口偏小时（整页滚动）测试框仍完整落在卡片内，不越界。"""
+    page = _make_page(760, 560)
+    box = page._test_label
+    card = box.parentWidget()
+    assert box.geometry().bottom() <= card.contentsRect().bottom(), \
+        f"测试框越界：bottom={box.geometry().bottom()} " \
+        f"card_bottom={card.contentsRect().bottom()}"
+    # 内容高于视口 -> 出现纵向滚动（而不是压扁卡片）
+    assert page._page_scroll.verticalScrollBar().maximum() > 0
+
+
+def test_no_horizontal_scroll_at_normal_width():
+    """主窗口最小尺寸（1000x680 -> 内容区约 800x640）下无横向溢出。"""
+    page = _make_page(800, 640)
+    assert page._page_scroll.horizontalScrollBar().maximum() == 0, \
+        "800px 内容区不应出现横向溢出"

@@ -81,9 +81,24 @@ class DashboardPage(QWidget):
         return box
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        # 外层滚动区：窗口高度不足时整页滚动，避免布局压缩第 2 行卡片、
+        # 导致固定高度的测试结果框溢出到下方「已加载模型」卡片
+        # （红字反馈：内容框下移了，请固定）。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._page_scroll = QScrollArea()
+        self._page_scroll.setWidgetResizable(True)
+        self._page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._page_scroll.setObjectName("PageScroll")
+        # 只纵向滚动：横向由内容自适应宽度，避免出现横向滚动条
+        self._page_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("PageContent")
+        root = QVBoxLayout(content)
         root.setSpacing(12)
-        root.setContentsMargins(16, 16, 16, 16)
+        root.setContentsMargins(12, 12, 12, 12)
 
         # ---- 第 1 行：运行监控与参数（四卡一排）----
         monitor = QHBoxLayout()
@@ -112,6 +127,9 @@ class DashboardPage(QWidget):
         log_card.setMinimumHeight(110)
         log_card.setMaximumHeight(180)
         root.addWidget(log_card)
+
+        self._page_scroll.setWidget(content)
+        outer.addWidget(self._page_scroll)
 
     def append_log(self, line: str) -> None:
         """追加一行后端日志（供主窗口转发 launcher.log）。"""
@@ -152,7 +170,7 @@ class DashboardPage(QWidget):
         p.end()
         return pm
 
-    def _render_cpu_graph(self, values, w: int = 200, h: int = 46) -> QPixmap:
+    def _render_cpu_graph(self, values, w: int = 130, h: int = 46) -> QPixmap:
         """渲染 CPU 使用率实时面积折线图（任务管理器风格）。
 
         values 为历史采样序列（最多 60 点），不足部分左侧补 0。
@@ -218,7 +236,7 @@ class DashboardPage(QWidget):
         top.setSpacing(6)
         self._cpu_pct = QLabel("—%")
         self._cpu_pct.setStyleSheet("font-size: 18px; font-weight: 600;")
-        self._cpu_text = QLabel("— 核 / — 线程")
+        self._cpu_text = QLabel("—核/—线程")
         self._cpu_text.setObjectName("MutedLabel")
         top.addWidget(self._cpu_pct)
         top.addWidget(self._cpu_text)
@@ -227,7 +245,7 @@ class DashboardPage(QWidget):
         # 实时面积折线图（任务管理器风格，随采样滚动更新）
         self._cpu_graph = QLabel()
         self._cpu_graph.setPixmap(self._render_cpu_graph([]))
-        self._cpu_graph.setFixedSize(200, 46)
+        self._cpu_graph.setFixedSize(130, 46)
         inner.addWidget(self._cpu_graph)
         card.layout().addLayout(inner)
         return card
@@ -239,7 +257,7 @@ class DashboardPage(QWidget):
         inner.setSpacing(6)
         self._gpu_text = QLabel("加载中…")
         self._gpu_text.setObjectName("InfoLabel")
-        self._gpu_hint = QLabel("显存 — / — GB")
+        self._gpu_hint = QLabel("显存 —")
         self._gpu_hint.setObjectName("MutedLabel")
         inner.addWidget(QLabel("显卡"))
         inner.addWidget(self._gpu_text)
@@ -253,7 +271,7 @@ class DashboardPage(QWidget):
         """渲染并发槽位示意图：n 个高亮方块 = 当前并发上限（简单图示替代长文案）。"""
         total = 16
         n = max(1, min(n, total))
-        bw, gap, h = 9, 3, 14
+        bw, gap, h = 6, 1, 14
         w = total * bw + (total - 1) * gap
         svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
                f'viewBox="0 0 {w} {h}">')
@@ -321,6 +339,9 @@ class DashboardPage(QWidget):
 
     def _build_load_card(self) -> QGroupBox:
         card = self._card("模型加载 / 测试")
+        # 高度按内容固定，不允许被布局压缩（否则固定高度的测试结果框会溢出卡片边界）
+        card.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Fixed)
         # 红字要求：加载/测试按钮放到模型同一行，模型名称框缩小（不占满整行）
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -672,7 +693,7 @@ class DashboardPage(QWidget):
         self._mem_gb.setText(f"{free:.1f} / {total:.1f} GB")
         self._mem_hint.setText(f"空闲 {free:.1f} GB")
         self._cpu_text.setText(
-            f"{d.get('cpu_count')} 核 / {d.get('cpu_threads')} 线程")
+            f"{d.get('cpu_count')}核/{d.get('cpu_threads')}线程")
         cpu = float(d.get("cpu_percent") or 0)
         self._cpu_hist.append(cpu)
         self._cpu_pct.setText(f"{cpu:.0f}%")

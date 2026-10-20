@@ -16,6 +16,12 @@ QMainWindow {
     background-color: #0f1117;
 }
 
+/* 页面外层滚动区（控制台等）：容器透明，不遮盖卡片圆角 */
+#PageScroll, #PageContent {
+    background: transparent;
+    border: none;
+}
+
 #NavPanel {
     background-color: #14161f;
     border-right: 1px solid #232734;
