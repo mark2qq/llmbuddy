@@ -113,3 +113,21 @@ def test_no_horizontal_scroll_at_normal_width():
     page = _make_page(800, 640)
     assert page._page_scroll.horizontalScrollBar().maximum() == 0, \
         "800px 内容区不应出现横向溢出"
+
+
+def test_log_card_pinned_bottom():
+    """运行日志固定在页面底部：已加载模型再多也不被挤走（红字需求）。"""
+    page = _make_page(1080, 640)
+    log_card = page._log.parentWidget()
+    base = log_card.geometry()
+    assert base.bottom() <= page.height(), "运行日志应在可视区内"
+    for n in (1, 3, 8):
+        page._apply_pool({"loaded": [
+            {"name": f"m{i}", "status": "paused", "progress": 0.0}
+            for i in range(n)]})
+        app.processEvents()
+        app.processEvents()
+        g = log_card.geometry()
+        assert (g.y(), g.height()) == (base.y(), base.height()), \
+            f"{n} 个模型时运行日志位置/高度被改变"
+        assert g.bottom() <= page.height()

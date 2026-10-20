@@ -231,5 +231,6 @@ def test_styles_and_layout_params():
 
     from ui.pages.dashboard_page import DashboardPage
     p = DashboardPage(_FakeApi(), None, None)
-    # 图6：日志区限高 180、已加载区随上半区拉伸
-    assert p._log.parentWidget().maximumHeight() == 180
+    # 图6：日志区限高（2026-10-20 调整为 124：日志固定在页面底部，
+    # 已加载模型增多时不再挤压日志）
+    assert p._log.parentWidget().maximumHeight() == 124

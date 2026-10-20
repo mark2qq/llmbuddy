@@ -81,11 +81,11 @@ class DashboardPage(QWidget):
         return box
 
     def _build_ui(self) -> None:
-        # 外层滚动区：窗口高度不足时整页滚动，避免布局压缩第 2 行卡片、
-        # 导致固定高度的测试结果框溢出到下方「已加载模型」卡片
-        # （红字反馈：内容框下移了，请固定）。
+        # 结构：上部「监控 + 加载 + 已加载模型」放进滚动区，运行日志固定在最底部。
+        # 红字反馈：模型加载多了会把运行日志挤下去——日志固定后，模型再多也只在
+        # 上方区域内部滚动（已加载模型卡片自带滚动），日志始终可见。
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(0)
         self._page_scroll = QScrollArea()
         self._page_scroll.setWidgetResizable(True)
@@ -97,8 +97,8 @@ class DashboardPage(QWidget):
         content = QWidget()
         content.setObjectName("PageContent")
         root = QVBoxLayout(content)
-        root.setSpacing(12)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+        root.setContentsMargins(0, 0, 0, 0)
 
         # ---- 第 1 行：运行监控与参数（四卡一排）----
         monitor = QHBoxLayout()
@@ -115,21 +115,22 @@ class DashboardPage(QWidget):
         # ---- 第 2 行：模型加载 / 测试 ----
         root.addWidget(self._build_load_card())
 
-        # ---- 第 3 行：已加载模型（占满剩余空间）----
+        # ---- 第 3 行：已加载模型（占满剩余空间，内部滚动）----
         root.addWidget(self._build_loaded_card(), 1)
 
-        # ---- 第 4 行：运行日志（限高）----
+        self._page_scroll.setWidget(content)
+        outer.addWidget(self._page_scroll, 1)
+        outer.addSpacing(12)
+
+        # ---- 底部固定：运行日志（不参与上部滚动，模型再多也不会被挤走）----
         log_card = QGroupBox("运行日志")
         log_card.setObjectName("Card")
         log_card.setLayout(QVBoxLayout())
         self._log = LogView()
         log_card.layout().addWidget(self._log)
         log_card.setMinimumHeight(110)
-        log_card.setMaximumHeight(180)
-        root.addWidget(log_card)
-
-        self._page_scroll.setWidget(content)
-        outer.addWidget(self._page_scroll)
+        log_card.setMaximumHeight(124)
+        outer.addWidget(log_card)
 
     def append_log(self, line: str) -> None:
         """追加一行后端日志（供主窗口转发 launcher.log）。"""
@@ -219,7 +220,6 @@ class DashboardPage(QWidget):
         self._mem_gb.setObjectName("InfoLabel")
         self._mem_hint = QLabel("加载中…")
         self._mem_hint.setObjectName("MutedLabel")
-        col.addWidget(QLabel("内存"))
         col.addWidget(self._mem_gb)
         col.addWidget(self._mem_hint)
         inner.addLayout(col)
@@ -259,7 +259,6 @@ class DashboardPage(QWidget):
         self._gpu_text.setObjectName("InfoLabel")
         self._gpu_hint = QLabel("显存 —")
         self._gpu_hint.setObjectName("MutedLabel")
-        inner.addWidget(QLabel("显卡"))
         inner.addWidget(self._gpu_text)
         inner.addWidget(self._gpu_hint)
         # 无独显时整卡置灰（视觉弱化）
@@ -388,7 +387,7 @@ class DashboardPage(QWidget):
         self._loaded_layout.setSpacing(8)
         self._loaded_layout.setContentsMargins(2, 2, 2, 2)
         self._loaded_scroll.setWidget(self._loaded_container)
-        self._loaded_scroll.setMinimumHeight(120)
+        self._loaded_scroll.setMinimumHeight(84)
         card.layout().addWidget(self._loaded_scroll)
         self._empty_loaded = QLabel("暂无已加载模型")
         self._empty_loaded.setObjectName("MutedLabel")

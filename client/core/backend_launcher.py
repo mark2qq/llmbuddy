@@ -246,7 +246,8 @@ class BackendLauncher(QObject):
         """
         if proc is None:
             return
-        pid = proc.pid
+        # 支持传入 Popen 对象或进程 PID（int）：外部后端只能按 PID 定位
+        pid = proc if isinstance(proc, int) else getattr(proc, "pid", None)
         if pid is None:
             return
         if sys.platform == "win32":
@@ -297,10 +298,96 @@ class BackendLauncher(QObject):
                     except Exception:  # noqa: BLE001
                         pass
 
+    # ------------------------------------------------------------------ #
+    # 外部后端清理（GUI 未持有子进程句柄时）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_backend_process(pid: int) -> bool:
+        """判断 PID 是否为 llmBuddy 后端进程（避免误杀恰好占用同一端口的其它程序）。"""
+        try:
+            import psutil
+            p = psutil.Process(pid)
+            name = (p.name() or "").lower()
+            if "llmbuddy" in name:
+                return True
+            if "python" in name or "pythonw" in name:
+                try:
+                    cmd = " ".join(p.cmdline() or []).lower()
+                except Exception:  # noqa: BLE001
+                    return False
+                return ("serve.py" in cmd) or ("--backend" in cmd)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    @staticmethod
+    def _find_backend_pids(port: int) -> list:
+        """查找监听指定端口的 llmBuddy 后端进程 PID。"""
+        pids = []
+        try:
+            import psutil
+            for c in psutil.net_connections(kind="inet"):
+                try:
+                    listening = (c.status == psutil.CONN_LISTEN
+                                 or c.status == "LISTEN")
+                    if not listening or not c.laddr or not c.pid:
+                        continue
+                    if int(c.laddr.port) != int(port):
+                        continue
+                    if BackendLauncher._is_backend_process(int(c.pid)):
+                        pids.append(int(c.pid))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        return list(dict.fromkeys(pids))
+
+    def _stop_external_backend(self) -> bool:
+        """停止不由本进程拉起、但目前仍在监听网关端口的后端。
+
+        典型场景：后端由上一个 GUI 实例/手动启动，本 GUI 的 proc 为 None。
+        此前 stop() 在「无 proc」时直接返回，导致点了「停止服务」后端仍在跑
+        （红字缺陷：服务停止后状态栏仍显示运行中——其实服务根本没停）。
+
+        返回是否确认服务已不可达。
+        """
+        try:
+            port = int(getattr(self.config, "gateway_port", 8000) or 8000)
+        except Exception:  # noqa: BLE001
+            port = 8000
+        if not self.is_ready():
+            return True
+        # 1) 先优雅停机（M15），能正常退出最干净
+        try:
+            self._api().stop_service()
+        except Exception:  # noqa: BLE001
+            pass
+        for _ in range(20):
+            time.sleep(0.25)
+            if not self.is_ready():
+                return True
+        # 2) 仍可达 -> 按端口定位后端 PID，杀整棵进程树（含引擎子进程）
+        for pid in self._find_backend_pids(port):
+            try:
+                self._kill_process_tree(pid)
+            except Exception:  # noqa: BLE001
+                pass
+        # 3) 再确认一次（留出端口释放时间）
+        for _ in range(12):
+            if not self.is_ready():
+                return True
+            time.sleep(0.25)
+        return not self.is_ready()
+
     def stop(self) -> None:
         """停止后端：优雅停机（M15）后 terminate 等待，并清理全部引擎子进程。"""
         if not self._running and self.proc is None:
+            # GUI 未持有后端进程（先启动后端再开客户端 / 旧实例拉起）：
+            # 按端口定位并清理，否则「停止服务」只是发了个空信号，服务继续运行
+            self._stop_external_backend()
+            self._running = False
             self.state_changed.emit("stopped")
+            self.ready.emit(False)
             return
         self._stop_event.set()
         # 先尝试优雅停机
@@ -355,4 +442,10 @@ class BackendLauncher(QObject):
             except Exception:  # noqa: BLE001
                 pass
             self.proc = None
+        else:
+            # 未持有句柄（外部后端）：按端口清理，避免退出后服务仍在跑
+            try:
+                self._stop_external_backend()
+            except Exception:  # noqa: BLE001
+                pass
         self._running = False

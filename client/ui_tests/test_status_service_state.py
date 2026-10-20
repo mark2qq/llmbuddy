@@ -92,6 +92,34 @@ def test_apply_config_does_not_force_stopped():
     assert win._status_bar._status.text() == "服务运行中"
 
 
+def test_stale_probe_result_ignored_after_stop():
+    """停止服务后，停止前发出的探测结果晚到也不能改回「运行中」。
+
+    这是「服务已停止仍显示运行中」的根因：探测结果乱序覆盖。
+    """
+    win = _make_window()
+    win._apply_status_health({"pool": {"loaded": []}})
+    assert win._status_state == "running"
+    stale_gen = win._probe_gen          # 停止前发出的那一次探测
+    win._on_state("stopped")            # 用户点「停止服务」
+    assert win._status_state == "stopped"
+    # 过期的成功结果晚到
+    win._apply_status_health(
+        {"pool": {"loaded": [{"name": "x", "status": "ready"}]}}, stale_gen)
+    assert win._status_state == "stopped", "过期探测结果不应把状态改回运行中"
+    assert win._status_bar._status.text() == "服务未启动"
+
+
+def test_fresh_probe_after_stop_still_updates():
+    """停止后新发起的探测（新代际）仍然生效（服务被重新拉起时可恢复）。"""
+    win = _make_window()
+    win._on_state("stopped")
+    fresh_gen = win._probe_gen
+    win._apply_status_health({"pool": {"loaded": []}}, fresh_gen)
+    assert win._status_state == "running"
+    assert win._status_bar._status.text() == "服务运行中"
+
+
 def test_apply_status_health_updates_model_names_only():
     win = _make_window()
     win._apply_status_health({"pool": {"loaded": [

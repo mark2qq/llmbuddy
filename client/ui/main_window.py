@@ -41,6 +41,9 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         # 状态栏当前服务状态（stopped/starting/running），供后台探测结果比对
         self._status_state = "stopped"
+        # 探测代际号：每次状态变更/新探测都会 +1，过期探测结果直接丢弃，
+        # 避免「停止服务瞬间在途的 health 成功结果晚到」把状态又改回运行中
+        self._probe_gen = 0
 
         self.setWindowTitle(APP_TITLE)
         self.setMinimumSize(1000, 680)
@@ -239,6 +242,9 @@ class MainWindow(QMainWindow):
     def _on_state(self, state: str) -> None:
         # 托盘启停互斥：随后端状态实时切换可用性（红字要求）
         self._sync_tray_actions(state)
+        # 作废所有在途探测：停止服务后，停止前发出的 health 成功结果若晚到，
+        # 会把状态又覆盖成「运行中」（红字缺陷）
+        self._probe_gen += 1
         self._status_state = state
         self._status_bar.set_status(
             state, url=self.config.gateway_url() if state == "running" else "",
@@ -248,6 +254,7 @@ class MainWindow(QMainWindow):
 
     def _on_ready(self, ok: bool) -> None:
         if ok:
+            self._probe_gen += 1
             self._status_state = "running"
             self._status_bar.set_status("running", url=self.config.gateway_url())
             self._refresh_all()
@@ -328,12 +335,21 @@ class MainWindow(QMainWindow):
         改为以 health 是否可达作为唯一事实来源，5s 兜底轮询 + 保存设置后自愈。
         """
         worker = Worker(self.api.health)
-        worker.result.connect(self._apply_status_health)
-        worker.error.connect(self._on_status_probe_error)
+        gen = self._probe_gen
+        worker.result.connect(
+            lambda data, g=gen: self._apply_status_health(data, g))
+        worker.error.connect(
+            lambda msg, g=gen: self._on_status_probe_error(msg, g))
         worker.start()
 
-    def _apply_status_health(self, data) -> None:
-        """health 可达 -> 服务运行中，并回填已加载模型。"""
+    def _apply_status_health(self, data, gen=None) -> None:
+        """health 可达 -> 服务运行中，并回填已加载模型。
+
+        gen 为 None 表示直接调用（测试/内部），不做代际校验；
+        否则丢弃过期探测结果（期间状态已变更）。
+        """
+        if gen is not None and gen != self._probe_gen:
+            return
         d = data or {}
         if self._status_state != "running":
             self._status_state = "running"
@@ -343,12 +359,14 @@ class MainWindow(QMainWindow):
         pool = d.get("pool") or {}
         self._status_bar.set_models(self._pool_names(pool.get("loaded")))
 
-    def _on_status_probe_error(self, _msg: str) -> None:
+    def _on_status_probe_error(self, _msg: str, gen=None) -> None:
         """health 不可达 -> 服务未启动。
 
         「启动中」不回退：此时 health 失败属正常（服务尚未起来），
         等 launcher 的 ready/state 信号给出最终结果。
         """
+        if gen is not None and gen != self._probe_gen:
+            return
         if self._status_state == "starting":
             return
         if self._status_state != "stopped":
