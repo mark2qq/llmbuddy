@@ -157,6 +157,11 @@ def m5_pull_status(name: str):
         "progress": status.get("progress", 0.0),
         "gguf_path": status.get("gguf_path"),
         "error": status.get("error"),
+        # 下载加速可观测性：已下载字节 / 总大小 / 速度(MB/s) / 并发线程数
+        "downloaded": status.get("downloaded", 0),
+        "total_bytes": status.get("total_bytes", 0),
+        "speed_mbps": status.get("speed_mbps", 0.0),
+        "threads": status.get("threads", 1),
     })
 
 
