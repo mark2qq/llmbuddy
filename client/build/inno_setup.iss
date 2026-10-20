@@ -239,9 +239,33 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// 安装前强制结束正在运行的旧版程序（2026-10-20 修复）：
+// CloseApplications=yes 依赖 Windows Restart Manager，对「卡死/僵尸」进程
+// 不生效，曾导致替换 llmBuddy.exe 时 DeleteFile 错误 5（拒绝访问）。
+// 这里在正式写入文件前用 taskkill 兜底结束三类进程：
+//   llmBuddy.exe（新版主程序）/ LLMDesktop.exe（旧版主程序残留）/
+//   llama-server.exe（随安装目录分发的推理引擎，从 {app}\engine 启动时会锁文件）
+// taskkill 对不存在的进程返回非 0，无需特殊处理。
+// ---------------------------------------------------------------------------
+procedure ForceCloseApp(const ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  Log('安装前结束进程: ' + ImageName);
+  Exec(ExpandConstant('{sys}\cmd.exe'),
+       '/C taskkill /F /T /IM "' + ImageName + '"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  ForceCloseApp('llmBuddy.exe');
+  ForceCloseApp('LLMDesktop.exe');
+  ForceCloseApp('llama-server.exe');
+  // 给进程完全退出/句柄释放留一点时间，避免紧随其后的 DeleteFile 仍失败
+  Sleep(800);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
