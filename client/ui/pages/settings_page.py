@@ -11,10 +11,13 @@
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
                                QLineEdit, QSpinBox, QCheckBox, QComboBox,
-                               QPushButton, QLabel, QMessageBox)
+                               QPushButton, QLabel, QMessageBox, QButtonGroup,
+                               QColorDialog)
+from PySide6.QtGui import QColor
 from PySide6.QtCore import Signal
 
 from core.task_runner import Worker
+from core.theme import DEFAULT_DARK_BG, PRESET_BACKGROUNDS, normalize_color
 
 
 class SettingsPage(QWidget):
@@ -76,6 +79,40 @@ class SettingsPage(QWidget):
         form.addRow("", self._auto_restart)
         root.addWidget(card)
 
+        # ---- 界面外观：背景色（保存后立即生效，无需重启） ----
+        appear = QGroupBox("界面外观")
+        appear.setObjectName("Card")
+        aform = QFormLayout(appear)
+        self._bg_color = DEFAULT_DARK_BG
+        self._bg_group = QButtonGroup(self)
+        self._bg_group.setExclusive(True)
+        self._bg_btns = {}
+        bg_row = QHBoxLayout()
+        bg_row.setSpacing(8)
+        for label, color in PRESET_BACKGROUNDS:
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setFixedSize(30, 24)
+            btn.setToolTip(f"{label}（{color}）")
+            btn.setStyleSheet(
+                f"QPushButton {{ background-color: {color};"
+                f" border: 1px solid #8a90a6; border-radius: 6px; }}"
+                f"QPushButton:checked {{ border: 2px solid #6c8cff; }}")
+            btn.clicked.connect(
+                lambda _checked=False, col=color: self._select_bg(col))
+            self._bg_group.addButton(btn)
+            self._bg_btns[color] = btn
+            bg_row.addWidget(btn)
+        self._bg_custom = QPushButton("自定义…")
+        self._bg_custom.clicked.connect(self._on_pick_color)
+        bg_row.addWidget(self._bg_custom)
+        bg_row.addStretch(1)
+        self._bg_value = QLabel("默认深色")
+        self._bg_value.setObjectName("MutedLabel")
+        bg_row.addWidget(self._bg_value)
+        aform.addRow("背景色:", bg_row)
+        root.addWidget(appear)
+
         self._note = QLabel("提示：端口 / 引擎 / 模型目录 / 加载参数修改后需重启后端生效。")
         self._note.setWordWrap(True)
         root.addWidget(self._note)
@@ -88,6 +125,36 @@ class SettingsPage(QWidget):
         btn_row.addWidget(save)
         root.addLayout(btn_row)
         root.addStretch(1)
+
+    # ------------------------------------------------------------------ #
+    # 界面外观（背景色）
+    # ------------------------------------------------------------------ #
+    def _select_bg(self, color: str) -> None:
+        """选中背景色：仅更新预览，点「保存」后立即生效。"""
+        c = normalize_color(color) or DEFAULT_DARK_BG
+        self._bg_color = c
+        preset_btn = self._bg_btns.get(c)
+        if preset_btn is not None:
+            preset_btn.setChecked(True)
+            self._bg_custom.setStyleSheet("")
+        else:
+            # 自定义色：取消预设选中，并让「自定义…」按钮显示该颜色
+            self._bg_group.setExclusive(False)
+            for b in self._bg_btns.values():
+                b.setChecked(False)
+            self._bg_group.setExclusive(True)
+            self._bg_custom.setStyleSheet(
+                f"QPushButton {{ background-color: {c}; color: #ffffff;"
+                f" border: 1px solid #8a90a6; border-radius: 8px;"
+                f" padding: 4px 12px; }}")
+        self._bg_value.setText("默认深色" if c == DEFAULT_DARK_BG else c)
+
+    def _on_pick_color(self) -> None:
+        """自定义背景色（取色器）。"""
+        color = QColorDialog.getColor(
+            QColor(self._bg_color or DEFAULT_DARK_BG), self, "选择背景色")
+        if color.isValid():
+            self._select_bg(color.name())
 
     # ------------------------------------------------------------------ #
     # 读写
@@ -105,6 +172,7 @@ class SettingsPage(QWidget):
         self._max_conc.setValue(int(c.max_concurrent_models))
         self._log_level.setCurrentText(c.log_level or "INFO")
         self._auto_restart.setChecked(bool(c.auto_restart))
+        self._select_bg(getattr(c, "background_color", "") or DEFAULT_DARK_BG)
 
     def refresh(self) -> None:
         """切页/后端就绪时由主窗口调用：重新从配置加载显示。
@@ -127,9 +195,13 @@ class SettingsPage(QWidget):
         c.max_concurrent_models = self._max_conc.value()
         c.log_level = self._log_level.currentText()
         c.auto_restart = self._auto_restart.isChecked()
+        # 背景色：默认深色存空串（与旧配置兼容）
+        bg = self._bg_color or DEFAULT_DARK_BG
+        c.background_color = "" if bg == DEFAULT_DARK_BG else bg
         try:
             c.save()
-            QMessageBox.information(self, "已保存", "设置已保存到 config.json")
+            # 先通知主窗口重新应用主题（立即生效），再弹保存成功提示
             self.config_changed.emit()
+            QMessageBox.information(self, "已保存", "设置已保存并立即生效")
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "失败", f"保存失败: {e}")

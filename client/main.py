@@ -114,7 +114,7 @@ if "--backend" in sys.argv[1:]:
     sys.exit(0)
 
 from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtCore import QFile, QTextStream, QTimer
+from PySide6.QtCore import QTimer
 
 from app_config import Config, CLIENT_DIR
 from core.api_client import ApiClient
@@ -149,15 +149,21 @@ def resource_path(rel: str) -> str:
     return os.path.join(candidates[-1], rel)
 
 
-def load_stylesheet() -> str:
-    """加载 resources/styles.qss。"""
-    path = resource_path(os.path.join("resources", "styles.qss"))
-    if os.path.exists(path):
-        f = QFile(path)
-        if f.open(QFile.OpenModeFlag.ReadOnly | QFile.OpenModeFlag.Text):
-            stream = QTextStream(f)
-            return stream.readAll()
-    return ""
+def load_stylesheet(background_color: str = "") -> str:
+    """加载主题样式：基线 styles.qss + 按背景色的覆盖（见 core.theme）。"""
+    try:
+        from core.theme import build_stylesheet
+        return build_stylesheet(background_color)
+    except Exception:
+        # 兜底：直接读基线样式，保证界面不裸奔
+        path = resource_path(os.path.join("resources", "styles.qss"))
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                return ""
+        return ""
 
 
 def _count_local_models(cfg) -> int:
@@ -187,10 +193,14 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(False)
     _startup_log("QApplication created")
 
-    style = load_stylesheet()
+    # 先载入配置：主题背景色需要它（Config.load 无副作用，可安全提前）
+    config = Config.load()
+    _startup_log("config loaded")
+    style = load_stylesheet(config.background_color)
     if style:
         app.setStyleSheet(style)
-    _startup_log("stylesheet loaded=%s" % bool(style))
+    _startup_log("stylesheet loaded=%s bg=%s"
+                 % (bool(style), config.background_color or "default"))
 
     # ------------------------------------------------------------------
     # 单实例锁（2026-10-20 需求）：已有 llmBuddy 在运行时，再次打开不启动
@@ -205,7 +215,6 @@ def main() -> None:
         sys.exit(0)
     _startup_log("single-instance: primary acquired")
 
-    config = Config.load()
     api = ApiClient(config.gateway_host, config.gateway_port, config.api_key)
     launcher = BackendLauncher(config)
     _startup_log("config/api/launcher ready")

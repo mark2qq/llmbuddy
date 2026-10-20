@@ -83,6 +83,7 @@ a = Analysis(
         "core.port_scanner",
         "core.task_runner",
         "core.signals",
+        "core.theme",
         "ui",
         "ui.main_window",
         "ui.pages",

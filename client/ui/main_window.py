@@ -256,6 +256,13 @@ class MainWindow(QMainWindow):
         self.api.host = self.config.gateway_host
         self.api.port = self.config.gateway_port
         self.api.api_key = self.config.api_key
+        # 界面背景色：保存后立即重新应用样式（无需重启客户端）
+        try:
+            from core.theme import apply_stylesheet
+            apply_stylesheet(QApplication.instance(),
+                             getattr(self.config, "background_color", ""))
+        except Exception:
+            pass
         self._status_bar.set_status("stopped", url=self.config.gateway_url())
 
     def _refresh_all(self) -> None:
