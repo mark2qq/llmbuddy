@@ -92,20 +92,20 @@ class LibraryPage(QWidget):
         card = QGroupBox("模型目录")
         card.setObjectName("Card")
         card.setLayout(QVBoxLayout())
-        self._table = QTableWidget(0, 7)
+        self._table = QTableWidget(0, 8)
         self._table.setObjectName("CatalogTable")
         self._table.setHorizontalHeaderLabels(
-            ["名称", "仓库", "量化", "大小(GB)", "最小内存(GB)", "参数", "本地/操作"])
+            ["名称", "仓库", "量化", "大小(GB)", "最小内存(GB)", "参数", "发布时间", "本地/操作"])
         # 列宽策略（红字要求：所有列——含名称列——都可左右拖动伸缩）：
         #   全部列 Interactive（初始按内容给定宽度，用户可拖动；名称列不再用 Stretch，
         #   因为 Stretch 列会强制铺满且禁用用户拖动）
         hdr = self._table.horizontalHeader()
-        for col in range(0, 7):
+        for col in range(0, 8):
             hdr.setSectionResizeMode(col, QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
         hdr.setSectionsMovable(False)
         # 初始列宽（用户可拖动调整）
-        for col, w in ((0, 340), (1, 200), (2, 100), (3, 95), (4, 120), (5, 80), (6, 270)):
+        for col, w in ((0, 340), (1, 200), (2, 100), (3, 95), (4, 120), (5, 80), (6, 110), (7, 270)):
             self._table.setColumnWidth(col, w)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setWordWrap(False)
@@ -224,7 +224,13 @@ class LibraryPage(QWidget):
             self._table.setItem(i, 3, QTableWidgetItem(str(it.get("size_gb", ""))))
             self._table.setItem(i, 4, QTableWidgetItem(str(it.get("min_ram_gb", ""))))
             self._table.setItem(i, 5, QTableWidgetItem(str(it.get("params_b", ""))))
-            self._table.setCellWidget(i, 6, self._build_action_cell(name, local, it))
+            # 「发布时间」：取目录中的 published 字段（官方发布日，YYYY-MM-DD）；
+            # 本地导入/缺失该字段时显示「—」
+            pub = str(it.get("published", "") or "").strip()
+            pub_item = QTableWidgetItem(pub if pub else "—")
+            pub_item.setToolTip(pub if pub else "该模型无发布时间信息")
+            self._table.setItem(i, 6, pub_item)
+            self._table.setCellWidget(i, 7, self._build_action_cell(name, local, it))
         self._table.horizontalScrollBar().setValue(0)
 
     def _build_action_cell(self, name: str, local: bool, it: dict) -> QWidget:

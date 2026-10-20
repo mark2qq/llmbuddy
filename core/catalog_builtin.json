@@ -6,6 +6,7 @@
     "size_gb": 4.7,
     "min_ram_gb": 8.0,
     "params_b": 7.0,
+    "published": "2024-09-19",
     "gguf_url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -16,6 +17,7 @@
     "size_gb": 2.0,
     "min_ram_gb": 4.0,
     "params_b": 3.0,
+    "published": "2024-09-19",
     "gguf_url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -26,6 +28,7 @@
     "size_gb": 0.4,
     "min_ram_gb": 2.0,
     "params_b": 0.5,
+    "published": "2024-09-19",
     "gguf_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -36,6 +39,7 @@
     "size_gb": 4.7,
     "min_ram_gb": 8.0,
     "params_b": 7.0,
+    "published": "2024-11-12",
     "gguf_url": "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -46,6 +50,7 @@
     "size_gb": 4.9,
     "min_ram_gb": 8.0,
     "params_b": 8.0,
+    "published": "2024-07-23",
     "gguf_url": "https://huggingface.co/unsloth/Llama-3.1-8B-Instruct-GGUF/resolve/main/Llama-3.1-8B-Instruct-Q4_K_M.gguf",
     "source": "huggingface"
   },
@@ -56,6 +61,7 @@
     "size_gb": 1.7,
     "min_ram_gb": 4.0,
     "params_b": 2.0,
+    "published": "2024-08-01",
     "gguf_url": "https://huggingface.co/google/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -66,6 +72,7 @@
     "size_gb": 6.5,
     "min_ram_gb": 12.0,
     "params_b": 9.0,
+    "published": "2024-06-27",
     "gguf_url": "https://huggingface.co/google/gemma-2-9b-it-GGUF/resolve/main/gemma-2-9b-it-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -76,6 +83,7 @@
     "size_gb": 2.4,
     "min_ram_gb": 4.0,
     "params_b": 3.8,
+    "published": "2024-04-23",
     "gguf_url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -86,6 +94,7 @@
     "size_gb": 9.0,
     "min_ram_gb": 16.0,
     "params_b": 14.0,
+    "published": "2024-09-19",
     "gguf_url": "https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf",
     "source": "huggingface"
   },
@@ -96,6 +105,7 @@
     "size_gb": 2.0,
     "min_ram_gb": 4.0,
     "params_b": 3.0,
+    "published": "2024-09-25",
     "gguf_url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
     "source": "huggingface"
   }
