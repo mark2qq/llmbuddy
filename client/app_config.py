@@ -47,6 +47,11 @@ APP_NAME = "llmBuddy"
 APP_VERSION = "1.0.5"
 APP_TITLE = f"{APP_NAME}  v{APP_VERSION}"
 
+# 用户数据目录名（%LOCALAPPDATA% 下）：2026-10-20 起由 LLMDesktop 更名为 llmBuddy。
+# LEGACY 仅用于一次性迁移（旧目录整体改名，保留模型/配置/Key/cache/logs）。
+DATA_DIRNAME = "llmBuddy"
+LEGACY_DATA_DIRNAME = "LLMDesktop"
+
 
 def resource_path(rel: str) -> str:
     """解析资源路径（styles.qss、图标等）。
@@ -73,11 +78,29 @@ def resource_path(rel: str) -> str:
     return os.path.join(candidates[-1], rel)
 
 
+def _user_data_dir() -> str:
+    """用户数据目录（打包态）：%LOCALAPPDATA%\\llmBuddy。
+
+    Program Files 安装目录标准用户不可写，配置/模型/Key/日志全部外置到此。
+    历史目录名为 LLMDesktop：首次运行时把旧目录整体 rename 到新名字
+    （同卷原子操作，已下载模型与 API Key 原样保留）；rename 失败
+    （目录被占用等）则回退沿用旧目录，保证任何情况下数据不丢。
+    """
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    new_dir = os.path.join(local, DATA_DIRNAME)
+    old_dir = os.path.join(local, LEGACY_DATA_DIRNAME)
+    if not os.path.isdir(new_dir) and os.path.isdir(old_dir):
+        try:
+            os.rename(old_dir, new_dir)
+        except OSError:
+            return old_dir
+    return new_dir
+
+
 def _config_dir() -> str:
-    """配置目录：打包态用 %LOCALAPPDATA%\\LLMDesktop（Program Files 下不可写），开发态用 client 目录。"""
+    """配置目录：打包态用 %LOCALAPPDATA%\\llmBuddy（Program Files 下不可写），开发态用 client 目录。"""
     if is_frozen():
-        local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(local, "LLMDesktop")
+        return _user_data_dir()
     return CLIENT_DIR
 
 
@@ -91,13 +114,12 @@ DEV_BACKEND_SCRIPT = os.path.join(os.path.dirname(CLIENT_DIR), "serve.py")
 DEFAULT_ENGINE_EXE = (os.path.join(CLIENT_DIR, "engine", "llama-server.exe")
                       if is_frozen() else r"E:\llm-service\engine\llama-server.exe")
 
-# 默认模型目录：打包态放到用户可写的 %LOCALAPPDATA%\LLMDesktop\models
+# 默认模型目录：打包态放到用户可写的 %LOCALAPPDATA%\llmBuddy\models
 # （安装目录在 Program Files 下标准用户不可写，模型下载/加载会失败）；
 # 开发态沿用 E:\llama-serve\models
 def _default_models_dir() -> str:
     if is_frozen():
-        local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(local, "LLMDesktop", "models")
+        return os.path.join(_user_data_dir(), "models")
     return r"E:\llama-serve\models"
 
 
@@ -194,6 +216,14 @@ class Config:
         if not cfg.python_exe or not os.path.exists(cfg.python_exe):
             cfg.python_exe = DEFAULT_PYTHON_EXE
             healed = True
+        # 数据目录改名（LLMDesktop -> llmBuddy）后，旧配置里的 models_dir 仍指向
+        # 已不存在的旧路径；旧目录已整体迁移，把路径中的旧目录名换成新名字即可找回。
+        if (cfg.models_dir and not os.path.isdir(cfg.models_dir)
+                and LEGACY_DATA_DIRNAME in cfg.models_dir):
+            candidate = cfg.models_dir.replace(LEGACY_DATA_DIRNAME, DATA_DIRNAME)
+            if os.path.isdir(candidate):
+                cfg.models_dir = candidate
+                healed = True
         if healed and os.path.exists(target):
             try:
                 cfg.save(target)

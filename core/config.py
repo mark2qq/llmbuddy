@@ -22,16 +22,34 @@ from typing import Dict, Any, Optional, List
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.environ.get("LLM_MODELS_DIR", r"E:\llama-serve\models")
 
+# 用户数据目录名（%LOCALAPPDATA% 下）：2026-10-20 起由 LLMDesktop 更名为 llmBuddy。
+DATA_DIRNAME = "llmBuddy"
+LEGACY_DATA_DIRNAME = "LLMDesktop"
+
+
+def user_data_dir() -> str:
+    """用户数据目录（打包态）：%LOCALAPPDATA%\\llmBuddy。
+
+    与客户端 app_config._user_data_dir 行为对齐：新目录优先；若新目录尚
+    不存在而旧目录（LLMDesktop）存在（例如后端先于客户端启动、或迁移失败），
+    沿用旧目录，保证缓存/日志不丢。
+    """
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    new_dir = os.path.join(local, DATA_DIRNAME)
+    old_dir = os.path.join(local, LEGACY_DATA_DIRNAME)
+    if not os.path.isdir(new_dir) and os.path.isdir(old_dir):
+        return old_dir
+    return new_dir
+
 
 def _default_cache_dir() -> str:
-    """缓存目录：打包态 _internal 只读，改用 %LOCALAPPDATA%\\LLMDesktop\\cache；
+    """缓存目录：打包态 _internal 只读，改用 %LOCALAPPDATA%\\llmBuddy\\cache；
     可用 LLM_CACHE_DIR 覆盖；开发态用仓库 cache/。"""
     override = os.environ.get("LLM_CACHE_DIR")
     if override:
         return override
     if getattr(sys, "frozen", False):
-        local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(local, "LLMDesktop", "cache")
+        return os.path.join(user_data_dir(), "cache")
     return os.path.join(BASE_DIR, "cache")
 
 

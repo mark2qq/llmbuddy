@@ -15,15 +15,17 @@ import os
 import sys
 import time
 
+from app_config import DATA_DIRNAME  # 用户数据目录名（llmBuddy；旧名 LLMDesktop 已迁移）
+
 
 # ---------------------------------------------------------------------------
 # 启动期崩溃兜底：窗口程序（console=False）一旦抛出未捕获异常会“静默退出”，
 # 用户看到的就是“双击没反应”。这里把所有未捕获异常写到
-# %LOCALAPPDATA%/LLMDesktop/crash.log，并弹一个系统级消息框，便于排查。
+# %LOCALAPPDATA%/llmBuddy/crash.log，并弹一个系统级消息框，便于排查。
 # ---------------------------------------------------------------------------
 def _install_crash_handler() -> None:
     local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    log_dir = os.path.join(local, "LLMDesktop")
+    log_dir = os.path.join(local, DATA_DIRNAME)
     _orig = sys.excepthook
 
     def _show(msg: str) -> None:
@@ -66,13 +68,13 @@ import traceback  # noqa: E402  (置于崩溃兜底之后)
 
 
 # ---------------------------------------------------------------------------
-# 启动里程碑日志：写 %LOCALAPPDATA%/LLMDesktop/startup.log。
+# 启动里程碑日志：写 %LOCALAPPDATA%/llmBuddy/startup.log。
 # 即便窗口程序“静默退出”，也能据此判断卡在哪一步（便于用户/我们排查）。
 # ---------------------------------------------------------------------------
 def _startup_log(msg: str) -> None:
     try:
         local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        d = os.path.join(local, "LLMDesktop")
+        d = os.path.join(local, DATA_DIRNAME)
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "startup.log"), "a", encoding="utf-8") as f:
             f.write("%s  %s\n" % (time.strftime("%H:%M:%S"), msg))
@@ -81,7 +83,7 @@ def _startup_log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 打包态后端模式：LLMDesktop.exe --backend
+# 打包态后端模式：llmBuddy.exe --backend
 # 由 GUI 进程（BackendLauncher）以子方式拉起，只跑 FastAPI 服务，不加载 Qt。
 # 后端源码（serve.py + core/ + routers/）作为 data 文件随包分发到
 # _internal/backend/，与客户端 client/core 隔离；此处把该目录插到 sys.path 最前，

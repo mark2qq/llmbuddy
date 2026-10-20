@@ -1,6 +1,6 @@
-# LLMDesktop 全功能回归测试报告
+# llmBuddy 全功能回归测试报告
 
-- **测试对象**：本地大模型服务 LLMDesktop（FastAPI 后端 + PySide6 桌面客户端 + 冻结态 exe + Inno 安装包）
+- **测试对象**：本地大模型服务 llmBuddy（FastAPI 后端 + PySide6 桌面客户端 + 冻结态 exe + Inno 安装包）
 - **测试环境**：Windows，系统 Python 3.11.7（`C:\Program Files\Python311\python.exe`），本机有 HTTP 代理（所有 127.0.0.1 请求均 `trust_env=False`）
 - **硬件**：16.9 GB 总内存（测试期可用 ~5.9–6.1 GB），16 逻辑核 CPU；引擎为 CPU 精简版 `engine-runtime/llama-server.exe`
 - **模型**：`E:/llama-serve/models` 下 `qwen3-4b.gguf`(2.5GB) / `qwen2.5-7b-instruct.gguf` / `qwen2.5-coder-7b.gguf`
@@ -37,7 +37,7 @@
 
 ---
 
-## B. 冻结态 exe `--backend` 端到端（`dist/LLMDesktop/LLMDesktop.exe --backend`）
+## B. 冻结态 exe `--backend` 端到端（`dist/llmBuddy/llmBuddy.exe --backend`）
 
 **命令/端口**：`LLM_PORT=8031 LLM_ENGINE_PORT=8039 LLM_HOST=127.0.0.1`，引擎 `engine-runtime/llama-server.exe`，模型 `qwen3-4b`。
 测试脚本：`qa_e2e_backend.py`（修正版）/ `qa_e2e_diag.py`（速度标定）/ `qa_e2e_repro.py`（缺陷复现）。
@@ -73,7 +73,7 @@
 - 5 个页面切换（refresh=False）均无异常。
 
 ### C-2 冻结态 GUI exe 启动（`qa_gui_exe.py`，offscreen）
-- 先起 `--backend` 后端于 8031（GUI 据此跳过"启动服务"弹窗），以 offscreen 启动 GUI exe，轮询 `%LOCALAPPDATA%/LLMDesktop/startup.log`。
+- 先起 `--backend` 后端于 8031（GUI 据此跳过"启动服务"弹窗），以 offscreen 启动 GUI exe，轮询 `%LOCALAPPDATA%/llmBuddy/startup.log`。
 - **结果**：启动日志确认到达 `14:50:21 entering app.exec()` —— **证明冻结态 exe 同样无初始化死锁、能正常进入事件循环**（需求 9 打开即运行成立）。
 - **沙箱限制**：GUI exe 进入事件循环后约 0.5s 以 `rc=3221226505`(0xC0000409) 退出。该崩溃发生在 `app.exec()` **之后**，且同一套 PySide6 在 C-1 离线构造中 9/9 通过，判定为 **offscreen 无头环境（系统托盘/原生事件）假象，非产品逻辑缺陷**。建议在真实带显示器桌面环境复验运行稳定性。
 - 进程/临时目录均已清理。
@@ -89,7 +89,7 @@
 | 3 | GitHub 模型列表拉取/下载（可填账号） | 读 `library_page.py`（`catalog(force,keyword)`=M3、`pull`=M4、鉴权 `AuthDialog`）；端到端 M3 | **PASS** | 实现为"curated 清单 + 可选远程合并"（`catalog_builtin.json`），支持 gated 模型填 token 下载；非直接调 GitHub API，但功能等价 |
 | 4 | 模型对话窗口 | 读 `chat_page.py`（流式 SSE、多轮上下文、打字机）；端到端首次 chat 非流式/流式均返回 content | **PASS** | UI 与首轮推理正常；重复对话受引擎缺陷影响（见#1） |
 | 5 | API 调用信息展示（地址/模型名/Key 生成） | 读 `api_page.py`（`openai_base_url()`、`/v1/models`、`gen_key`=M7）；端到端 M7 | **PASS** | M7 生成 64 位 hex Key 正常 |
-| 6 | 一键安装包 | 检查 `client/build/inno_setup.iss` 与产物 `client/build/installer/LLMDesktop-Setup-1.0.0.exe`(48MB) | **PASS*** | 安装包**存在且脚本完整**（含默认路径、组件选择、卸载清理）；沙箱内未实际执行静默安装（需管理员提权+显示器），以"产物存在性+脚本审阅"判定 |
+| 6 | 一键安装包 | 检查 `client/build/inno_setup.iss` 与产物 `client/build/installer/llmBuddy-Setup-1.0.0.exe`(48MB) | **PASS*** | 安装包**存在且脚本完整**（含默认路径、组件选择、卸载清理）；沙箱内未实际执行静默安装（需管理员提权+显示器），以"产物存在性+脚本审阅"判定 |
 | 7 | 端口扫描选空闲端口 | 读 `core/port_scanner.py` + `routers/manage.py` M2；pytest `test_m2_ports` + 端到端 M2 | **PASS** | `psutil` 枚举 + socket 绑定探测，返回空闲/占用列表 |
 | 8 | 守护进程（崩溃自愈） | 读 `core/pool.py` `_watchdog_loop`（引擎崩溃重启）+ `core/backend_launcher.py` `_watch`（后端进程崩溃自动重启） | **PASS*** | 进程级自愈有效。**注意**：看门狗以"进程是否存活"判活，对"进程活着但不响应"的引擎挂起（#1）不会触发重启——建议补充响应探活 |
 | 9 | 无登录、打开即运行 | 读 `main.py`（无登录态；启动即建 QApplication 并提示一键启动后端）；C-2 确认到达 `app.exec()` | **PASS** | 无登录；打开即尝试拉起/连接服务 |
@@ -124,13 +124,13 @@
 
 ### 🟡 #3（沙箱限制）Inno 安装包未实际静默安装
 - `inno_setup.iss` 含 `PrivilegesRequired=admin`，静默安装需管理员提权与显示器；沙箱未执行。已以"脚本审阅 + 产物存在性"判定安装包可用。
-- **建议**：在管理员+显示器的Windows 上实机跑一次 `LLMDesktop-Setup-1.0.0.exe` 验证安装/卸载/启动链路。
+- **建议**：在管理员+显示器的Windows 上实机跑一次 `llmBuddy-Setup-1.0.0.exe` 验证安装/卸载/启动链路。
 
 ### 🟢 #4（已确认修复，未回退）历史已知修复回归
 - 打包同名 `core` 冲突 → 后端作 data 文件打入 `_internal/backend/`，`--backend` 模式正常 import serve（端到端已验证）。
 - `settings_page.py` 缺 `QHBoxLayout` import → 已修复（C-1 构造无 `NameError`）。
 - GUI 初始化死锁 → `QTimer.singleShot` 延迟刷新（C-1/C-2 均确认进入事件循环，无死锁）。
-- 冻结态 `models_dir`/`config` 改到 `%LOCALAPPDATA%\LLMDesktop`（offscreen 构造与 exe 启动均正常）。
+- 冻结态 `models_dir`/`config` 改到 `%LOCALAPPDATA%\llmBuddy`（offscreen 构造与 exe 启动均正常）。
 - M12 对思考模型兜底取 `reasoning_content`（端到端 M12 首轮 `sample` 非空）。
 - 网关把 `reasoning_content` 合并进 `content`（非流式 `_normalize` + 流式 `_rewrite_sse_line`；端到端首次 chat `content` 非空已验证）。
 

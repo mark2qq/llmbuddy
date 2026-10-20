@@ -9,7 +9,7 @@ REM    - Inno Setup 6（ISCC.exe 路径见下方，按实际安装位置修改�
 REM ============================================================
 REM 切到仓库根目录（本脚本位于 <repo>\client\build，故上溯两级）
 REM 必须从仓库根执行：PyInstaller 的 --distpath/--workpath 是相对当前目录的，
-REM 产物需落在 <repo>\dist\LLMDesktop，inno_setup.iss 里的 DistDir 也指向该路径。
+REM 产物需落在 <repo>\dist\llmBuddy，inno_setup.iss 里的 DistDir 也指向该路径。
 cd /d %~dp0\..\..
 
 set PYTHON=C:\Program Files\Python311\python.exe
@@ -18,9 +18,9 @@ set ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe
 if not exist "%ISCC%" set ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe
 if not exist "%ISCC%" set ISCC=C:\Program Files\Inno Setup 6\ISCC.exe
 
-REM 注意：PyInstaller 的 COLLECT 阶段会整目录删除已存在的 dist\LLMDesktop。
+REM 注意：PyInstaller 的 COLLECT 阶段会整目录删除已存在的 dist\llmBuddy。
 REM 若删除被拦截/失败，可先把旧产物改名留存（本项目历史做法）：
-REM   move dist\LLMDesktop dist\LLMDesktop.bak-%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%
+REM   move dist\llmBuddy dist\llmBuddy.bak-%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%
 echo [1/3] 正在用 PyInstaller 构建 onedir 产物 ...
 %PYTHON% -m PyInstaller client\build\pyinstaller.spec --noconfirm --clean --distpath dist --workpath build\pyi
 if errorlevel 1 (
@@ -28,8 +28,8 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-if not exist dist\LLMDesktop\LLMDesktop.exe (
-    echo [错误] 未找到产物 dist\LLMDesktop\LLMDesktop.exe
+if not exist dist\llmBuddy\llmBuddy.exe (
+    echo [错误] 未找到产物 dist\llmBuddy\llmBuddy.exe
     pause
     exit /b 1
 )
@@ -51,7 +51,7 @@ if errorlevel 1 (
 
 echo.
 echo [3/3] 构建完成！
-echo   - onedir 产物：dist\LLMDesktop\
-echo   - 安装包：client\build\installer\llmBuddy-Setup-1.0.4.exe
+echo   - onedir 产物：dist\llmBuddy\
+echo   - 安装包：client\build\installer\llmBuddy-Setup-1.0.5.exe
 echo.
 pause

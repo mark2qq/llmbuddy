@@ -1,32 +1,32 @@
 ; -*- coding: utf-8 -*-
 ; Inno Setup 安装脚本（client/build/inno_setup.iss）
 ;
-; 作用：把 PyInstaller onedir 产物（dist/LLMDesktop/）+ 精简版推理引擎（engine-runtime/）
+; 作用：把 PyInstaller onedir 产物（dist/llmBuddy/）+ 精简版推理引擎（engine-runtime/）
 ;       + 后端源码（serve.py/core/routers）打包为 Windows 一键安装程序。
 ;
 ; 布局：
-;   {app}\LLMDesktop.exe + _internal\    主程序（内嵌 PySide6 GUI + FastAPI 后端）
+;   {app}\llmBuddy.exe + _internal\    主程序（内嵌 PySide6 GUI + FastAPI 后端）
 ;   {app}\engine\                         llama.cpp CPU 版运行时（约 45MB）
 ;   {app}\backend\                        后端源码（高级用户可直接 python serve.py 运行）
 ;   {app}\models\                         模型目录（空占位，用户在客户端内下载模型）
-;   %LOCALAPPDATA%\LLMDesktop\config.json   运行时配置（安装目录只读，配置外置）
+;   %LOCALAPPDATA%\llmBuddy\config.json   运行时配置（安装目录只读，配置外置）
 ;
-; 用法：先运行 PyInstaller（client/build/build.bat 或 pyinstaller 命令）生成 dist\LLMDesktop\，
+; 用法：先运行 PyInstaller（client/build/build.bat 或 pyinstaller 命令）生成 dist\llmBuddy\，
 ;       再用 ISCC 编译本文件，产物在 client\build\installer\llmBuddy-Setup-1.0.0.exe
 
 ; 产品显示名（快捷方式 / 开始菜单 / 控制面板卸载项都显示这个）
 #define MyAppName "llmBuddy"
 #define MyAppVersion "1.0.5"
 #define MyAppPublisher "llmBuddy"
-; 可执行文件名保持 LLMDesktop.exe（内部二进制名，运行识别依赖它）
-#define MyAppExeName "LLMDesktop.exe"
+; 可执行文件名与产品名一致：llmBuddy.exe（内部以 sys.executable 自拉起，无外部依赖旧名）
+#define MyAppExeName "llmBuddy.exe"
 #define MyAppURL "https://github.com/mark2qq/ebook"
 ; 产品唯一 GUID：升级识别凭据（不可变更）
 #define MyAppGuid "{6C3D5A21-9B4E-4C7A-8F21-5D2E9A1B4C30}"
 
 ; ---- 构建机路径（按需修改）----
 #define RepoDir "E:\llm-service"
-#define DistDir "E:\llm-service\dist\LLMDesktop"
+#define DistDir "E:\llm-service\dist\llmBuddy"
 #define EngineDir "E:\llm-service\engine-runtime"
 
 [Setup]
@@ -107,10 +107,12 @@ Name: "{app}\backend\cache"
 
 [InstallDelete]
 ; 旧版本（产品名还是 LLMDesktop 时）留下的快捷方式：升级时清掉，避免桌面出现两个图标
+; 注意：以下 LLMDesktop 字样是「旧安装名」，必须保留——正是要清理的对象，勿改成 llmBuddy。
 Type: files; Name: "{autodesktop}\LLMDesktop.lnk"
 Type: filesandordirs; Name: "{autoprograms}\LLMDesktop"
 ; 旧安装目录（当时叫 LLMDesktop）：安装目录改名后清掉残留，避免旧文件占空间
-; 注意：用户数据（模型/配置/Key）在 %LOCALAPPDATA%\LLMDesktop，不在此目录，不受影响
+; 注意：用户数据（模型/配置/Key）在 %LOCALAPPDATA%\llmBuddy（旧名 LLMDesktop 的目录
+; 已由客户端首次启动时自动迁移），不在此安装目录，不受影响。
 Type: filesandordirs; Name: "{autopf}\LLMDesktop"
 
 [Icons]
@@ -128,7 +130,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: no
 
 [UninstallDelete]
 ; 只清理安装目录内的运行时日志/缓存。
-; 关键：**不再删除 %LOCALAPPDATA%\LLMDesktop**——那里存着用户下载的模型（数 GB）、
+; 关键：**不删除 %LOCALAPPDATA%\llmBuddy**——那里存着用户下载的模型（数 GB）、
 ; 配置与已生成的 API Key，卸载/升级都不应清空（历史 bug：卸载后模型和 Key 全丢）。
 Type: filesandordirs; Name: "{app}\backend\logs"
 Type: filesandordirs; Name: "{app}\backend\cache"

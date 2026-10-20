@@ -38,7 +38,7 @@
 
 | 层 | 组件 | 职责 | 进程 |
 |----|------|------|------|
-| **表现层（客户端）** | PySide6 主窗口 + 各页面/控件 | 交互、展示、系统托盘、安装体验 | `LLMDesktop.exe`（父进程） |
+| **表现层（客户端）** | PySide6 主窗口 + 各页面/控件 | 交互、展示、系统托盘、安装体验 | `llmBuddy.exe`（父进程） |
 | **客户端服务层** | `BackendLauncher` / `ApiClient` / `PortScanner` / `TaskRunner` | 拉起&看护后端、HTTP 封装、端口检测、后台线程 | 随客户端 |
 | **控制面（后端）** | `serve.py` + `routers/manage.py` | 管理 REST、系统检测、目录/下载编排、并发控制 | `serve.py`（子进程，由客户端 spawn） |
 | **网关层（后端）** | `routers/gateway.py` | OpenAI 兼容 `/v1/*`，按 model 名路由到引擎池 | 同后端 |
@@ -49,7 +49,7 @@
 
 ```mermaid
 graph TD
-    U[用户] -->|双击| EXE[LLMDesktop.exe<br/>PySide6 客户端]
+    U[用户] -->|双击| EXE[llmBuddy.exe<br/>PySide6 客户端]
     EXE -->|spawn + 看护| SRV[serve.py<br/>FastAPI 控制面/网关]
     SRV -->|管理 REST /api/v1/*| EXE
     SRV -->|OpenAI /v1/*| EXE
@@ -205,8 +205,8 @@ client/
 
 ### 3.3 安装后目录布局（打包产物）
 ```
-<install_dir>/                    # 用户可选，默认 C:\Program Files\LLMDesktop
-├── LLMDesktop.exe                # PySide6 客户端（PyInstaller 单 exe）
+<install_dir>/                    # 用户可选，默认 C:\Program Files\llmBuddy
+├── llmBuddy.exe                # PySide6 客户端（PyInstaller 单 exe）
 ├── backend/
 │   ├── serve.py  core/  routers/ # 后端代码
 │   ├── venv/                     # 后端独立 Python 3.11 运行时（fastapi/uvicorn/httpx/psutil）

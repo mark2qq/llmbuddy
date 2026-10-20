@@ -22,7 +22,7 @@ from typing import Optional, Dict, Any, List
 
 import httpx
 
-from core.config import resolve_gguf, MODELS_DIR
+from core.config import resolve_gguf, MODELS_DIR, user_data_dir
 from core.system import detect_system, estimate_max_models
 
 logger = logging.getLogger("llm-service")
@@ -132,7 +132,7 @@ class PoolEntry:
         突发大量日志（token 统计/计时等），若 Python 读取线程来不及排干，引擎会阻塞在
         写管道上，导致后续推理请求挂起/超时——表现为「第 1 次推理正常、之后偶发卡死」。
         重定向到文件由 OS 缓冲，绝不阻塞子进程。引擎日志写用户可写的
-        %LOCALAPPDATA%\\LLMDesktop\\logs，便于排查。
+        %LOCALAPPDATA%\\llmBuddy\\logs，便于排查。
         """
         ins = self.instance
         args = self._build_args()
@@ -145,9 +145,9 @@ class PoolEntry:
             except Exception:
                 pass
             self._engine_log = None
-        # 引擎日志目录（写入用户可写的 LOCALAPPDATA，避免安装目录不可写）
-        log_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                               "LLMDesktop", "logs")
+        # 引擎日志目录（写入用户可写的 LOCALAPPDATA，避免安装目录不可写；
+        # 数据目录名 llmBuddy，旧名 LLMDesktop 由 user_data_dir 兼容回退）
+        log_dir = os.path.join(user_data_dir(), "logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"engine_{ins.name}_{ins.engine_port}.log")
         try:

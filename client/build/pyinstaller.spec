@@ -2,14 +2,14 @@
 """
 PyInstaller 打包规格（client/build/pyinstaller.spec）。
 
-产物：onedir 模式 dist/LLMDesktop/LLMDesktop.exe（窗口程序 console=False，无控制台窗口）。
+产物：onedir 模式 dist/llmBuddy/llmBuddy.exe（窗口程序 console=False，无控制台窗口）。
 选择 onedir 而非 onefile 的理由：C/S 场景下后端进程（exe --backend）会被反复重启，
 onefile 每次都要解压自身（数十 MB），启动慢且临时目录易被清理；onedir 直接跑安装目录。
 
 内嵌内容：
     - PySide6 桌面 GUI（client/ 全部源码，入口 main.py）
     - 完整后端：serve.py + core/ + routers/ + fastapi/uvicorn/httpx/psutil
-      （运行时 GUI 以子进程方式拉起「LLMDesktop.exe --backend」运行内嵌服务）
+      （运行时 GUI 以子进程方式拉起「llmBuddy.exe --backend」运行内嵌服务）
     - 资源：resources/styles.qss、core/catalog_builtin.json
 不含：
     - 引擎 llama-server.exe 及 DLL（由 Inno Setup 从 engine-runtime/ 装入安装目录 engine/，
@@ -122,7 +122,7 @@ exe = EXE(
     a.scripts,
     [],
     [],
-    name="LLMDesktop",
+    name="llmBuddy",
     icon=os.path.join(CLIENT_DIR, "resources", "llmbuddy.ico"),
     debug=False,
     bootloader_ignore_signals=False,
@@ -138,7 +138,7 @@ exe = EXE(
     entitlements_file=None,
 )
 
-# COLLECT 生成 onedir 布局：dist/LLMDesktop/LLMDesktop.exe + dist/LLMDesktop/_internal/
+# COLLECT 生成 onedir 布局：dist/llmBuddy/llmBuddy.exe + dist/llmBuddy/_internal/
 coll = COLLECT(
     exe,
     a.binaries,
@@ -146,5 +146,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="LLMDesktop",
+    name="llmBuddy",
 )
