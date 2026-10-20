@@ -8,7 +8,7 @@
 修复：
     1. 页面外层包 QScrollArea（空间不足时整页纵向滚动，而不是压缩卡片）；
     2. 加载卡垂直方向 Fixed（按内容高度固定，不被压缩）；
-    3. 测试结果框固定 84px + 纵向滚动条；
+    3. 测试结果框固定 56px + 纵向滚动条；
     4. 监控卡尺寸收紧，内容最小宽度适配 800px 内容区（无横向滚动）。
 """
 import os
@@ -83,8 +83,8 @@ def test_test_result_box_fixed_height_and_scrollable():
     page = _make_page()
     box = page._test_label
     assert isinstance(box, QTextEdit)
-    assert box.height() == 84, "测试结果框应为固定高度"
-    assert box.minimumHeight() == box.maximumHeight() == 84
+    assert box.height() == 56, "测试结果框应为固定高度"
+    assert box.minimumHeight() == box.maximumHeight() == 56
     assert box.verticalScrollBarPolicy() != \
         Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
@@ -131,3 +131,56 @@ def test_log_card_pinned_bottom():
         assert (g.y(), g.height()) == (base.y(), base.height()), \
             f"{n} 个模型时运行日志位置/高度被改变"
         assert g.bottom() <= page.height()
+
+
+# --------------------------------------------------------------------------- #
+# 加载区紧凑化（2026-10-21 红字：出现滚动条是已加载模型高度不够，
+# 只要把模型加载的区域高度调小一点就行）
+# --------------------------------------------------------------------------- #
+def _two_models():
+    return {"loaded": [
+        {"name": "qwen2.5-0.5b-instruct-q4_k_m", "status": "paused",
+         "progress": 0.0, "ctx": 32768, "threads": 16, "gpu_layers": 0},
+        {"name": "llama-3.2-3b-instruct-q4_k_m", "status": "paused",
+         "progress": 0.0, "ctx": 32768, "threads": 16, "gpu_layers": 0}]}
+
+
+def test_load_card_compact_gives_room_to_loaded_models():
+    """加载区高度收紧（56px 测试框 + 紧凑间距），给已加载模型让出空间。"""
+    page = _make_page(1080, 640)
+    card = page._test_label.parentWidget()
+    assert page._test_label.height() == 56
+    assert card.height() <= 152, f"加载卡过高：{card.height()}"
+    assert card.layout().spacing() <= 6
+
+
+def test_two_models_no_scroll_at_min_window():
+    """主窗口最小高度（1080x640）下，两个已加载模型不需要滚动。"""
+    page = _make_page(1080, 640)
+    page._apply_pool(_two_models())
+    app.processEvents()
+    app.processEvents()
+    assert page._loaded_scroll.can_scroll() is False, \
+        "两个模型时已加载列表不应出现滚动条"
+    assert page._loaded_scroll.overlay_visible() is False
+
+
+def test_three_models_no_scroll_at_normal_window():
+    """常规高度（1080x700）下，三个已加载模型不需要滚动。"""
+    page = _make_page(1080, 700)
+    data = _two_models()
+    data["loaded"].append({"name": "qwen3-4b", "status": "ready",
+                           "progress": 1.0, "ctx": 4096,
+                           "threads": 8, "gpu_layers": 0})
+    page._apply_pool(data)
+    app.processEvents()
+    app.processEvents()
+    assert page._loaded_scroll.can_scroll() is False, \
+        "三个模型时已加载列表不应出现滚动条"
+
+
+def test_page_fits_min_window_height():
+    """压缩后页面在最小窗口高度下不再需要整页滚动。"""
+    page = _make_page(1080, 640)
+    assert page._page_scroll.can_scroll() is False
+    assert page._page_scroll.overlay_visible() is False

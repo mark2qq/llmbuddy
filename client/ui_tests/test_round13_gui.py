@@ -201,7 +201,8 @@ def test_dashboard_test_result_scrollable():
     p = DashboardPage(_FakeApi(), _FakeLauncher(), _FakeConfig())
     assert isinstance(p._test_label, QTextEdit), "测试结果应为可滚动文本框"
     assert p._test_label.isReadOnly()
-    assert p._test_label.height() >= 80, "应有足够高度展示多行"
+    # 至少两行高度（红字：加载区调小给已加载模型让位，2026-10-21 由 84 收到 56）
+    assert p._test_label.height() >= 54, "应有足够高度展示多行"
     assert p._test_label.verticalScrollBarPolicy() in (
         Qt.ScrollBarPolicy.ScrollBarAsNeeded,
         Qt.ScrollBarPolicy.ScrollBarAlwaysOn)

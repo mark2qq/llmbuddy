@@ -339,6 +339,9 @@ class DashboardPage(QWidget):
         # 高度按内容固定，不允许被布局压缩（否则固定高度的测试结果框会溢出卡片边界）
         card.setSizePolicy(QSizePolicy.Policy.Preferred,
                            QSizePolicy.Policy.Fixed)
+        # 紧凑化：加载区越高，下方「已加载模型」能显示的行数越少
+        # （红字反馈：出现滚动条是已加载模型高度不够，把加载区调小一点就行）
+        card.layout().setSpacing(4)
         # 红字要求：加载/测试按钮放到模型同一行，模型名称框缩小（不占满整行）
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -357,11 +360,13 @@ class DashboardPage(QWidget):
         card.layout().addLayout(row)
 
         # 测试结果：内容可能很长（延迟 + 样例全文）。红字要求：固定高度，
-        # 内容多了出滚动条，绝不撑出卡片区域
+        # 内容多了出滚动条，绝不撑出卡片区域。
+        # 高度取 56（约 2 行）：既放得下「通过/延迟 + 样例」两行，又不挤占
+        # 下方已加载模型的空间。
         self._test_label = QTextEdit()
         self._test_label.setObjectName("TestResult")
         self._test_label.setReadOnly(True)
-        self._test_label.setFixedHeight(84)
+        self._test_label.setFixedHeight(56)
         self._test_label.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self._test_label.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -385,7 +390,7 @@ class DashboardPage(QWidget):
         self._loaded_layout.setSpacing(8)
         self._loaded_layout.setContentsMargins(2, 2, 2, 2)
         self._loaded_scroll.setWidget(self._loaded_container)
-        self._loaded_scroll.setMinimumHeight(84)
+        self._loaded_scroll.setMinimumHeight(76)
         card.layout().addWidget(self._loaded_scroll)
         self._empty_loaded = QLabel("暂无已加载模型")
         self._empty_loaded.setObjectName("MutedLabel")
