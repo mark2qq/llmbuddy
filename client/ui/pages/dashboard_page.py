@@ -227,49 +227,94 @@ class DashboardPage(QWidget):
         card.layout().addLayout(inner)
         return card
 
+    def _render_conc_slots(self, n: int) -> QPixmap:
+        """渲染并发槽位示意图：n 个高亮方块 = 当前并发上限（简单图示替代长文案）。"""
+        total = 16
+        n = max(1, min(n, total))
+        bw, gap, h = 9, 3, 14
+        w = total * bw + (total - 1) * gap
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+               f'viewBox="0 0 {w} {h}">')
+        for i in range(total):
+            x = i * (bw + gap)
+            col = self._ACCENT if i < n else self._TRACK
+            svg += (f'<rect x="{x}" y="0" width="{bw}" height="{h}" '
+                    f'rx="2.5" fill="{col}"/>')
+        svg += '</svg>'
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pm = QPixmap(w, h)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        renderer.render(p)
+        p.end()
+        return pm
+
     def _build_concurrency_card(self) -> QGroupBox:
         card = self._card("并发上限")
         inner = QVBoxLayout()
         inner.setContentsMargins(6, 6, 6, 6)
         inner.setSpacing(8)
-        self._conc_label = QLabel("加载中…")
-        self._conc_label.setWordWrap(True)
-        inner.addWidget(self._conc_label)
+        # 顶行：当前上限大数字 + 系统建议（红字要求：文字精简，冗长说明移入 tooltip）
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self._conc_big = QLabel("—")
+        self._conc_big.setStyleSheet("font-size: 24px; font-weight: 600;")
+        self._conc_sug = QLabel("建议 —")
+        self._conc_sug.setObjectName("MutedLabel")
+        top.addWidget(self._conc_big)
+        top.addWidget(self._conc_sug)
+        top.addStretch(1)
+        self._conc_apply = QPushButton("应用")
+        self._conc_apply.clicked.connect(self._on_set_concurrency)
+        top.addWidget(self._conc_apply)
+        inner.addLayout(top)
 
+        # 槽位示意图（随滑块实时变化）
+        self._conc_slots = QLabel()
+        self._conc_slots.setPixmap(self._render_conc_slots(1))
+        self._conc_slots.setFixedHeight(14)
+        inner.addWidget(self._conc_slots)
+
+        # 滑块 + 数值
+        srow = QHBoxLayout()
+        srow.setSpacing(8)
         self._conc_slider = QSlider(Qt.Orientation.Horizontal)
         self._conc_slider.setRange(1, 16)
         self._conc_slider.setValue(1)
-        inner.addWidget(self._conc_slider)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        row.addWidget(QLabel("按内存自动估算"))
-        row.addStretch(1)
-        self._conc_apply = QPushButton("应用")
-        self._conc_apply.clicked.connect(self._on_set_concurrency)
-        row.addWidget(self._conc_apply)
-        inner.addLayout(row)
+        self._conc_slider.valueChanged.connect(self._on_slider_moved)
+        srow.addWidget(self._conc_slider, 1)
+        self._conc_val = QLabel("1")
+        self._conc_val.setMinimumWidth(22)
+        self._conc_val.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        srow.addWidget(self._conc_val)
+        inner.addLayout(srow)
         card.layout().addLayout(inner)
         return card
 
+    def _on_slider_moved(self, v: int) -> None:
+        """滑块变化 -> 实时更新槽位图示与数值。"""
+        self._conc_slots.setPixmap(self._render_conc_slots(v))
+        self._conc_val.setText(str(v))
+
     def _build_load_card(self) -> QGroupBox:
         card = self._card("模型加载 / 测试")
+        # 红字要求：加载/测试按钮放到模型同一行，模型名称框缩小（不占满整行）
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addWidget(QLabel("模型:"))
         self._model_combo = ModelComboBox()
+        self._model_combo.setMaximumWidth(340)
         row.addWidget(self._model_combo, 1)
-        card.layout().addLayout(row)
-
-        btn_row = QHBoxLayout()
         self._load_btn = QPushButton("加载")
         self._load_btn.setObjectName("PrimaryBtn")
         self._test_btn = QPushButton("测试")
         self._load_btn.clicked.connect(self._on_load)
         self._test_btn.clicked.connect(self._on_test)
-        btn_row.addWidget(self._load_btn)
-        btn_row.addWidget(self._test_btn)
-        btn_row.addStretch(1)
-        card.layout().addLayout(btn_row)
+        row.addWidget(self._load_btn)
+        row.addWidget(self._test_btn)
+        row.addStretch(1)
+        card.layout().addLayout(row)
 
         # 测试结果：内容可能很长（延迟 + 样例全文），用只读文本框自带滚动条，
         # 避免 QLabel 被裁切看不全（红字：测试时没有显示全，建议加滚动）
@@ -440,11 +485,14 @@ class DashboardPage(QWidget):
     def _fill_concurrency(self, d: dict) -> None:
         if not d:
             return
-        cur = d.get("max_concurrent", "?")
-        sug = d.get("suggested", "?")
+        cur = d.get("max_concurrent", 1)
+        sug = d.get("suggested", "—")
         reason = d.get("reason", "")
-        self._conc_label.setText(
-            f"当前上限: <b>{cur}</b>    系统建议: <b>{sug}</b>\n{reason}")
+        self._conc_big.setText(str(cur))
+        self._conc_sug.setText(f"系统建议 {sug}")
+        # 冗长的估算说明放 tooltip（红字要求：卡片内文字精简）
+        self._conc_sug.setToolTip(f"按内存自动估算：{reason}" if reason
+                                  else "按内存自动估算")
         try:
             self._conc_slider.setValue(int(cur))
         except Exception:
