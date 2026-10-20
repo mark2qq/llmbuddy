@@ -202,9 +202,14 @@ QHeaderView::section { background-color: #f4f6fb; color: #5a6275;
 /* 进度条 / 滚动条 */
 QProgressBar { background-color: #eef1f7; border: 1px solid #d5dbe7;
                color: #3b4354; }
-QScrollBar:vertical { background-color: #eef1f7; }
-QScrollBar::handle:vertical { background-color: #c8cfdd; }
-QScrollBar::handle:vertical:hover { background-color: #aeb7c9; }
+QScrollBar:vertical { background: transparent; }
+QScrollBar::handle:vertical { background-color: rgba(35, 45, 65, 18%); }
+QScrollBar::handle:vertical:hover { background-color: rgba(35, 45, 65, 34%); }
+#OverlayScrollBar { background: transparent; }
+#OverlayScrollBar::handle:vertical {
+    background-color: rgba(35, 45, 65, 22%); }
+#OverlayScrollBar::handle:vertical:hover {
+    background-color: rgba(35, 45, 65, 40%); }
 
 /* 日志 / 测试结果 */
 #LogView { background-color: #fbfcfe; color: #2b3242;

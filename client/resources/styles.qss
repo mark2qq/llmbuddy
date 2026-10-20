@@ -409,24 +409,47 @@ QProgressBar::chunk {
 }
 
 /* ---------------- 滚动条 ---------------- */
+/* 细滚动条：轨道透明、滑块半透明，不抢视觉（红字：滚动条默认不显示，
+   需要滚动时才出现；页面级滚动条由 AutoHideScrollArea 控制显隐） */
 QScrollBar:vertical {
-    background-color: #14161f;
-    width: 10px;
-    border-radius: 5px;
+    background: transparent;
+    width: 6px;
+    margin: 0;
+    border: none;
 }
 
 QScrollBar::handle:vertical {
-    background-color: #2c3142;
-    border-radius: 5px;
+    background-color: rgba(255, 255, 255, 16%);
+    border-radius: 3px;
     min-height: 24px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background-color: #3a4156;
+    background-color: rgba(255, 255, 255, 34%);
 }
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
+}
+
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+/* 页面浮层滚动条（AutoHideScrollArea 内置，默认隐藏） */
+#OverlayScrollBar {
+    background: transparent;
+    border: none;
+}
+
+#OverlayScrollBar::handle:vertical {
+    background-color: rgba(255, 255, 255, 22%);
+    border-radius: 3px;
+    min-height: 36px;
+}
+
+#OverlayScrollBar::handle:vertical:hover {
+    background-color: rgba(255, 255, 255, 42%);
 }
 
 /* ---------------- 对话框 ---------------- */

@@ -23,7 +23,7 @@ from collections import deque
 from typing import Optional
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-                               QLabel, QPushButton, QScrollArea,
+                               QLabel, QPushButton,
                                QTableWidgetItem, QHeaderView, QMessageBox,
                                QFrame, QSizePolicy, QTextEdit, QSlider)
 from PySide6.QtGui import QPixmap, QPainter
@@ -32,6 +32,7 @@ from PySide6.QtCore import Qt, QTimer, QByteArray, Signal
 
 from core.task_runner import Worker
 from core.auto_service import AutoService
+from ui.widgets.auto_scroll_area import AutoHideScrollArea
 from ui.widgets.model_combo import ModelComboBox
 from ui.widgets.progress_dialog import ProgressDialog
 from ui.widgets.log_view import LogView
@@ -87,13 +88,10 @@ class DashboardPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(0)
-        self._page_scroll = QScrollArea()
-        self._page_scroll.setWidgetResizable(True)
-        self._page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # 滚动条默认不显示：只有内容高度超出视口（窗口变矮/模型变多）时才浮出细条，
+        # 停止滚动 1.2s 后自动收起（红字反馈）。
+        self._page_scroll = AutoHideScrollArea()
         self._page_scroll.setObjectName("PageScroll")
-        # 只纵向滚动：横向由内容自适应宽度，避免出现横向滚动条
-        self._page_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
         content.setObjectName("PageContent")
         root = QVBoxLayout(content)
@@ -378,7 +376,7 @@ class DashboardPage(QWidget):
         card = self._card("已加载模型")
         # 卡片式布局：每行一个模型卡片（名称 + 参数摘要 + 正常尺寸操作按钮），
         # 替代原 8 列密集表格（12px 微型按钮看不清）。
-        self._loaded_scroll = QScrollArea()
+        self._loaded_scroll = AutoHideScrollArea()
         self._loaded_scroll.setWidgetResizable(True)
         self._loaded_scroll.setObjectName("LoadedScroll")
         self._loaded_container = QWidget()
