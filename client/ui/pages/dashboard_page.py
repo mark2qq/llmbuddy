@@ -250,7 +250,7 @@ class DashboardPage(QWidget):
         return pm
 
     def _build_concurrency_card(self) -> QGroupBox:
-        card = self._card("并发上限")
+        card = self._card("模型加载上限")
         inner = QVBoxLayout()
         inner.setContentsMargins(6, 6, 6, 6)
         inner.setSpacing(8)
@@ -316,12 +316,17 @@ class DashboardPage(QWidget):
         row.addStretch(1)
         card.layout().addLayout(row)
 
-        # 测试结果：内容可能很长（延迟 + 样例全文），用只读文本框自带滚动条，
-        # 避免 QLabel 被裁切看不全（红字：测试时没有显示全，建议加滚动）
+        # 测试结果：内容可能很长（延迟 + 样例全文）。红字要求：固定高度，
+        # 内容多了出滚动条，绝不撑出卡片区域
         self._test_label = QTextEdit()
         self._test_label.setObjectName("TestResult")
         self._test_label.setReadOnly(True)
-        self._test_label.setFixedHeight(96)
+        self._test_label.setFixedHeight(84)
+        self._test_label.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self._test_label.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._test_label.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._test_label.setPlaceholderText(
             "测试结果将显示在这里（内容较长时可滚动查看）")
         card.layout().addWidget(self._test_label)
