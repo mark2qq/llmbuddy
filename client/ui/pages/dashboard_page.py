@@ -10,16 +10,24 @@
     - 测试模型            -> M12 test_model()
     - 并发上限显示/设置   -> M13 concurrency() / M14 set_concurrency()
     - 运行日志            -> LogView（后端 stdout 实时转发）
+
+2026-10-20 改版（v3 布局）：四行纵向堆叠
+    第 1 行 运行监控与参数：内存环形图 / CPU 线程柱状 / GPU / 并发上限滑块（图形化）
+    第 2 行 模型加载 / 测试
+    第 3 行 已加载模型（卡片列表，可滚动）
+    第 4 行 运行日志（限高）
 """
 import html
 import time
 from typing import Optional
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-                               QLabel, QPushButton, QSpinBox, QScrollArea,
+                               QLabel, QPushButton, QScrollArea,
                                QTableWidgetItem, QHeaderView, QMessageBox,
-                               QFrame, QSizePolicy, QTextEdit)
-from PySide6.QtCore import Qt, QTimer, Signal
+                               QFrame, QSizePolicy, QTextEdit, QSlider)
+from PySide6.QtGui import QPixmap, QPainter
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtCore import Qt, QTimer, QByteArray, Signal
 
 from core.task_runner import Worker
 from core.auto_service import AutoService
@@ -34,6 +42,12 @@ class DashboardPage(QWidget):
     # 模型池快照变化（每次 refresh 拿到 pool 数据后发出，携带 loaded 列表）。
     # 主窗口据此即时更新状态栏「运行中模型」段（红字需求）。
     pool_changed = Signal(list)
+
+    # 监控卡配色（沿用应用深色主题）
+    _ACCENT = "#7C6FF0"
+    _TRACK = "#2A3040"
+    _GREEN = "#3DD68C"
+    _MUTED = "#8A90A6"
 
     def __init__(self, api, launcher, config, parent=None):
         super().__init__(parent)
@@ -63,28 +77,25 @@ class DashboardPage(QWidget):
         root.setSpacing(12)
         root.setContentsMargins(16, 16, 16, 16)
 
-        top = QHBoxLayout()
-        top.setSpacing(16)
+        # ---- 第 1 行：运行监控与参数（四卡一排）----
+        monitor = QHBoxLayout()
+        monitor.setSpacing(12)
+        self._mem_donut, self._mem_gb, self._mem_hint = (None, None, None)
+        self._cpu_text = None
+        self._gpu_text = None
+        monitor.addWidget(self._build_memory_card())
+        monitor.addWidget(self._build_cpu_card())
+        monitor.addWidget(self._build_gpu_card())
+        monitor.addWidget(self._build_concurrency_card())
+        root.addLayout(monitor)
 
-        # 左列：系统 + 并发（服务启停已移至系统托盘菜单）
-        left = QVBoxLayout()
-        left.setSpacing(16)
-        left.addWidget(self._build_system_card())
-        left.addWidget(self._build_concurrency_card())
-        left.addStretch(1)
+        # ---- 第 2 行：模型加载 / 测试 ----
+        root.addWidget(self._build_load_card())
 
-        # 右列：加载/测试 + 已加载列表
-        right = QVBoxLayout()
-        right.setSpacing(16)
-        right.addWidget(self._build_load_card())
-        right.addWidget(self._build_loaded_card(), 1)
+        # ---- 第 3 行：已加载模型（占满剩余空间）----
+        root.addWidget(self._build_loaded_card(), 1)
 
-        top.addLayout(left, 1)
-        top.addLayout(right, 2)
-        # 红字要求：已加载模型区域要大一些 -> 上半区占满剩余空间
-        root.addLayout(top, 1)
-
-        # 底部：运行日志（红字要求：日志区可以小一些，限制最大高度）
+        # ---- 第 4 行：运行日志（限高）----
         log_card = QGroupBox("运行日志")
         log_card.setObjectName("Card")
         log_card.setLayout(QVBoxLayout())
@@ -99,31 +110,146 @@ class DashboardPage(QWidget):
         if hasattr(self, "_log"):
             self._log.append(line)
 
-    def _build_system_card(self) -> QGroupBox:
-        card = self._card("系统资源")
-        self._sys_label = QLabel("加载中…")
-        self._sys_label.setObjectName("InfoLabel")
-        self._sys_label.setWordWrap(True)
-        card.layout().addWidget(self._sys_label)
+    # ------------------------------------------------------------------ #
+    # 第 1 行：监控卡（图形化）
+    # ------------------------------------------------------------------ #
+    def _render_donut(self, percent: float, color: str,
+                      size: int = 78) -> QPixmap:
+        """渲染内存使用环形图（含中心百分比），返回 QPixmap。"""
+        r = 34
+        cx = cy = size / 2
+        circ = 2 * 3.14159265 * r
+        pct = max(0.0, min(100.0, percent))
+        dash = circ * pct / 100.0
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" '
+            f'viewBox="0 0 {size} {size}">'
+            f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" '
+            f'stroke="{self._TRACK}" stroke-width="8"/>'
+            f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}" '
+            f'stroke-width="8" stroke-linecap="round" '
+            f'stroke-dasharray="{dash:.1f} {circ:.1f}" '
+            f'transform="rotate(-90 {cx} {cy})"/>'
+            f'<text x="{cx}" y="{cy - 1}" text-anchor="middle" '
+            f'fill="#E8EAF2" font-size="15" font-weight="500">{pct:.0f}%</text>'
+            f'<text x="{cx}" y="{cy + 13}" text-anchor="middle" '
+            f'fill="{self._MUTED}" font-size="10">已用内存</text>'
+            f'</svg>'
+        )
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        renderer.render(p)
+        p.end()
+        return pm
+
+    def _render_cpu_bars(self, size: int = 78) -> QPixmap:
+        """渲染 16 线程占用示意迷你柱状图（装饰性，构建时生成一次）。"""
+        n = 16
+        gap = 3
+        bw = 8
+        h = 34
+        w = n * bw + (n - 1) * gap
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+               f'viewBox="0 0 {w} {h}">')
+        pattern = [0.60, 0.35, 0.80, 0.28, 0.52, 0.20, 0.44, 0.66,
+                   0.30, 0.58, 0.24, 0.70, 0.40, 0.18, 0.56, 0.34]
+        for i, ph in enumerate(pattern):
+            x = i * (bw + gap)
+            bh = max(4, int(h * ph))
+            col = self._ACCENT if ph >= 0.26 else self._TRACK
+            svg += (f'<rect x="{x}" y="{h - bh}" width="{bw}" height="{bh}" '
+                    f'rx="2" fill="{col}"/>')
+        svg += '</svg>'
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pm = QPixmap(w, h)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        renderer.render(p)
+        p.end()
+        return pm
+
+    def _build_memory_card(self) -> QGroupBox:
+        card = self._card("内存")
+        inner = QHBoxLayout()
+        inner.setContentsMargins(4, 4, 4, 4)
+        inner.setSpacing(10)
+        self._mem_donut = QLabel()
+        self._mem_donut.setPixmap(self._render_donut(0.0, self._ACCENT))
+        self._mem_donut.setFixedSize(78, 78)
+        inner.addWidget(self._mem_donut)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self._mem_gb = QLabel("— / — GB")
+        self._mem_gb.setObjectName("InfoLabel")
+        self._mem_hint = QLabel("加载中…")
+        self._mem_hint.setObjectName("MutedLabel")
+        col.addWidget(QLabel("内存"))
+        col.addWidget(self._mem_gb)
+        col.addWidget(self._mem_hint)
+        inner.addLayout(col)
+        card.layout().addLayout(inner)
+        return card
+
+    def _build_cpu_card(self) -> QGroupBox:
+        card = self._card("CPU")
+        inner = QVBoxLayout()
+        inner.setContentsMargins(4, 4, 4, 4)
+        inner.setSpacing(6)
+        self._cpu_text = QLabel("— 核 / — 线程")
+        self._cpu_text.setObjectName("InfoLabel")
+        bars = QLabel()
+        bars.setPixmap(self._render_cpu_bars())
+        bars.setFixedHeight(34)
+        self._cpu_hint = QLabel("线程占用示意")
+        self._cpu_hint.setObjectName("MutedLabel")
+        inner.addWidget(self._cpu_text)
+        inner.addWidget(bars)
+        inner.addWidget(self._cpu_hint)
+        card.layout().addLayout(inner)
+        return card
+
+    def _build_gpu_card(self) -> QGroupBox:
+        card = self._card("GPU")
+        inner = QVBoxLayout()
+        inner.setContentsMargins(4, 4, 4, 4)
+        inner.setSpacing(6)
+        self._gpu_text = QLabel("加载中…")
+        self._gpu_text.setObjectName("InfoLabel")
+        self._gpu_hint = QLabel("显存 — / — GB")
+        self._gpu_hint.setObjectName("MutedLabel")
+        inner.addWidget(QLabel("显卡"))
+        inner.addWidget(self._gpu_text)
+        inner.addWidget(self._gpu_hint)
+        # 无独显时整卡置灰（视觉弱化）
+        card.setObjectName("CardDim")
+        card.layout().addLayout(inner)
         return card
 
     def _build_concurrency_card(self) -> QGroupBox:
         card = self._card("并发上限")
+        inner = QVBoxLayout()
+        inner.setContentsMargins(6, 6, 6, 6)
+        inner.setSpacing(8)
         self._conc_label = QLabel("加载中…")
         self._conc_label.setWordWrap(True)
-        card.layout().addWidget(self._conc_label)
+        inner.addWidget(self._conc_label)
+
+        self._conc_slider = QSlider(Qt.Orientation.Horizontal)
+        self._conc_slider.setRange(1, 16)
+        self._conc_slider.setValue(1)
+        inner.addWidget(self._conc_slider)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("设置:"))
-        self._conc_spin = QSpinBox()
-        self._conc_spin.setRange(1, 16)
-        self._conc_spin.setValue(1)
-        row.addWidget(self._conc_spin)
+        row.setSpacing(8)
+        row.addWidget(QLabel("按内存自动估算"))
+        row.addStretch(1)
         self._conc_apply = QPushButton("应用")
         self._conc_apply.clicked.connect(self._on_set_concurrency)
         row.addWidget(self._conc_apply)
-        row.addStretch(1)
-        card.layout().addLayout(row)
+        inner.addLayout(row)
+        card.layout().addLayout(inner)
         return card
 
     def _build_load_card(self) -> QGroupBox:
@@ -299,7 +425,7 @@ class DashboardPage(QWidget):
     # 并发上限
     # ------------------------------------------------------------------ #
     def _on_set_concurrency(self) -> None:
-        n = self._conc_spin.value()
+        n = self._conc_slider.value()
 
         def _do():
             self.api.set_concurrency(n)
@@ -320,7 +446,7 @@ class DashboardPage(QWidget):
         self._conc_label.setText(
             f"当前上限: <b>{cur}</b>    系统建议: <b>{sug}</b>\n{reason}")
         try:
-            self._conc_spin.setValue(int(cur))
+            self._conc_slider.setValue(int(cur))
         except Exception:
             pass
 
@@ -443,15 +569,24 @@ class DashboardPage(QWidget):
         """刷新本页所有数据（后端就绪后调用）。"""
         def _sys_ok(d):
             if not d:
-                self._sys_label.setText("无法获取系统信息")
                 return
-            gpu = d.get("gpu_name") or ("不可用" if not d.get("gpu_available") else "可用")
-            self._sys_label.setText(
-                f"CPU 核心: {d.get('cpu_count')} 核 / {d.get('cpu_threads')} 线程<br>"
-                f"内存: {d.get('free_ram_gb')} / {d.get('total_ram_gb')} GB 空闲<br>"
-                f"GPU: {gpu}（显存 {d.get('free_vram_gb')}/{d.get('total_vram_gb')} GB）<br>"
-                f"系统建议并发模型数: {d.get('suggested_max_models')}"
-            )
+            total = float(d.get("total_ram_gb") or 0)
+            free = float(d.get("free_ram_gb") or 0)
+            used_pct = (1 - free / total) * 100 if total > 0 else 0
+            self._mem_donut.setPixmap(self._render_donut(used_pct, self._ACCENT))
+            self._mem_gb.setText(f"{free:.1f} / {total:.1f} GB")
+            self._mem_hint.setText(f"空闲 {free:.1f} GB")
+            self._cpu_text.setText(
+                f"{d.get('cpu_count')} 核 / {d.get('cpu_threads')} 线程")
+
+            gpu_ok = bool(d.get("gpu_available"))
+            if gpu_ok:
+                self._gpu_text.setText(str(d.get("gpu_name") or "可用"))
+                self._gpu_hint.setText(
+                    f"显存 {d.get('free_vram_gb')}/{d.get('total_vram_gb')} GB")
+            else:
+                self._gpu_text.setText("不可用")
+                self._gpu_hint.setText("显存 0.0 / 0.0 GB")
 
         self._bg(lambda: self.api.system_info(), _sys_ok)
         self._bg(lambda: self.api.concurrency(), self._fill_concurrency)
