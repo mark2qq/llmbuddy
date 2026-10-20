@@ -231,6 +231,9 @@ def main() -> None:
     # 启动日志停在 "backend not ready -> ask user" 再无后续）。推迟到事件循环内即可规避。
     def _post_startup() -> None:
         win._switch_page(0)
+        # 启动即按实际可达性同步状态栏（先启动后端再开客户端的场景，
+        # 不会收到 ready 信号，若不探测会一直显示「服务未启动」）
+        win._refresh_status_models()
         if launcher.is_ready():
             return
         _startup_log("backend not ready -> ask user")

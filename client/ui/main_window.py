@@ -39,6 +39,8 @@ class MainWindow(QMainWindow):
         self.launcher = launcher
         self.config = config
         self._force_quit = False
+        # 状态栏当前服务状态（stopped/starting/running），供后台探测结果比对
+        self._status_state = "stopped"
 
         self.setWindowTitle(APP_TITLE)
         self.setMinimumSize(1000, 680)
@@ -237,6 +239,7 @@ class MainWindow(QMainWindow):
     def _on_state(self, state: str) -> None:
         # 托盘启停互斥：随后端状态实时切换可用性（红字要求）
         self._sync_tray_actions(state)
+        self._status_state = state
         self._status_bar.set_status(
             state, url=self.config.gateway_url() if state == "running" else "",
             loaded=0)
@@ -245,6 +248,7 @@ class MainWindow(QMainWindow):
 
     def _on_ready(self, ok: bool) -> None:
         if ok:
+            self._status_state = "running"
             self._status_bar.set_status("running", url=self.config.gateway_url())
             self._refresh_all()
 
@@ -263,7 +267,11 @@ class MainWindow(QMainWindow):
                              getattr(self.config, "background_color", ""))
         except Exception:
             pass
-        self._status_bar.set_status("stopped", url=self.config.gateway_url())
+        # 保存设置后按实际可达性刷新服务状态。
+        # 修复（红字：服务已启动但状态栏显示「服务未启动」）：此前这里硬编码
+        # set_status("stopped")，而之后只有 5s 轮询回填模型名、不恢复服务状态，
+        # 于是出现「服务未启动 + 已加载模型 1」的矛盾显示。
+        self._refresh_status_models()
 
     def _refresh_all(self) -> None:
         for p in (self.dashboard, self.library, self.chat, self.api_page, self.settings):
@@ -312,14 +320,42 @@ class MainWindow(QMainWindow):
         self._refresh_status_models()
 
     def _refresh_status_models(self) -> None:
-        """后台拉取模型池，回填状态栏「已加载模型」段。"""
-        worker = Worker(self.api.pool)
-        worker.result.connect(self._apply_status_models)
-        worker.error.connect(lambda _msg: None)  # 后端未就绪时静默保持原状
+        """后台探测后端（M16 health，含 pool），同步服务状态 + 已加载模型段。
+
+        修复（红字：服务已启动但状态栏显示「服务未启动」）：
+        不能只依赖 launcher 的 ready 信号——先手动启动后端再开客户端、看门狗
+        重启、保存设置等路径都不会发 ready，状态栏会一直停在「服务未启动」。
+        改为以 health 是否可达作为唯一事实来源，5s 兜底轮询 + 保存设置后自愈。
+        """
+        worker = Worker(self.api.health)
+        worker.result.connect(self._apply_status_health)
+        worker.error.connect(self._on_status_probe_error)
         worker.start()
 
-    def _apply_status_models(self, pool) -> None:
-        self._status_bar.set_models(self._pool_names((pool or {}).get("loaded")))
+    def _apply_status_health(self, data) -> None:
+        """health 可达 -> 服务运行中，并回填已加载模型。"""
+        d = data or {}
+        if self._status_state != "running":
+            self._status_state = "running"
+            self._sync_tray_actions("running")
+            self._status_bar.set_status("running",
+                                        url=self.config.gateway_url())
+        pool = d.get("pool") or {}
+        self._status_bar.set_models(self._pool_names(pool.get("loaded")))
+
+    def _on_status_probe_error(self, _msg: str) -> None:
+        """health 不可达 -> 服务未启动。
+
+        「启动中」不回退：此时 health 失败属正常（服务尚未起来），
+        等 launcher 的 ready/state 信号给出最终结果。
+        """
+        if self._status_state == "starting":
+            return
+        if self._status_state != "stopped":
+            self._status_state = "stopped"
+            self._sync_tray_actions("stopped")
+            self._status_bar.set_status("stopped",
+                                        url=self.config.gateway_url())
 
     def _on_pool_changed(self, loaded) -> None:
         """控制台页 pool 快照变化 → 状态栏即时回填（无需再发请求）。"""
