@@ -15,6 +15,7 @@
 import os
 import sys
 import time
+import signal
 import subprocess
 import threading
 from typing import Optional
@@ -233,8 +234,71 @@ class BackendLauncher(QObject):
                     self.ready.emit(False)
             time.sleep(1.5)
 
+    @staticmethod
+    def _kill_process_tree(proc) -> None:
+        """终止后端进程及其全部子孙进程（含 llama-server.exe 推理引擎子进程）。
+
+        仅托盘「退出」/「停止服务」时调用，避免退出后残留孤儿引擎进程占用端口与显存
+        （2026-10-20 缺陷修复：原先只 kill serve.py，其派生的 llama-server.exe 变孤儿）。
+
+        Windows 优先用 ``taskkill /F /T /PID`` 杀整棵进程树（无需额外依赖）；
+        回退到 psutil 递归杀子孙；POSIX 用进程组信号。
+        """
+        if proc is None:
+            return
+        pid = proc.pid
+        if pid is None:
+            return
+        if sys.platform == "win32":
+            # taskkill /T 杀整棵进程树（含 llama-server.exe 引擎子进程），无需额外依赖
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return
+            except Exception:  # noqa: BLE001
+                pass
+            # 回退：psutil 递归杀子孙
+            try:
+                import psutil
+                p = psutil.Process(pid)
+                for c in p.children(recursive=True):
+                    try:
+                        c.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                import psutil
+                p = psutil.Process(pid)
+                for c in p.children(recursive=True):
+                    try:
+                        c.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except Exception:  # noqa: BLE001
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:  # noqa: BLE001
+                        pass
+
     def stop(self) -> None:
-        """停止后端：优雅停机（M15）后 terminate 等待。"""
+        """停止后端：优雅停机（M15）后 terminate 等待，并清理全部引擎子进程。"""
         if not self._running and self.proc is None:
             self.state_changed.emit("stopped")
             return
@@ -244,15 +308,22 @@ class BackendLauncher(QObject):
             self._api().stop_service()
         except Exception:
             pass
-        # 终止进程
+        # 终止进程（含全部子孙）
         if self.proc is not None:
             try:
                 self.proc.terminate()
                 try:
                     self.proc.wait(timeout=8)
                 except Exception:
-                    self.proc.kill()
+                    pass
             except Exception:
+                pass
+            # 兜底：无论是否优雅退出，都确保 serve.py 及其全部引擎子进程
+            #（llama-server.exe）被清理，避免退出后残留孤儿进程占用端口/显存
+            #（托盘「退出」缺陷修复）
+            try:
+                self._kill_process_tree(self.proc)
+            except Exception:  # noqa: BLE001
                 pass
             self.proc = None
         self._running = False
@@ -272,12 +343,16 @@ class BackendLauncher(QObject):
             return False
 
     def kill_hard(self) -> None:
-        """强制杀掉后端（仅托盘退出时使用，不等优雅停机）。"""
+        """强制杀掉后端（仅托盘退出时使用，不等优雅停机，并清理全部引擎子进程）。
+
+        关键：用 _kill_process_tree 一并杀掉 serve.py 派生的 llama-server.exe，
+        否则退出后引擎进程残留成孤儿，占用 7999+ 端口与显存（2026-10-20 缺陷修复）。
+        """
         self._stop_event.set()
         if self.proc is not None:
             try:
-                self.proc.kill()
-            except Exception:
+                self._kill_process_tree(self.proc)
+            except Exception:  # noqa: BLE001
                 pass
             self.proc = None
         self._running = False

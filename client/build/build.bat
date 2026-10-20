@@ -52,6 +52,6 @@ if errorlevel 1 (
 echo.
 echo [3/3] 构建完成！
 echo   - onedir 产物：dist\llmBuddy\
-echo   - 安装包：client\build\installer\llmBuddy-Setup-1.0.5.exe
+echo   - 安装包：client\build\installer\llmBuddy-Setup-1.0.6.exe
 echo.
 pause
