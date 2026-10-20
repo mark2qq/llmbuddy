@@ -82,6 +82,12 @@ def _spin(n=60, until=None, timeout=5.0):
         time.sleep(0.005)
 
 
+def _wait_models_applied(p, timeout=5.0):
+    """等待 ApiPage.refresh() 的后台模型聚合完成（刷新已异步化：16 轮）。"""
+    ok = _spin(until=lambda: p._models.count() >= 2, timeout=timeout)
+    assert ok, "refresh() 后台模型聚合未在限时内完成"
+
+
 # ---------------------------------------------------------------------------
 # 图1：启动/停止合并为单个切换按钮
 # ---------------------------------------------------------------------------
@@ -191,6 +197,7 @@ def test_api_page_default_selects_loaded():
 
     p = ApiPage(_Api(), None, _FakeConfig())
     p.refresh()
+    _wait_models_applied(p)
     # 第 0 项是「全局 Key」入口，模型项共 3 个（合计 4 项）
     assert p._models.count() == 4
     # 已加载模型排在模型项的第一行（全局项之后）
@@ -219,6 +226,7 @@ def test_api_page_empty_shows_hint():
 
     p = ApiPage(_Api(), None, _FakeConfig())
     p.refresh()
+    _wait_models_applied(p)
     # 第 0 项全局入口 + 1 条提示项
     assert p._models.count() == 2
     assert "全局 Key" in p._models.item(0).text()

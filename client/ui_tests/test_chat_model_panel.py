@@ -60,9 +60,26 @@ def _make_page():
     return ChatPage(_FakeApi(), None, None)
 
 
+def _wait_models(p, timeout=5.0):
+    """等待 refresh() 的后台模型聚合完成（刷新已异步化：15 轮）。
+
+    ChatPage.refresh() 改在后台线程请求 pool/list_models，测试必须在
+    断言/发送前等结果应用，否则 _current_model 为空（会触发模态弹窗阻塞）。
+    """
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+        if p._local_split["running"] or p._local_split["not_running"]:
+            return
+    raise AssertionError("refresh() 后台模型聚合未在限时内完成")
+
+
 def test_default_selects_running():
     p = _make_page()
     p.refresh()
+    _wait_models(p)
     assert p._current_model == "qwen3-4b", p._current_model
     assert "qwen3-4b" in p._model_btn.text()
 
@@ -70,6 +87,7 @@ def test_default_selects_running():
 def test_menu_has_three_sections():
     p = _make_page()
     p.refresh()
+    _wait_models(p)
     p._build_model_menu()
     texts = [a.text() for a in p._model_menu.actions()]
     assert any("本地模型 · 运行中" in t for t in texts)
@@ -87,6 +105,7 @@ def test_menu_has_three_sections():
 def test_pick_model_updates_state():
     p = _make_page()
     p.refresh()
+    _wait_models(p)
     p._on_pick_model("deepseek-7b")
     assert p._current_model == "deepseek-7b"
     assert "deepseek-7b" in p._model_btn.text()
@@ -96,6 +115,7 @@ def test_send_cloud_model_blocked(qtbot_or_none=None):
     """选云端模型发送应被拦截提示，不调用 chat_stream。"""
     p = _make_page()
     p.refresh()
+    _wait_models(p)
     p._on_pick_model("Qwen/Qwen2.5-7B-Instruct")
     # 未真正发送：直接调用内部拦截判断
     assert p._current_model not in p._local_models

@@ -114,6 +114,8 @@ def test_enter_sends_and_shift_enter_newline():
 
     p = ChatPage(_BlockApi(), None, None)
     p.refresh()
+    # 刷新已异步化（15 轮）：等模型聚合应用，否则 _current_model 为空触发模态弹窗
+    assert _wait_until(lambda: bool(p._local_models)), "后台模型聚合未完成"
     p._input.setPlainText("你好")
     _press_enter(p._input, shift=False)
     for _ in range(30):
@@ -139,6 +141,8 @@ def test_model_menu_groups_and_custom_entry():
 
     p = ChatPage(_FakeApi(), None, None)
     p.refresh()
+    # 刷新已异步化（15 轮）：菜单改用缓存数据，须先等聚合结果
+    assert _wait_until(lambda: bool(p._local_models)), "后台模型聚合未完成"
     p._build_model_menu()
     texts = [a.text() for a in p._model_menu.actions() if a.text()]
 
@@ -178,6 +182,8 @@ def test_api_page_per_model_key():
 
     p = ApiPage(_FakeApi(), None, _FakeConfig())
     p.refresh()
+    # 刷新已异步化（16 轮）：等后台模型聚合完成再断言
+    assert _wait_until(lambda: p._models.count() >= 2), "后台模型聚合未完成"
     assert p._models.count() >= 2
 
     # 选中 qwen3-4b（有绑定 key bb22）

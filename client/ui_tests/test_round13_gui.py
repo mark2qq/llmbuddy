@@ -119,6 +119,12 @@ def _spin(until=None, timeout=5.0):
         time.sleep(0.005)
 
 
+def _wait_models_applied(p, timeout=5.0):
+    """等待 ApiPage.refresh() 的后台模型聚合完成（刷新已异步化：16 轮）。"""
+    ok = _spin(until=lambda: p._models.count() >= 2, timeout=timeout)
+    assert ok, "refresh() 后台模型聚合未在限时内完成"
+
+
 # ---------------------------------------------------------------------------
 # 图1/2：托盘启停互斥的视觉保证
 # ---------------------------------------------------------------------------
@@ -157,6 +163,7 @@ def test_api_page_filters_non_local_models():
 
     p = ApiPage(_FakeApi(), None, _FakeConfig())
     p.refresh()
+    _wait_models_applied(p)
     # 第 0 项为「全局 Key」入口；模型项从第 1 项开始
     ids = [p._models.item(i).data(Qt.ItemDataRole.UserRole)
            for i in range(1, p._models.count())]
@@ -178,6 +185,7 @@ def test_api_page_keeps_list_when_catalog_fails():
 
     p = ApiPage(_NoCatalog(), None, _FakeConfig())
     p.refresh()
+    _wait_models_applied(p)
     ids = [p._models.item(i).data(Qt.ItemDataRole.UserRole)
            for i in range(1, p._models.count())]
     # 目录失败 -> 以 pool 已加载名兜底；列表不应被清空
@@ -218,8 +226,13 @@ def test_title_and_icon():
     assert APP_NAME == "llmBuddy"
     assert "llmBuddy" in win.windowTitle() and APP_VERSION in win.windowTitle()
     assert "llmBuddy" in win.tray.toolTip()
-    nav = win.findChild(type(win._nav_buttons[0]), "NavTitle")
-    assert nav is not None and "llmBuddy" in nav.text() and APP_VERSION in nav.text()
+    from PySide6.QtWidgets import QWidget as _QWidget, QLabel as _QLabel
+    nav = win.findChild(_QWidget, "NavTitle")
+    assert nav is not None
+    name_lbl = nav.findChild(_QLabel, "NavTitleLabel")
+    ver_lbl = nav.findChild(_QLabel, "NavVersionLabel")
+    assert name_lbl is not None and APP_NAME in name_lbl.text()
+    assert ver_lbl is not None and APP_VERSION in ver_lbl.text()
     # 图标来自资源文件（非纯色方块回退）
     assert not win._app_icon.isNull()
     png = os.path.join(_CLIENT_DIR, "resources", "llmbuddy.png")

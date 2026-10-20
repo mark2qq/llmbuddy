@@ -416,6 +416,26 @@ class LibraryPage(QWidget):
             self._poll_timer.timeout.connect(self._poll_tick)
         self._poll_timer.start(1000)
 
+    @staticmethod
+    def _dl_text(name: str, status: str, st: dict) -> str:
+        """下载进度文案：百分比 + 已下载/总量 + 实时速度 + 并发线程数。
+
+        多线程分片加速后（core/download.py），让用户能直观看到速度提升。
+        """
+        pct = int(float(st.get("progress", 0.0) or 0.0) * 100)
+        parts = [f"{name}: {status} ({pct}%)"]
+        done = float(st.get("downloaded", 0) or 0)
+        total = float(st.get("total_bytes", 0) or 0)
+        if total > 0:
+            parts.append(f"{done / 1048576:.1f}/{total / 1048576:.0f} MB")
+        spd = float(st.get("speed_mbps", 0.0) or 0.0)
+        if spd > 0:
+            parts.append(f"{spd:.1f} MB/s")
+        th = int(st.get("threads", 1) or 1)
+        if th > 1:
+            parts.append(f"{th} 线程并行")
+        return " · ".join(parts)
+
     def _poll_tick(self) -> None:
         name = self._dl_name
         if not name:
@@ -430,7 +450,8 @@ class LibraryPage(QWidget):
         status = st.get("status", "")
         progress = float(st.get("progress", 0.0) or 0.0)
         if self._dl_progress:
-            self._dl_progress.set_progress(progress, f"{name}: {status} ({int(progress*100)}%)")
+            self._dl_progress.set_progress(
+                progress, self._dl_text(name, status, st))
         if status == "done":
             if self._dl_progress:
                 self._dl_progress.finish(True, f"{name} 下载完成")

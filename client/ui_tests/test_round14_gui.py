@@ -74,6 +74,12 @@ def _spin(until=None, timeout=5.0):
         time.sleep(0.005)
 
 
+def _wait_models_applied(p, timeout=5.0):
+    """等待 ApiPage.refresh() 的后台模型聚合完成（刷新已异步化：16 轮）。"""
+    ok = _spin(until=lambda: p._models.count() >= 2, timeout=timeout)
+    assert ok, "refresh() 后台模型聚合未在限时内完成"
+
+
 def test_global_key_item_exists_and_generates_unbound(monkeypatch):
     """第 0 项为全局 Key 入口；选中后「生成」创建不绑定模型的 Key。"""
     import ui.pages.api_page as api_page_mod
@@ -93,6 +99,7 @@ def test_global_key_item_exists_and_generates_unbound(monkeypatch):
     api = _FakeApi()
     p = ApiPage(api, None, _FakeConfig())
     p.refresh()
+    _wait_models_applied(p)
     first = p._models.item(0)
     assert "全局 Key" in first.text(), "第 0 项应为全局 Key 入口"
     assert first.data(Qt.ItemDataRole.UserRole) == ""

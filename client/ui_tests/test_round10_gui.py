@@ -79,6 +79,17 @@ def _spin(n=60, until=None, timeout=5.0):
         time.sleep(0.005)
 
 
+def _wait_models(p, timeout=5.0):
+    """等待 refresh() 的后台模型聚合完成（刷新已异步化：15 轮）。
+
+    ChatPage.refresh() 在后台线程请求 pool/list_models 并经信号回填，
+    测试必须在发送/断言前等结果应用，否则 _current_model 为空会触发
+    「未选择模型」模态弹窗（offscreen 下 exec() 永久阻塞）。
+    """
+    ok = _spin(until=lambda: bool(p._local_models), timeout=timeout)
+    assert ok, "refresh() 后台模型聚合未在限时内完成"
+
+
 # ---------------------------------------------------------------------------
 # 发送/停止圆形按钮状态
 # ---------------------------------------------------------------------------
@@ -126,6 +137,7 @@ def test_error_path_resets_busy():
 
     p = ChatPage(_BoomApi(), None, None)
     p.refresh()
+    _wait_models(p)
     p._input.setPlainText("你好")
     p._on_send()
     assert p._busy is True, "发送后应进入生成态"
@@ -153,6 +165,7 @@ def test_switch_model_after_error_can_send():
 
     p = ChatPage(_BoomApi(), None, None)
     p.refresh()
+    _wait_models(p)
     p._input.setPlainText("第一条")
     p._on_send()
     _spin(until=lambda: not p._busy)
@@ -184,6 +197,7 @@ def test_no_on_done_callback_still_releases_busy():
 
     p = ChatPage(_NoDoneApi(), None, None)
     p.refresh()
+    _wait_models(p)
     p._input.setPlainText("你好")
     p._on_send()
     assert p._busy is True
@@ -214,6 +228,7 @@ def test_library_refresh_has_loading_feedback():
     # 同步断言：进入加载态（红字：点击没反应）
     assert not p._refresh_btn.isEnabled(), "获取期间应禁用按钮"
     assert "正在获取模型目录" in p._hint.text(), "应有加载提示"
-    _spin(until=lambda: p._refresh_btn.isEnabled())
+    _spin(until=lambda: p._refresh_btn.isEnabled()
+          and "个模型" in p._hint.text())
     assert p._refresh_btn.isEnabled(), "完成后应恢复按钮"
     assert "个模型" in p._hint.text()

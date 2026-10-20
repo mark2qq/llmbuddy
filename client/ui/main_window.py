@@ -12,11 +12,12 @@ import os
 
 from PySide6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                                QPushButton, QStackedWidget, QSystemTrayIcon,
-                               QMenu, QMessageBox, QApplication)
-from PySide6.QtCore import Qt, QSize
+                               QMenu, QMessageBox, QApplication, QLabel)
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QIcon, QPixmap, QColor, QAction
 
 from app_config import APP_NAME, APP_VERSION, APP_TITLE, resource_path
+from core.task_runner import Worker
 
 from ui.widgets.status_bar import StatusBar
 from ui.pages.dashboard_page import DashboardPage
@@ -117,12 +118,20 @@ class MainWindow(QMainWindow):
         self._switch_page(0, refresh=False)
 
     def _nav_title(self) -> QWidget:
-        title = QPushButton(f"{APP_NAME}  v{APP_VERSION}")
-        title.setObjectName("NavTitle")
-        title.setToolTip(APP_TITLE)
-        title.setDisabled(True)
-        title.setMinimumHeight(56)
-        return title
+        """侧栏标题：产品名（放大）在上，版本号（灰色、小一号）在其下方。"""
+        box = QWidget()
+        box.setObjectName("NavTitle")
+        box.setToolTip(APP_TITLE)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 10, 8, 8)
+        lay.setSpacing(1)
+        name = QLabel(APP_NAME)
+        name.setObjectName("NavTitleLabel")
+        ver = QLabel(f"v{APP_VERSION}")
+        ver.setObjectName("NavVersionLabel")
+        lay.addWidget(name)
+        lay.addWidget(ver)
+        return box
 
     def _switch_page(self, idx: int, refresh: bool = True) -> None:
         self._stack.setCurrentIndex(idx)
@@ -216,6 +225,15 @@ class MainWindow(QMainWindow):
         # 设置页保存后同步 api/launcher 端点
         self.settings.config_changed.connect(self._apply_config)
 
+        # 控制台页每次拿到 pool 快照（加载/停止/取消后都会刷新）→ 状态栏即时回填
+        self.dashboard.pool_changed.connect(self._on_pool_changed)
+
+        # 兜底轮询：覆盖启动竞态、看门狗自愈、加载进度完成等未经过页面刷新的路径
+        self._status_poll = QTimer(self)
+        self._status_poll.setInterval(5000)
+        self._status_poll.timeout.connect(self._poll_status_models)
+        self._status_poll.start()
+
     def _on_state(self, state: str) -> None:
         # 托盘启停互斥：随后端状态实时切换可用性（红字要求）
         self._sync_tray_actions(state)
@@ -246,6 +264,59 @@ class MainWindow(QMainWindow):
                 p.refresh()
             except Exception:
                 pass
+        # 红字：状态栏显示正在运行的模型（pool 请求在后台线程，不卡 UI）
+        self._refresh_status_models()
+
+    @staticmethod
+    def _pool_names(loaded) -> list:
+        """从 pool.loaded 提取状态栏展示用的模型名列表。
+
+        - ready   : 直接显示模型名（正在运行）
+        - loading : 显示「名称(加载中 45%)」，避免加载期间状态栏空着「0（无）」
+        - paused / 其它 : 不计入（未在运行）
+        """
+        out = []
+        for e in (loaded or []):
+            if not isinstance(e, dict):
+                continue
+            name = e.get("name")
+            if not name:
+                continue
+            status = e.get("status")
+            if status == "ready":
+                out.append(name)
+            elif status == "loading":
+                try:
+                    pct = int(float(e.get("progress", 0) or 0) * 100)
+                except (TypeError, ValueError):
+                    pct = 0
+                out.append(f"{name}(加载中 {pct}%)")
+        return out
+
+    def _poll_status_models(self) -> None:
+        """5s 兜底轮询，保证状态栏模型段最终一致。
+
+        刻意不使用 launcher.is_running() 作门槛：它只在本进程拉起后端
+        子进程时为 True（见 backend_launcher.is_running），后端由看门狗
+        重启、手动启动、或先启动后端再开客户端时轮询会永不运行，
+        状态栏就会一直停在「0（无）」。后端未就绪时请求失败会被静默
+        忽略，保留上一次显示即可。
+        """
+        self._refresh_status_models()
+
+    def _refresh_status_models(self) -> None:
+        """后台拉取模型池，回填状态栏「已加载模型」段。"""
+        worker = Worker(self.api.pool)
+        worker.result.connect(self._apply_status_models)
+        worker.error.connect(lambda _msg: None)  # 后端未就绪时静默保持原状
+        worker.start()
+
+    def _apply_status_models(self, pool) -> None:
+        self._status_bar.set_models(self._pool_names((pool or {}).get("loaded")))
+
+    def _on_pool_changed(self, loaded) -> None:
+        """控制台页 pool 快照变化 → 状态栏即时回填（无需再发请求）。"""
+        self._status_bar.set_models(self._pool_names(loaded))
 
     # ------------------------------------------------------------------ #
     # 关闭事件：最小化到托盘

@@ -97,9 +97,14 @@ class ChatPage(QWidget):
         self._cancel_requested = False    # 用户是否请求终止当前生成
         self._current_model: str = ""      # 当前选中的模型
         self._local_models: List[str] = []  # 刷新得到的本地模型（运行+已下载）
+        self._local_split: Dict[str, List[str]] = {"running": [], "not_running": []}
+        self._refresh_token = 0  # 丢弃乱序/过期的后台刷新结果
         self._assistant_label: Optional[QLabel] = None
         self._assistant_text = ""
-        self._settings = QSettings("LLMDesktop", "LLMDesktop")
+        # QSettings 组织/应用名随产品改名（LLMDesktop -> llmBuddy，2026-10-20）；
+        # 旧设置仅存「自定义线上模型」一个键，读取时做一次兼容回退，避免用户配置丢失。
+        self._settings = QSettings("llmBuddy", "llmBuddy")
+        self._legacy_settings = QSettings("LLMDesktop", "LLMDesktop")
         self.chunk_received.connect(self._append_chunk)
         self.done_received.connect(self._on_done)
         self._build_ui()
@@ -186,7 +191,10 @@ class ChatPage(QWidget):
     # ------------------------------------------------------------------ #
     def _custom_cloud_models(self) -> List[str]:
         """读取用户配置的自定义线上模型（QSettings 持久化）。"""
-        val = self._settings.value(_CUSTOM_MODELS_KEY, [], type=list)
+        val = self._settings.value(_CUSTOM_MODELS_KEY, None)
+        if val is None:
+            # 兼容 2026-10-20 产品改名（LLMDesktop -> llmBuddy）前的旧设置
+            val = self._legacy_settings.value(_CUSTOM_MODELS_KEY, None, type=list)
         return [str(v) for v in (val or []) if str(v).strip()]
 
     def _open_model_menu(self) -> None:
@@ -214,10 +222,15 @@ class ChatPage(QWidget):
         not_running = [n for n in all_local if n not in running]
         return {"running": running, "not_running": not_running}
 
-    def _build_model_menu(self) -> None:
-        """重建选择面板：本地模型·运行中 / 本地模型·已下载 / 线上免费模型 / 配置自定义模型。"""
+    def _build_model_menu(self, local: Optional[Dict[str, List[str]]] = None) -> None:
+        """重建选择面板：本地模型·运行中 / 本地模型·已下载 / 线上免费模型 / 配置自定义模型。
+
+        参数 local 缺省时使用 refresh() 缓存的 _local_split（绝不在此处发起
+        网络请求——本函数会被打开菜单/选模型等交互频繁调用，必须瞬时完成）。
+        """
         self._model_menu.clear()
-        local = self._collect_local_models()
+        if local is None:
+            local = self._local_split
         running = local["running"]
         not_running = local["not_running"]
 
@@ -465,9 +478,32 @@ class ChatPage(QWidget):
     # 刷新
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
-        local = self._collect_local_models()
-        running = local["running"]
-        not_running = local["not_running"]
+        """刷新模型列表。
+
+        _collect_local_models 内含 2 个 HTTP 请求（pool + list_models），
+        若在主线程同步执行会冻结 UI——这正是「切换到对话模块反应慢」的根因；
+        这里放到后台线程执行，完成后经信号回主线程应用结果。
+        """
+        self._refresh_token += 1
+        token = self._refresh_token
+        worker = Worker(self._collect_local_models)
+        worker.result.connect(lambda local, t=token: self._apply_refresh(local, t))
+        # 出错时保留现有列表不动（不清空），仅忽略本次刷新
+        worker.error.connect(lambda _msg, t=token: self._discard_refresh(t))
+        worker.start()
+
+    def _discard_refresh(self, token: int) -> None:
+        """后台刷新失败：仅作废令牌，保留上次展示数据。"""
+        if token == self._refresh_token:
+            self._refresh_token += 1
+
+    def _apply_refresh(self, local: Dict[str, List[str]], token: int) -> None:
+        """应用后台刷新结果（主线程）。令牌不匹配说明已有更新的刷新，丢弃。"""
+        if token != self._refresh_token:
+            return
+        running = list(local.get("running") or [])
+        not_running = list(local.get("not_running") or [])
+        self._local_split = {"running": running, "not_running": not_running}
         self._local_models = running + not_running
         cloud_names = ([c["name"] for c in CLOUD_FREE_MODELS]
                        + self._custom_cloud_models())

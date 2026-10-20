@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                                QLabel, QPushButton, QSpinBox, QScrollArea,
                                QTableWidgetItem, QHeaderView, QMessageBox,
                                QFrame, QSizePolicy, QTextEdit)
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 
 from core.task_runner import Worker
 from core.auto_service import AutoService
@@ -31,8 +31,9 @@ from ui.widgets.log_view import LogView
 class DashboardPage(QWidget):
     """控制台页面。"""
 
-    # 通知主窗口状态变化（可选）
-    status_message = None
+    # 模型池快照变化（每次 refresh 拿到 pool 数据后发出，携带 loaded 列表）。
+    # 主窗口据此即时更新状态栏「运行中模型」段（红字需求）。
+    pool_changed = Signal(list)
 
     def __init__(self, api, launcher, config, parent=None):
         super().__init__(parent)
@@ -466,13 +467,14 @@ class DashboardPage(QWidget):
     def _refresh_models_and_table(self, local_names) -> None:
         # 下拉只列已下载（local=True）的模型：根源修复“gguf 缺失”
         self._model_combo.set_models(local_names)
+        # pool 请求挪后台线程（与 15 轮对话页/API 页同因修复：主线程 HTTP 卡 UI）
+        self._bg(lambda: self.api.pool(), self._apply_pool)
 
-        try:
-            pool = self.api.pool()
-        except Exception:
-            pool = {}
-        loaded = pool.get("loaded", []) or []
+    def _apply_pool(self, pool) -> None:
+        loaded = (pool or {}).get("loaded", []) or []
         self._render_loaded(loaded)
+        # 通知主窗口刷新状态栏「运行中模型」（所有加载/停止/取消路径都汇聚到 refresh）
+        self.pool_changed.emit(loaded)
 
     def _on_row_start(self, name: str) -> None:
         """行内「启动」：运行该模型（已加载未运行则恢复运行，否则直接加载运行）。"""

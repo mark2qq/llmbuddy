@@ -29,6 +29,7 @@ class ApiPage(QWidget):
         self.launcher = launcher
         self.config = config
         self._selected_model: Optional[str] = None   # 当前选中的模型
+        self._refresh_token = 0                       # 丢弃乱序/过期的后台刷新结果
         self._build_ui()
 
     # ------------------------------------------------------------------ #
@@ -71,9 +72,17 @@ class ApiPage(QWidget):
         key_card = QGroupBox("API Key")
         key_card.setObjectName("Card")
         key_card.setLayout(QVBoxLayout())
+        # 红字要求：当前模型行加一个「复制」按钮，可一键复制模型名称（参考下面 Key 的复制模式）
+        model_row = QHBoxLayout()
         self._key_model_label = QLabel("未选择模型（生成全局 Key）")
         self._key_model_label.setObjectName("MutedLabel")
-        key_card.layout().addWidget(self._key_model_label)
+        model_row.addWidget(self._key_model_label)
+        model_row.addStretch(1)
+        self._copy_model_btn = QPushButton("复制")
+        self._copy_model_btn.setToolTip("复制当前模型名称")
+        self._copy_model_btn.clicked.connect(self._on_copy_model)
+        model_row.addWidget(self._copy_model_btn)
+        key_card.layout().addLayout(model_row)
 
         key_row = QHBoxLayout()
         key_row.addWidget(QLabel("Key:"))
@@ -102,6 +111,17 @@ class ApiPage(QWidget):
         if cb is not None and text:
             cb.setText(text)
 
+    def _on_copy_model(self) -> None:
+        """红字要求：一键复制当前模型名称（参考 Key 的复制模式，带已复制反馈）。"""
+        model = self._selected_model
+        if not model:
+            return
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(model)
+        self._copy_model_btn.setText("已复制")
+        QTimer.singleShot(1800, lambda: self._copy_model_btn.setText("复制"))
+
     def _on_copy_key(self) -> None:
         """复制完整 Key 并提示位数（便于确认没有复制残缺）。"""
         text = self._key_label.text()
@@ -114,17 +134,22 @@ class ApiPage(QWidget):
         QTimer.singleShot(1800, lambda: self._copy_btn.setText("复制"))
 
     def _on_model_selected(self, current, _previous) -> None:
-        """红字要求：选择不同模型，对应显示不同 Key（未生成则显示空）。"""
+        """红字要求：选择不同模型，对应显示不同 Key（未生成则显示空）。
+        红字（2026-10-20）：切回「全局 Key」项时，也要回显已生成的全局 Key
+        （此前直接 return，导致切换模型后再回到全局项 Key 框为空）。"""
         if current is None:
             self._selected_model = None
         else:
             self._selected_model = current.data(Qt.ItemDataRole.UserRole) or ""
         self._key_label.setText("")
+        self._key_label.setPlaceholderText("（尚未生成 Key，点击「生成」创建）")
+        # 红字要求：未选中具体模型（全局 Key）时不可复制模型名
+        self._copy_model_btn.setEnabled(bool(self._selected_model))
         if not self._selected_model:
             self._key_model_label.setText("未选择模型（生成全局 Key）")
-            return
-        self._key_model_label.setText(f"当前模型: {self._selected_model}")
-        # 后台查询该模型已绑定的 Key
+        else:
+            self._key_model_label.setText(f"当前模型: {self._selected_model}")
+        # 后台查询已有 Key：全局项匹配 model 为空的最新 Key；模型项匹配该模型绑定 Key
         def _do():
             return self.api.list_keys()
 
@@ -134,11 +159,12 @@ class ApiPage(QWidget):
                 return
             found = ""
             for k in keys or []:
-                if k.get("model") == model and k.get("key"):
+                # 全局 Key 的 model 为空串；模型项匹配对应模型名
+                if (k.get("model") or "") == (model or "") and k.get("key"):
                     found = k["key"]        # 列表按时间倒序 -> 最后命中即最新
             self._key_label.setText(found)
             self._key_label.setPlaceholderText(
-                "（该模型尚未生成 Key，点击「生成」创建）" if not found else "")
+                "（尚未生成 Key，点击「生成」创建）" if not found else "")
 
         def _err(e):
             # 后端旧版本无 /api/v1/keys 时静默降级
@@ -207,13 +233,37 @@ class ApiPage(QWidget):
         return names if known else None
 
     def refresh(self) -> None:
+        """刷新模型列表（红字：切换到 API 页反应慢——根因是本方法在主线程
+        同步发 2 个 HTTP 请求（list_models + catalog），选中项变化又触发
+        list_keys。改为后台线程聚合，完成后回主线程重建列表，切页瞬时。"""
         self._url.setText(self.config.openai_base_url())
-        try:
-            models = self.api.list_models()
-        except Exception:
-            models = []
-        # 红字要求：不是本程序下载的模型不要显示（内置目录模板不计入）
-        local_names = self._local_model_names()
+        self._refresh_token += 1
+        token = self._refresh_token
+
+        def _collect():
+            try:
+                models = self.api.list_models()
+            except Exception:
+                models = []
+            # 红字要求：不是本程序下载的模型不要显示（内置目录模板不计入）。
+            # 返回 None 表示「无法判断」（目录查询失败），此时不做过滤。
+            return models, self._local_model_names()
+
+        worker = Worker(_collect)
+        worker.result.connect(
+            lambda data, t=token: self._apply_refresh(data[0], data[1], t))
+        # 出错保留现有列表（不清空），仅作废本次结果
+        worker.error.connect(lambda _msg, t=token: self._discard_refresh(t))
+        worker.start()
+
+    def _discard_refresh(self, token: int) -> None:
+        if token == self._refresh_token:
+            self._refresh_token += 1
+
+    def _apply_refresh(self, models, local_names, token: int) -> None:
+        """应用后台聚合结果（主线程）：重建模型列表并恢复/默认选中。"""
+        if token != self._refresh_token:
+            return
         if local_names is not None:
             models = [m for m in models if m.get("id") in local_names]
         # 红字要求：要默认显示已经加载的所有模型 ->
@@ -245,6 +295,7 @@ class ApiPage(QWidget):
             self._models.addItem(hint)
             self._selected_model = None
             self._key_model_label.setText("未选择模型（生成全局 Key）")
+            self._copy_model_btn.setEnabled(False)
             self._models.setCurrentRow(0)
             return
         # 尽量保持选中项；否则默认选中第一个「已加载」模型

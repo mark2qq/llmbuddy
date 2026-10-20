@@ -23,9 +23,21 @@ QMainWindow {
 
 #NavTitle {
     background: transparent;
-    color: #aeb6c8;
-    font-size: 13px;
-    font-weight: 600;
+    border: none;
+}
+
+#NavTitleLabel {
+    background: transparent;
+    color: #e8ebf2;
+    font-size: 18px;
+    font-weight: 700;
+    border: none;
+}
+
+#NavVersionLabel {
+    background: transparent;
+    color: #7d8596;
+    font-size: 11px;
     border: none;
 }
 
