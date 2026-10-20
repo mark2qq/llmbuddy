@@ -11,6 +11,7 @@ import math
 import platform
 import threading
 import subprocess
+import time
 from typing import Dict, Any, Optional, Tuple
 
 import psutil
@@ -23,12 +24,23 @@ _DEFAULT_MODEL_EST_GB: float = 6.0
 _system_cache: Optional[Dict[str, Any]] = None
 _cache_lock = threading.Lock()
 
+# GPU 探测缓存（秒）：控制台 2s 轮询，避免每次都拉起 nvidia-smi 子进程
+_GPU_CACHE_TTL: float = 30.0
+_gpu_cache: Optional[Tuple[bool, str, float, float]] = None
+_gpu_cache_ts: float = 0.0
+
 
 def _detect_gpu() -> Tuple[bool, str, float, float]:
     """
     探测 NVIDIA GPU。
     返回 (是否可用, 名称, 总显存GB, 空闲显存GB)；不可用则全部返回假值。
+    结果缓存 30s（控制台实时轮询时避免反复拉起 nvidia-smi）。
     """
+    global _gpu_cache, _gpu_cache_ts
+    now = time.time()
+    if _gpu_cache is not None and (now - _gpu_cache_ts) < _GPU_CACHE_TTL:
+        return _gpu_cache
+    result: Tuple[bool, str, float, float] = (False, "", 0.0, 0.0)
     try:
         proc = subprocess.run(
             ["nvidia-smi",
@@ -43,22 +55,27 @@ def _detect_gpu() -> Tuple[bool, str, float, float]:
             total = float(parts[1]) / 1024.0
             used = float(parts[2]) / 1024.0
             free = max(0.0, total - used)
-            return True, name, total, free
+            result = (True, name, total, free)
     except Exception:
         pass
-    return False, "", 0.0, 0.0
+    _gpu_cache = result
+    _gpu_cache_ts = now
+    return result
 
 
 def detect_system() -> Dict[str, Any]:
     """
     检测本机资源，返回 SystemInfo dict。
-    字段：cpu_count, cpu_threads, total_ram_gb, free_ram_gb, gpu_available,
-          gpu_name, total_vram_gb, free_vram_gb, os_reserve_gb, suggested_max_models
+    字段：cpu_count, cpu_threads, cpu_percent, total_ram_gb, free_ram_gb,
+          mem_percent, gpu_available, gpu_name, total_vram_gb, free_vram_gb,
+          os_reserve_gb, suggested_max_models
     """
     global _system_cache
     vm = psutil.virtual_memory()
     cpu_count = psutil.cpu_count(logical=False) or os.cpu_count() or 1
     cpu_threads = psutil.cpu_count(logical=True) or (cpu_count * 2)
+    # 非阻塞采样：返回自上次调用以来的平均 CPU 使用率（首次为 0，随后正常）
+    cpu_percent = psutil.cpu_percent(interval=None)
 
     gpu_avail, gpu_name, total_vram, free_vram = _detect_gpu()
 
@@ -66,8 +83,10 @@ def detect_system() -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "cpu_count": int(cpu_count),
         "cpu_threads": int(cpu_threads),
+        "cpu_percent": round(float(cpu_percent), 1),
         "total_ram_gb": round(vm.total / (1024 ** 3), 2),
         "free_ram_gb": round(free_ram, 2),
+        "mem_percent": round(float(vm.percent), 1),
         "gpu_available": gpu_avail,
         "gpu_name": gpu_name,
         "total_vram_gb": round(total_vram, 2),

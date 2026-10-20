@@ -19,6 +19,7 @@
 """
 import html
 import time
+from collections import deque
 from typing import Optional
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
@@ -58,9 +59,16 @@ class DashboardPage(QWidget):
         self._poll_model: str = ""
         self._progress: Optional[ProgressDialog] = None
         self._row_widgets: dict = {}
+        # CPU 实时曲线历史（最近 60 个采样点，2s 一点）
+        self._cpu_hist: deque = deque(maxlen=60)
+        self._mon_busy = False
         # 连接被拒（服务未运行）时自动启动后端并延时重试
         self._auto = AutoService(launcher, retry_cb=self.refresh)
         self._build_ui()
+        # 实时监控定时器：内存环形图 + CPU 曲线（红字要求「要实时运行」）
+        self._mon_timer = QTimer(self)
+        self._mon_timer.timeout.connect(self._mon_tick)
+        self._mon_timer.start(2000)
 
     # ------------------------------------------------------------------ #
     # UI 构建
@@ -144,24 +152,32 @@ class DashboardPage(QWidget):
         p.end()
         return pm
 
-    def _render_cpu_bars(self, size: int = 78) -> QPixmap:
-        """渲染 16 线程占用示意迷你柱状图（装饰性，构建时生成一次）。"""
-        n = 16
-        gap = 3
-        bw = 8
-        h = 34
-        w = n * bw + (n - 1) * gap
-        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
-               f'viewBox="0 0 {w} {h}">')
-        pattern = [0.60, 0.35, 0.80, 0.28, 0.52, 0.20, 0.44, 0.66,
-                   0.30, 0.58, 0.24, 0.70, 0.40, 0.18, 0.56, 0.34]
-        for i, ph in enumerate(pattern):
-            x = i * (bw + gap)
-            bh = max(4, int(h * ph))
-            col = self._ACCENT if ph >= 0.26 else self._TRACK
-            svg += (f'<rect x="{x}" y="{h - bh}" width="{bw}" height="{bh}" '
-                    f'rx="2" fill="{col}"/>')
-        svg += '</svg>'
+    def _render_cpu_graph(self, values, w: int = 200, h: int = 46) -> QPixmap:
+        """渲染 CPU 使用率实时面积折线图（任务管理器风格）。
+
+        values 为历史采样序列（最多 60 点），不足部分左侧补 0。
+        """
+        n = 60
+        vals = list(values)[-n:]
+        vals = [0.0] * (n - len(vals)) + vals
+        pts = []
+        for i, v in enumerate(vals):
+            x = i * (w - 2) / (n - 1) + 1
+            v = max(0.0, min(100.0, float(v)))
+            y = h - 1 - (v / 100.0) * (h - 3)
+            pts.append(f"{x:.1f},{y:.1f}")
+        poly = " ".join(pts)
+        area = f"1,{h - 1} {poly} {w - 1},{h - 1}"
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+            f'viewBox="0 0 {w} {h}">'
+            f'<rect x="0" y="0" width="{w}" height="{h}" rx="4" '
+            f'fill="{self._TRACK}" fill-opacity="0.22"/>'
+            f'<polygon points="{area}" fill="{self._ACCENT}" fill-opacity="0.30"/>'
+            f'<polyline points="{poly}" fill="none" stroke="{self._ACCENT}" '
+            f'stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>'
+            f'</svg>'
+        )
         renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
         pm = QPixmap(w, h)
         pm.fill(Qt.GlobalColor.transparent)
@@ -196,17 +212,23 @@ class DashboardPage(QWidget):
         card = self._card("CPU")
         inner = QVBoxLayout()
         inner.setContentsMargins(4, 4, 4, 4)
-        inner.setSpacing(6)
+        inner.setSpacing(4)
+        # 顶行：实时 CPU 占用率 + 核数/线程数
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self._cpu_pct = QLabel("—%")
+        self._cpu_pct.setStyleSheet("font-size: 18px; font-weight: 600;")
         self._cpu_text = QLabel("— 核 / — 线程")
-        self._cpu_text.setObjectName("InfoLabel")
-        bars = QLabel()
-        bars.setPixmap(self._render_cpu_bars())
-        bars.setFixedHeight(34)
-        self._cpu_hint = QLabel("线程占用示意")
-        self._cpu_hint.setObjectName("MutedLabel")
-        inner.addWidget(self._cpu_text)
-        inner.addWidget(bars)
-        inner.addWidget(self._cpu_hint)
+        self._cpu_text.setObjectName("MutedLabel")
+        top.addWidget(self._cpu_pct)
+        top.addWidget(self._cpu_text)
+        top.addStretch(1)
+        inner.addLayout(top)
+        # 实时面积折线图（任务管理器风格，随采样滚动更新）
+        self._cpu_graph = QLabel()
+        self._cpu_graph.setPixmap(self._render_cpu_graph([]))
+        self._cpu_graph.setFixedSize(200, 46)
+        inner.addWidget(self._cpu_graph)
         card.layout().addLayout(inner)
         return card
 
@@ -616,32 +638,61 @@ class DashboardPage(QWidget):
                  lambda e: self._test_label.setPlainText(f"测试失败: {e}"))
 
     # ------------------------------------------------------------------ #
+    # 实时监控（2s 采样：内存环形图 / CPU 曲线，红字要求「要实时运行」）
+    # ------------------------------------------------------------------ #
+    def _mon_tick(self) -> None:
+        """定时采样系统资源（仅页面可见时请求，避免无谓开销）。"""
+        if self._mon_busy or not self.isVisible():
+            return
+        self._mon_busy = True
+        self._bg(lambda: self.api.system_info(), self._on_mon_data,
+                 self._on_mon_err)
+
+    def _on_mon_data(self, d) -> None:
+        self._mon_busy = False
+        if d:
+            self._apply_system(d)
+
+    def _on_mon_err(self, e: str) -> None:
+        self._mon_busy = False
+        # 采样失败不刷日志（掉线时避免每 2s 刷屏），自动拉起逻辑保留
+        self._auto.handle(e, lambda _m: None)
+
+    def _apply_system(self, d: dict) -> None:
+        """用 M1 数据更新内存环形图 / CPU 实时曲线 / GPU 卡。"""
+        if not d:
+            return
+        total = float(d.get("total_ram_gb") or 0)
+        free = float(d.get("free_ram_gb") or 0)
+        if d.get("mem_percent") is not None:
+            used_pct = float(d.get("mem_percent") or 0)
+        else:
+            used_pct = (1 - free / total) * 100 if total > 0 else 0
+        self._mem_donut.setPixmap(self._render_donut(used_pct, self._ACCENT))
+        self._mem_gb.setText(f"{free:.1f} / {total:.1f} GB")
+        self._mem_hint.setText(f"空闲 {free:.1f} GB")
+        self._cpu_text.setText(
+            f"{d.get('cpu_count')} 核 / {d.get('cpu_threads')} 线程")
+        cpu = float(d.get("cpu_percent") or 0)
+        self._cpu_hist.append(cpu)
+        self._cpu_pct.setText(f"{cpu:.0f}%")
+        self._cpu_graph.setPixmap(self._render_cpu_graph(self._cpu_hist))
+
+        gpu_ok = bool(d.get("gpu_available"))
+        if gpu_ok:
+            self._gpu_text.setText(str(d.get("gpu_name") or "可用"))
+            self._gpu_hint.setText(
+                f"显存 {d.get('free_vram_gb')}/{d.get('total_vram_gb')} GB")
+        else:
+            self._gpu_text.setText("不可用")
+            self._gpu_hint.setText("显存 0.0 / 0.0 GB")
+
+    # ------------------------------------------------------------------ #
     # 刷新
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
         """刷新本页所有数据（后端就绪后调用）。"""
-        def _sys_ok(d):
-            if not d:
-                return
-            total = float(d.get("total_ram_gb") or 0)
-            free = float(d.get("free_ram_gb") or 0)
-            used_pct = (1 - free / total) * 100 if total > 0 else 0
-            self._mem_donut.setPixmap(self._render_donut(used_pct, self._ACCENT))
-            self._mem_gb.setText(f"{free:.1f} / {total:.1f} GB")
-            self._mem_hint.setText(f"空闲 {free:.1f} GB")
-            self._cpu_text.setText(
-                f"{d.get('cpu_count')} 核 / {d.get('cpu_threads')} 线程")
-
-            gpu_ok = bool(d.get("gpu_available"))
-            if gpu_ok:
-                self._gpu_text.setText(str(d.get("gpu_name") or "可用"))
-                self._gpu_hint.setText(
-                    f"显存 {d.get('free_vram_gb')}/{d.get('total_vram_gb')} GB")
-            else:
-                self._gpu_text.setText("不可用")
-                self._gpu_hint.setText("显存 0.0 / 0.0 GB")
-
-        self._bg(lambda: self.api.system_info(), _sys_ok)
+        self._bg(lambda: self.api.system_info(), self._apply_system)
         self._bg(lambda: self.api.concurrency(), self._fill_concurrency)
         # 下拉只列已下载模型：从目录（catalog）过滤 local=True 的名称，
         # 根源修复“gguf 缺失”（此前误用 list_models() 仅返回注册名，不代表已下载）。
