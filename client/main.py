@@ -119,6 +119,7 @@ from PySide6.QtCore import QFile, QTextStream, QTimer
 from app_config import Config, CLIENT_DIR
 from core.api_client import ApiClient
 from core.backend_launcher import BackendLauncher
+from core.single_instance import SingleInstanceGuard
 from ui.main_window import MainWindow
 
 
@@ -191,12 +192,26 @@ def main() -> None:
         app.setStyleSheet(style)
     _startup_log("stylesheet loaded=%s" % bool(style))
 
+    # ------------------------------------------------------------------
+    # 单实例锁（2026-10-20 需求）：已有 llmBuddy 在运行时，再次打开不启动
+    # 新窗口/新进程——第二个实例向已运行实例发送「激活」请求后立即退出，
+    # 已运行实例把主窗口置前。必须在创建 BackendLauncher 之前判定，
+    # 避免第二个实例重复拉起后端子进程。
+    # ------------------------------------------------------------------
+    guard = SingleInstanceGuard()
+    if not guard.try_lock():
+        _startup_log("single-instance: already running -> activate & exit")
+        app.processEvents()
+        sys.exit(0)
+    _startup_log("single-instance: primary acquired")
+
     config = Config.load()
     api = ApiClient(config.gateway_host, config.gateway_port, config.api_key)
     launcher = BackendLauncher(config)
     _startup_log("config/api/launcher ready")
 
     win = MainWindow(api, launcher, config)
+    guard.activate_requested.connect(win._show_window)
     win.show()
     _startup_log("MainWindow shown")
     # 首次刷新与「后端未就绪」提示统一推迟到事件循环内执行。
