@@ -146,12 +146,13 @@ def test_model_menu_groups_and_custom_entry():
     p._build_model_menu()
     texts = [a.text() for a in p._model_menu.actions() if a.text()]
 
-    assert any("本地模型 · 运行中" in t for t in texts)
-    assert any("本地模型 · 已下载" in t for t in texts)
-    assert any("线上免费模型" in t for t in texts)
+    assert any("本地模型" in t for t in texts)
+    assert any("在线模型 · SiliconFlow" in t for t in texts)
     assert any("配置自定义模型" in t for t in texts)
-    # 本地条目带状态图标前缀
+    # 本地条目带状态图标前缀：运行中 ● / 已下载 ○（合并为一段，前缀保留状态语义）
     assert any("●" in t and "qwen3-4b" in t for t in texts)
+    assert any("○" in t and "llama-3.1-8b" in t for t in texts)
+    assert any("○" in t and "deepseek-7b" in t for t in texts)
     # 云端条目带 ☁ 前缀
     assert any("☁" in t and "Qwen/Qwen2.5-7B-Instruct" in t for t in texts)
 

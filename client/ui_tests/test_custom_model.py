@@ -39,7 +39,12 @@ app = QApplication.instance() or QApplication(sys.argv)
 
 CUSTOM_KEY = "chat/custom_models"
 LEGACY_KEY = "chat/custom_cloud_models"
+CLOUD_KEY = "chat/cloud_api_key"
+CLOUD_MODELS_KEY = "chat/cloud_models"
+CLOUD_MODELS_AT_KEY = "chat/cloud_models_fetched_at"
 _ORG_APP = [("llmBuddy", "llmBuddy"), ("LLMDesktop", "LLMDesktop")]
+_ISOLATED_KEYS = (CUSTOM_KEY, LEGACY_KEY, CLOUD_KEY,
+                  CLOUD_MODELS_KEY, CLOUD_MODELS_AT_KEY)
 
 
 @pytest.fixture(autouse=True)
@@ -48,15 +53,15 @@ def _isolate_settings():
     saved = []
     for org, app_name in _ORG_APP:
         s = QSettings(org, app_name)
-        state = {key: s.value(key, None) for key in (CUSTOM_KEY, LEGACY_KEY)}
-        for key in (CUSTOM_KEY, LEGACY_KEY):
+        state = {key: s.value(key, None) for key in _ISOLATED_KEYS}
+        for key in _ISOLATED_KEYS:
             s.remove(key)
         s.sync()
         saved.append((org, app_name, state))
     yield
     for org, app_name, state in saved:
         s = QSettings(org, app_name)
-        for key in (CUSTOM_KEY, LEGACY_KEY):
+        for key in _ISOLATED_KEYS:
             if state[key] is None:
                 s.remove(key)
             else:
@@ -244,7 +249,7 @@ def test_menu_contains_custom_section():
     assert any("自定义模型" in t for t in texts)
     assert any("我的模型" in t for t in texts)
     assert any("配置自定义模型" in t for t in texts)
-    assert any("线上免费模型" in t for t in texts)
+    assert any("在线模型" in t for t in texts)
 
 
 # --------------------------------------------------------------------------- #
@@ -534,3 +539,342 @@ def test_test_custom_entry_success_and_error(monkeypatch):
     with pytest.raises(RuntimeError):
         cmd._test_custom_entry(
             {"base_url": "https://api.x/v1", "api_key": "sk-1", "model": "m"})
+
+
+# --------------------------------------------------------------------------- #
+# 10) 云端路由：线上免费模型直连 SiliconFlow（复用 chat_stream_custom）
+# --------------------------------------------------------------------------- #
+def _cloud_routing_api():
+    calls = {}
+
+    class _Api:
+        def pool(self):
+            return {"loaded": []}
+
+        def list_models(self):
+            return []
+
+        def chat_stream_custom(self, entry, messages, **kw):
+            calls["entry"] = entry
+            calls["messages"] = list(messages)
+            kw["on_done"]({"text": "hi", "finish": {}, "cancelled": False})
+            return {"text": "hi", "finish": {}, "cancelled": False}
+
+    return _Api(), calls
+
+
+def test_cloud_model_with_existing_key_routes_directly():
+    """已配置云端 Key：直接走 chat_stream_custom，不弹框。"""
+    from ui.pages.chat_page import ChatPage, SILICONFLOW_BASE_URL, CLOUD_FREE_MODELS
+
+    _set_llmbuddy(CLOUD_KEY, "sk-cloud")
+    api, calls = _cloud_routing_api()
+    p = ChatPage(api, None, None)
+
+    name = CLOUD_FREE_MODELS[0]["name"]
+    p._on_pick_model(name)
+    p._input.setPlainText("你好")
+    p._on_send()
+    assert _spin(until=lambda: p._busy is False), "云端模型发送未在限时内完成"
+
+    assert calls["entry"]["base_url"] == SILICONFLOW_BASE_URL
+    assert calls["entry"]["api_key"] == "sk-cloud"
+    assert calls["entry"]["model"] == name
+    # 合成 entry 为局部变量，不污染 _current_custom（保持选中态语义干净）
+    assert p._current_custom is None
+
+
+def test_cloud_model_missing_key_prompts_then_sends(monkeypatch):
+    """未配置 Key：弹 CloudKeyDialog 保存后带 Key 继续本次发送。"""
+    from ui.pages.chat_page import ChatPage, CloudKeyDialog, CLOUD_FREE_MODELS
+
+    # 模拟用户在对话框里输入并点「保存并继续」
+    def fake_exec(self):
+        self._saved_key = "sk-new"
+        return True
+
+    monkeypatch.setattr(CloudKeyDialog, "exec", fake_exec)
+    api, calls = _cloud_routing_api()
+    p = ChatPage(api, None, None)
+
+    name = CLOUD_FREE_MODELS[0]["name"]
+    p._on_pick_model(name)
+    p._input.setPlainText("你好")
+    p._on_send()
+    assert _spin(until=lambda: p._busy is False), "云端模型发送未在限时内完成"
+
+    assert calls["entry"]["api_key"] == "sk-new"
+    # Key 已写入 QSettings，下次直接复用
+    assert p._cloud_api_key() == "sk-new"
+
+
+def test_cloud_model_cancel_dialog_does_not_send(monkeypatch):
+    """取消 Key 对话框：不发送、不卡死、不改动选中状态。"""
+    from ui.pages.chat_page import ChatPage, CloudKeyDialog, CLOUD_FREE_MODELS
+
+    monkeypatch.setattr(CloudKeyDialog, "exec", lambda self: False)
+    api, calls = _cloud_routing_api()
+    p = ChatPage(api, None, None)
+
+    name = CLOUD_FREE_MODELS[0]["name"]
+    p._on_pick_model(name)
+    p._input.setPlainText("你好")
+    p._on_send()
+
+    assert p._busy is False
+    assert "entry" not in calls
+    assert p._cloud_api_key() == ""
+
+
+def test_cloud_key_persist_and_read():
+    """_set_cloud_api_key / _cloud_api_key 读写往返。"""
+    from ui.pages.chat_page import ChatPage
+
+    p = ChatPage(_FakeApi(), None, None)
+    assert p._cloud_api_key() == ""
+    p._set_cloud_api_key("sk-xyz")
+    assert p._cloud_api_key() == "sk-xyz"
+
+
+def test_menu_cloud_section_header():
+    """菜单云端段标题为「在线模型 · SiliconFlow」。"""
+    from ui.pages.chat_page import ChatPage
+
+    p = ChatPage(_FakeApi(), None, None)
+    p._build_model_menu()
+    texts = [a.text() for a in p._model_menu.actions()]
+    assert any("在线模型 · SiliconFlow" in t for t in texts)
+
+
+def test_cloud_key_dialog_validation():
+    """CloudKeyDialog：空 Key 保存被拦，填写后可取回。"""
+    from ui.pages.chat_page import CloudKeyDialog
+
+    dlg = CloudKeyDialog(current_key="")
+    dlg._on_save()
+    assert dlg.result() != QDialog.DialogCode.Accepted
+    assert dlg._error_label.text() != ""
+
+    dlg._key_edit.setText("sk-abc")
+    dlg._on_save()
+    assert dlg.saved_key() == "sk-abc"
+
+
+def test_menu_has_configure_cloud_key_entry():
+    """菜单含「配置 SiliconFlow API Key」入口（支持重配已保存的 Key）。"""
+    from ui.pages.chat_page import ChatPage
+
+    p = ChatPage(_FakeApi(), None, None)
+    p._build_model_menu()
+    texts = [a.text() for a in p._model_menu.actions()]
+    assert any("配置 SiliconFlow API Key" in t for t in texts)
+
+
+def test_reconfigure_existing_cloud_key(monkeypatch):
+    """已保存 Key 仍可通过菜单入口重配（问题 A 修复）。"""
+    from ui.pages.chat_page import ChatPage, CloudKeyDialog
+
+    _set_llmbuddy(CLOUD_KEY, "sk-old")
+    monkeypatch.setattr(CloudKeyDialog, "exec",
+                        lambda self: (setattr(self, "_saved_key", "sk-new")
+                                      or True))
+    p = ChatPage(_FakeApi(), None, None)
+    p._on_configure_cloud_key()
+    assert p._cloud_api_key() == "sk-new"
+
+
+# --------------------------------------------------------------------------- #
+# 11) 获取最新模型列表：fetch_cloud_models（fake httpx GET，不发真实网络）
+# --------------------------------------------------------------------------- #
+def _patch_httpx_get(monkeypatch, resp):
+    """用记录型 fake httpx.Client 替换 GET 客户端（chat_page 内的 httpx 引用）。"""
+    from ui.pages import chat_page as cp
+
+    calls = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            calls["kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, **kw):
+            calls["url"] = url
+            return resp
+
+    monkeypatch.setattr(cp.httpx, "Client", _FakeClient)
+    return calls
+
+
+class _FakeGetResp:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+def test_fetch_cloud_models_parses_tags_and_orders_free_first(monkeypatch):
+    from ui.pages.chat_page import (fetch_cloud_models,
+                                    SILICONFLOW_BASE_URL)
+
+    payload = json.dumps({
+        "object": "list",
+        "data": [
+            {"id": "paid-model/Pro", "object": "model"},
+            {"id": "Qwen/Qwen3-8B", "object": "model"},
+            {"id": "Qwen/Qwen2.5-7B-Instruct", "object": "model"},
+            {"id": "Qwen/Qwen3-8B", "object": "model"},   # 重复
+            {"id": "", "object": "model"},                 # 脏数据
+            "not-a-dict",
+        ],
+    })
+    calls = _patch_httpx_get(monkeypatch, _FakeGetResp(200, payload))
+
+    models = fetch_cloud_models("sk-1")
+    assert calls["kwargs"].get("trust_env") is False
+    assert calls["kwargs"]["headers"]["Authorization"] == "Bearer sk-1"
+    assert calls["url"] == f"{SILICONFLOW_BASE_URL}/models?sub_type=chat"
+
+    names = [m["name"] for m in models]
+    assert names == ["Qwen/Qwen3-8B", "Qwen/Qwen2.5-7B-Instruct", "paid-model/Pro"]
+    assert models[0]["tag"] == "免费"
+    assert models[2]["tag"] == "SiliconFlow"
+
+
+def test_fetch_cloud_models_error_paths(monkeypatch):
+    from ui.pages.chat_page import fetch_cloud_models
+
+    # 未配置 Key：直接抛，不发请求
+    with pytest.raises(RuntimeError):
+        fetch_cloud_models("")
+
+    # HTTP 401：带状态码抛出
+    _patch_httpx_get(monkeypatch, _FakeGetResp(401, "invalid token"))
+    with pytest.raises(RuntimeError, match="401"):
+        fetch_cloud_models("sk-1")
+
+    # 响应非 JSON
+    _patch_httpx_get(monkeypatch, _FakeGetResp(200, "<html>oops</html>"))
+    with pytest.raises(RuntimeError, match="解析失败"):
+        fetch_cloud_models("sk-1")
+
+    # 空列表
+    _patch_httpx_get(monkeypatch, _FakeGetResp(200, '{"object":"list","data":[]}'))
+    with pytest.raises(RuntimeError, match="未返回"):
+        fetch_cloud_models("sk-1")
+
+
+# --------------------------------------------------------------------------- #
+# 12) 云端模型缓存：_cloud_models 回退 / _save_cloud_models 往返
+# --------------------------------------------------------------------------- #
+def test_cloud_models_fallback_to_builtin():
+    from ui.pages.chat_page import ChatPage, CLOUD_FREE_MODELS
+
+    p = ChatPage(_FakeApi(), None, None)
+    assert p._cloud_models() == CLOUD_FREE_MODELS
+
+
+def test_cloud_models_roundtrip():
+    from ui.pages.chat_page import ChatPage, CLOUD_FREE_MODELS
+
+    p = ChatPage(_FakeApi(), None, None)
+    assert p._cloud_models() == CLOUD_FREE_MODELS
+    stored = [
+        {"name": "Qwen/Qwen3-8B", "tag": "免费"},
+        {"name": "vendor/NewModel", "tag": "SiliconFlow"},
+    ]
+    p._save_cloud_models(stored)
+    assert p._cloud_models() == stored
+    # 拉取时间已记录
+    assert _get_llmbuddy(CLOUD_MODELS_AT_KEY) is not None
+
+
+def test_cloud_models_cache_survives_dirty_json():
+    """缓存 JSON 损坏时回退内置清单，不崩溃。"""
+    from ui.pages.chat_page import ChatPage
+
+    _set_llmbuddy(CLOUD_MODELS_KEY, "{not-json")
+    p = ChatPage(_FakeApi(), None, None)
+    from ui.pages.chat_page import CLOUD_FREE_MODELS
+    assert p._cloud_models() == CLOUD_FREE_MODELS
+
+
+# --------------------------------------------------------------------------- #
+# 13) 菜单：获取入口 + 免费置顶 + 其它模型子菜单
+# --------------------------------------------------------------------------- #
+def test_menu_has_fetch_entry_and_free_first(monkeypatch):
+    from ui.pages.chat_page import ChatPage
+
+    p = ChatPage(_FakeApi(), None, None)
+    p._save_cloud_models([
+        {"name": "vendor/Paid1", "tag": "SiliconFlow"},
+        {"name": "Qwen/Qwen3-8B", "tag": "免费"},
+        {"name": "vendor/Paid2", "tag": "SiliconFlow"},
+    ])
+    p._build_model_menu()
+    texts = [a.text() for a in p._model_menu.actions()]
+    assert any("获取最新模型列表" in t for t in texts)
+    # 免费模型置顶：第一个云端项就是 Qwen/Qwen3-8B
+    cloud_idx = [i for i, t in enumerate(texts) if "Qwen/Qwen3-8B" in t]
+    assert cloud_idx, "免费模型未出现在顶层菜单"
+    # 付费模型收进子菜单
+    subs = [a.menu() for a in p._model_menu.actions() if a.menu() is not None]
+    sub_texts = [t for m in subs for t in (a.text() for a in m.actions())]
+    assert any("其它模型" in t for t in texts)
+    assert any("vendor/Paid1" in t for t in sub_texts)
+    assert not any("vendor/Paid1" in t for t in texts)
+
+
+def test_routing_uses_dynamic_cloud_cache():
+    """只在缓存里（不在内置清单）的模型也能走云端路由。"""
+    from ui.pages.chat_page import ChatPage, SILICONFLOW_BASE_URL, CLOUD_FREE_MODELS
+
+    fresh = "vendor/BrandNew-Free"
+    assert fresh not in [c["name"] for c in CLOUD_FREE_MODELS]
+
+    calls = {}
+
+    class _Api(_FakeApi):
+        def chat_stream_custom(self, entry, messages, **kw):
+            calls["entry"] = entry
+            kw["on_done"]({"text": "ok", "finish": {}, "cancelled": False})
+            return {"text": "ok", "finish": {}, "cancelled": False}
+
+    p = ChatPage(_Api(), None, None)
+    p._save_cloud_models([{"name": fresh, "tag": "免费"}])
+    p._set_cloud_api_key("sk-x")
+    p._on_pick_model(fresh)
+    p._input.setPlainText("你好")
+    p._on_send()
+    assert _spin(until=lambda: p._busy is False)
+    assert calls["entry"]["base_url"] == SILICONFLOW_BASE_URL
+    assert calls["entry"]["model"] == fresh
+
+
+def test_fetch_action_updates_cache(monkeypatch):
+    """菜单动作 _on_fetch_cloud_models：弹进度框->后台拉取->写缓存->重建菜单。"""
+    from ui.pages import chat_page as cp
+    from ui.pages.chat_page import ChatPage, CLOUD_MODELS_KEY
+
+    payload = json.dumps({"object": "list", "data": [
+        {"id": "Qwen/Qwen3-8B", "object": "model"},
+        {"id": "vendor/Paid1", "object": "model"},
+    ]})
+    _patch_httpx_get(monkeypatch, _FakeGetResp(200, payload))
+    # 进度框改为非阻塞（offscreen 下 exec 会永久阻塞事件循环）
+    monkeypatch.setattr(cp.ProgressDialog, "exec", lambda self: True)
+
+    _set_llmbuddy(CLOUD_KEY, "sk-1")
+    p = ChatPage(_FakeApi(), None, None)
+    p._on_fetch_cloud_models()
+    assert _spin(until=lambda: p._settings.value(CLOUD_MODELS_KEY) is not None), \
+        "拉取后未写入缓存"
+
+    names = [m["name"] for m in p._cloud_models()]
+    assert names == ["Qwen/Qwen3-8B", "vendor/Paid1"]
+    # 菜单已按新列表重建
+    texts = [a.text() for a in p._model_menu.actions()]
+    assert any("Qwen/Qwen3-8B" in t for t in texts)

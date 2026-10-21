@@ -4,7 +4,7 @@
 
 功能映射：
     - 模型选择       -> 底部输入区下方的下拉按钮（参考 WorkBuddy：显示当前模型 + ⌄），
-                       点击弹出选择面板：本地模型·运行中 / 本地模型·已下载 / 线上免费模型，
+                       点击弹出选择面板：本地模型 / 在线模型 · SiliconFlow / 自定义模型，
                        面板底部「⚙ 配置自定义模型」可添加自定义线上模型（QSettings 持久化）
     - 发送对话       -> POST /v1/chat/completions stream:true（M 网关）
     - 快捷键         -> Enter 发送 / Shift+Enter 换行
@@ -16,11 +16,15 @@
 说明：流式回调通过 Qt 信号投递回主线程更新 UI，避免跨线程操作控件；
      通过 generation id 隔离「已终止/已过期」的流式回调，防止串气泡或状态错乱。
 """
+import json
+from datetime import datetime
 from typing import Dict, List, Optional
 
+import httpx
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                                QTextEdit, QPushButton, QLabel, QScrollArea,
-                               QMenu, QMessageBox, QSizePolicy)
+                               QMenu, QMessageBox, QSizePolicy, QDialog,
+                               QLineEdit, QFormLayout)
 from PySide6.QtCore import Qt, Signal, QSettings, QSize, QPoint, QRect
 from PySide6.QtGui import (QPixmap, QPainter, QColor, QPolygon,
                            QIcon)
@@ -29,15 +33,157 @@ from core.task_runner import Worker
 from ui.widgets.custom_model_dialog import (CustomModelDialog,
                                             load_custom_models,
                                             save_custom_models)
+from ui.widgets.progress_dialog import ProgressDialog
 
 
-# 线上免费模型选项（UI 展示用；实际云端路由需后端接入，当前未接通）
+# 线上免费模型统一的 OpenAI 兼容端点（SiliconFlow）
+SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
+
+# SiliconFlow 官方标注「免费」的模型 ID 清单（2026-10 整理）。
+# 背景：GET /models 接口的响应只含 id/created/owned_by，不带免费标记，
+# 因此用这份清单给拉取到的模型打「免费」标并在菜单置顶；未命中的模型仍
+# 可选择（按量付费，余额不足时发送会报错，用户可自行判断）。
+SILICONFLOW_KNOWN_FREE = (
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-14B",
+    "Qwen/Qwen3-32B",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "deepseek-ai/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+    "deepseek-ai/DeepSeek-V3",
+    "THUDM/glm-4-9b-chat",
+    "THUDM/GLM-4-9B-0414",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+)
+
+# 内置云端模型清单：首次「获取最新模型」前的默认值（取已知免费模型）。
+# 走云端路由：选中后直连 SiliconFlow，复用 chat_stream_custom。
 CLOUD_FREE_MODELS: List[Dict[str, str]] = [
-    {"name": "Qwen/Qwen2.5-7B-Instruct", "tag": "SiliconFlow 免费"},
-    {"name": "Qwen/Qwen2.5-Coder-7B-Instruct", "tag": "SiliconFlow 免费"},
-    {"name": "deepseek-ai/DeepSeek-V3", "tag": "SiliconFlow"},
-    {"name": "meta-llama/Llama-3.1-8B-Instruct", "tag": "SiliconFlow"},
+    {"name": m, "tag": "免费"} for m in SILICONFLOW_KNOWN_FREE
 ]
+
+# 云端模型列表的 QSettings 缓存键（动态拉取结果 + 拉取时间）
+CLOUD_MODELS_KEY = "chat/cloud_models"
+CLOUD_MODELS_FETCHED_AT_KEY = "chat/cloud_models_fetched_at"
+
+
+def fetch_cloud_models(api_key: str) -> List[Dict[str, str]]:
+    """后台拉取 SiliconFlow 最新 chat 模型列表（GET /models?sub_type=chat）。
+
+    返回 [{name, tag}, ...]：已知免费模型 tag 为「免费」并置顶（组内保持
+    接口返回顺序），其余 tag 为「SiliconFlow」。失败抛异常（由 Worker 以
+    字符串回传）。trust_env=False 必须保留——本机有系统代理。
+    """
+    api_key = str(api_key or "").strip()
+    if not api_key:
+        raise RuntimeError("未配置 SiliconFlow API Key")
+    url = f"{SILICONFLOW_BASE_URL}/models?sub_type=chat"
+    with httpx.Client(trust_env=False, timeout=15.0,
+                      headers={"Authorization": f"Bearer {api_key}",
+                               "Accept": "application/json"}) as c:
+        resp = c.get(url)
+        body = resp.text
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}: {body[:200]}")
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise RuntimeError(f"响应解析失败：{body[:200]}")
+    items = data.get("data") or []
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        mid = str(it.get("id") or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append({"name": mid,
+                    "tag": "免费" if mid in SILICONFLOW_KNOWN_FREE else "SiliconFlow"})
+    if not out:
+        raise RuntimeError("接口未返回任何 chat 模型")
+    free = [m for m in out if m["tag"] == "免费"]
+    rest = [m for m in out if m["tag"] != "免费"]
+    return free + rest
+
+
+class CloudKeyDialog(QDialog):
+    """配置 SiliconFlow API Key（全局，供所有线上免费模型共用）。
+
+    首次使用线上免费模型且尚未配置 Key 时弹出；保存后立即写入 QSettings
+    并继续本次发送（无需用户再点一次）。
+    """
+
+    def __init__(self, parent=None, current_key: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("配置 SiliconFlow API Key")
+        self.setObjectName("CloudKeyDialog")
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        hint = QLabel(
+            "在线模型由 SiliconFlow 提供，需要一个 API Key 才能调用。\n"
+            "免费获取地址：https://cloud.siliconflow.cn/account/ak")
+        hint.setWordWrap(True)
+        hint.setObjectName("HintLabel")
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        key_row = QWidget()
+        kr = QHBoxLayout(key_row)
+        kr.setContentsMargins(0, 0, 0, 0)
+        kr.setSpacing(6)
+        self._key_edit = QLineEdit(current_key)
+        self._key_edit.setObjectName("CloudApiKeyEdit")
+        self._key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_edit.setPlaceholderText("sk-...")
+        self._show_btn = QPushButton("显示")
+        self._show_btn.setObjectName("TinyBtn")
+        self._show_btn.setCheckable(True)
+        self._show_btn.toggled.connect(self._on_toggle)
+        kr.addWidget(self._key_edit, 1)
+        kr.addWidget(self._show_btn)
+        form.addRow("API Key:", key_row)
+        layout.addLayout(form)
+
+        self._error_label = QLabel("")
+        self._error_label.setObjectName("ErrorLabel")
+        self._error_label.setWordWrap(True)
+        self._error_label.setStyleSheet("color:#e5484d;")
+        layout.addWidget(self._error_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("保存并继续")
+        save.setObjectName("PrimaryBtn")
+        save.clicked.connect(self._on_save)
+        btn_row.addWidget(cancel)
+        btn_row.addWidget(save)
+        layout.addLayout(btn_row)
+
+    def _on_toggle(self, checked: bool) -> None:
+        self._key_edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
+        self._show_btn.setText("隐藏" if checked else "显示")
+
+    def _on_save(self) -> None:
+        key = self._key_edit.text().strip()
+        if not key:
+            self._error_label.setText("请填写 API Key。")
+            return
+        self._saved_key = key
+        self.accept()
+
+    def saved_key(self) -> str:
+        return getattr(self, "_saved_key", "").strip()
 
 def _send_icon() -> QIcon:
     """白色向上箭头（发送）。"""
@@ -154,7 +300,7 @@ class ChatPage(QWidget):
 
         self._model_btn = QPushButton("选择模型  ⌄")
         self._model_btn.setObjectName("ModelDropBtn")
-        self._model_btn.setToolTip("选择要对话的模型（本地 / 线上免费）")
+        self._model_btn.setToolTip("选择要对话的模型（本地模型 / 在线模型）")
         self._model_btn.clicked.connect(self._open_model_menu)
         self._model_menu = QMenu(self)
         self._model_menu.setObjectName("ModelMenu")
@@ -197,6 +343,96 @@ class ChatPage(QWidget):
         """写入自定义模型列表（QSettings 持久化）。"""
         save_custom_models(self._settings, models)
 
+    def _cloud_api_key(self) -> str:
+        """读取全局云端（SiliconFlow）API Key（空串表示未配置）。"""
+        return str(self._settings.value("chat/cloud_api_key", "") or "").strip()
+
+    def _set_cloud_api_key(self, key: str) -> None:
+        """写入全局云端（SiliconFlow）API Key。"""
+        self._settings.setValue("chat/cloud_api_key", key)
+        self._settings.sync()
+
+    def _on_configure_cloud_key(self) -> None:
+        """打开「配置 SiliconFlow API Key」对话框（菜单入口，支持重配/清除）。"""
+        dlg = CloudKeyDialog(self, current_key=self._cloud_api_key())
+        if dlg.exec():
+            self._set_cloud_api_key(dlg.saved_key())
+
+    # ------------------------------------------------------------------ #
+    # 云端模型列表（动态拉取 + QSettings 缓存）
+    # ------------------------------------------------------------------ #
+    def _cloud_models(self) -> List[Dict[str, str]]:
+        """当前生效的云端模型列表：QSettings 缓存优先，否则回退内置清单。"""
+        raw = self._settings.value(CLOUD_MODELS_KEY, None)
+        if raw is not None:
+            data = raw
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = None
+            if isinstance(data, list):
+                out: List[Dict[str, str]] = []
+                for it in data:
+                    if not isinstance(it, dict):
+                        continue
+                    name = str(it.get("name") or "").strip()
+                    if not name:
+                        continue
+                    out.append({"name": name,
+                                "tag": str(it.get("tag") or "SiliconFlow")})
+                if out:
+                    return out
+        return [dict(m) for m in CLOUD_FREE_MODELS]
+
+    def _save_cloud_models(self, models: List[Dict[str, str]]) -> None:
+        """缓存拉取到的云端模型列表并记录拉取时间。"""
+        self._settings.setValue(CLOUD_MODELS_KEY,
+                                json.dumps(models, ensure_ascii=False))
+        self._settings.setValue(CLOUD_MODELS_FETCHED_AT_KEY,
+                                datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self._settings.sync()
+
+    def _on_fetch_cloud_models(self) -> None:
+        """菜单动作：从 SiliconFlow 拉取最新 chat 模型列表。
+
+        未配置 Key 先弹配置框；拉取走后台线程 + 进度弹窗（不冻结 UI）；
+        成功后写缓存并重建菜单，失败保留原列表并提示原因。
+        """
+        api_key = self._cloud_api_key()
+        if not api_key:
+            kdlg = CloudKeyDialog(self, current_key="")
+            if not kdlg.exec():
+                return
+            api_key = kdlg.saved_key()
+            self._set_cloud_api_key(api_key)
+
+        dlg = ProgressDialog("获取最新模型", cancellable=False, parent=self)
+        dlg.set_indeterminate("正在从 SiliconFlow 获取最新模型列表…")
+
+        def _ok(models: List[Dict[str, str]]) -> None:
+            self._save_cloud_models(models)
+            # 当前选中的模型若已不在新列表中（且非本地/自定义），复位到首个免费模型
+            names = [m["name"] for m in models]
+            if (self._current_custom is None and self._current_model
+                    and self._current_model not in names
+                    and self._current_model not in self._local_models):
+                self._current_model = names[0] if names else ""
+                self._update_model_btn()
+            self._build_model_menu()
+            free_n = sum(1 for m in models if m.get("tag") == "免费")
+            dlg.finish(True,
+                       f"✓ 已获取 {len(models)} 个模型（其中 {free_n} 个免费）")
+
+        def _fail(msg: str) -> None:
+            dlg.finish(False, f"获取失败：{str(msg)[:200]}")
+
+        w = Worker(fetch_cloud_models, api_key)
+        w.result.connect(_ok)
+        w.error.connect(_fail)
+        w.start()
+        dlg.exec()
+
     def _open_model_menu(self) -> None:
         """弹出模型选择面板（锚定在按钮下方）。"""
         self._build_model_menu()
@@ -223,7 +459,13 @@ class ChatPage(QWidget):
         return {"running": running, "not_running": not_running}
 
     def _build_model_menu(self, local: Optional[Dict[str, List[str]]] = None) -> None:
-        """重建选择面板：本地模型·运行中 / 本地模型·已下载 / 线上免费模型 / 自定义模型 / 配置自定义模型。
+        """重建选择面板：本地模型 / 在线模型 · SiliconFlow / 自定义模型 / 配置自定义模型。
+
+        结构收敛为两大类（需求：模型分本地与在线，在线以免费为主，另支持自定义）：
+            本地模型   —— 运行中(●)与已下载(○)合并为一段，前缀保留状态语义；
+            在线模型 · SiliconFlow —— 免费模型直接展示，付费模型收「其它模型」子菜单；
+            自定义模型 —— 在线段内子分组（本质也是在线模型），保留 custom: 内部键路由；
+            底部动作   —— 配置 API Key / 获取最新模型列表 / 配置自定义模型。
 
         参数 local 缺省时使用 refresh() 缓存的 _local_split（绝不在此处发起
         网络请求——本函数会被打开菜单/选模型等交互频繁调用，必须瞬时完成）。
@@ -234,27 +476,40 @@ class ChatPage(QWidget):
         running = local["running"]
         not_running = local["not_running"]
 
-        if running:
-            self._add_menu_header("本地模型 · 运行中")
+        # 本地模型：运行中(●)与已下载(○)合并为一段，前缀保留状态语义；
+        # 两者皆空时保留禁用提示，引导用户到模型库下载/加载
+        if running or not_running:
+            self._add_menu_header("本地模型")
             for n in running:
                 self._add_menu_action(f"●  {n}", n)
-        if not_running:
-            self._add_menu_header("本地模型 · 已下载")
             for n in not_running:
                 self._add_menu_action(f"○  {n}", n)
-        if not running and not not_running:
+        else:
             hint = self._model_menu.addAction("（暂无本地模型，请到模型库下载/加载）")
             hint.setEnabled(False)
 
         self._model_menu.addSeparator()
-        self._add_menu_header("线上免费模型")
-        for c in CLOUD_FREE_MODELS:
+
+        # 在线模型：免费置顶 + 付费进子菜单（"以免费为主"≠只有免费，保留可用性）
+        self._add_menu_header("在线模型 · SiliconFlow")
+        cloud = self._cloud_models()
+        free = [c for c in cloud if c.get("tag") == "免费"]
+        rest = [c for c in cloud if c.get("tag") != "免费"]
+        for c in free:
             label = f"☁  {c['name']}" + (f"  ·  {c.get('tag', '')}" if c.get("tag") else "")
             self._add_menu_action(label, c["name"])
+        if rest:
+            # 付费模型收进子菜单，避免主列表过长；选中后同样走云端直连
+            sub = self._model_menu.addMenu(f"其它模型（{len(rest)}，按量付费）")
+            sub.setObjectName("ModelMenu")
+            for c in rest:
+                label = f"☁  {c['name']}"
+                self._add_menu_action(label, c["name"], menu=sub)
 
+        # 自定义模型：在线段内子分组（自定义模型本质也是在线模型），
+        # 放在 SiliconFlow 模型列表之后、底部动作按钮之前；逻辑不变
         custom_models = self._custom_models()
         if custom_models:
-            self._model_menu.addSeparator()
             self._add_menu_header("自定义模型")
             for e in custom_models:
                 name = e.get("name") or e.get("model") or ""
@@ -263,6 +518,10 @@ class ChatPage(QWidget):
                 self._add_custom_menu_action(f"☁  {name}", e)
 
         self._model_menu.addSeparator()
+        cfg_key = self._model_menu.addAction("🔑  配置 SiliconFlow API Key")
+        cfg_key.triggered.connect(self._on_configure_cloud_key)
+        refresh = self._model_menu.addAction("🔄  获取最新模型列表")
+        refresh.triggered.connect(self._on_fetch_cloud_models)
         cfg = self._model_menu.addAction("⚙  配置自定义模型")
         cfg.triggered.connect(self._on_configure_custom_model)
 
@@ -270,8 +529,10 @@ class ChatPage(QWidget):
         act = self._model_menu.addAction(text)
         act.setEnabled(False)
 
-    def _add_menu_action(self, label: str, name: str) -> None:
-        act = self._model_menu.addAction(("✓  " if name == self._current_model else "    ") + label)
+    def _add_menu_action(self, label: str, name: str, menu=None) -> None:
+        """添加模型菜单项；menu 缺省为顶层面板（子菜单传入 sub QMenu）。"""
+        target = menu if menu is not None else self._model_menu
+        act = target.addAction(("✓  " if name == self._current_model else "    ") + label)
         act.triggered.connect(
             lambda _checked=False, m=name: self._on_pick_model(m))
 
@@ -426,7 +687,7 @@ class ChatPage(QWidget):
             return
         if not self._current_model:
             QMessageBox.information(self, "未选择模型",
-                                    "请先点击下方「选择模型」挑选一个本地模型。")
+                                    "请先点击下方「选择模型」挑选一个模型（本地模型 / 在线模型）。")
             return
 
         # 自定义模型：跳过本地模型拦截，走自定义 OpenAI 兼容端点
@@ -453,12 +714,31 @@ class ChatPage(QWidget):
                         max_tokens=max_tokens, cancel_check=cancel_check))
             return
 
-        # 线上免费模型预设：维持「未接入」拦截不变
-        if self._current_model not in self._local_models:
-            QMessageBox.information(
-                self, "线上模型未接入",
-                f"当前选择的是线上模型「{self._current_model}」，\n"
-                "云端路由尚未接入本地服务，请选择「本地模型」对话。")
+        # 线上免费模型预设：走云端路由（SiliconFlow 直连），复用自定义模型流式通道
+        if self._current_model in [c["name"] for c in self._cloud_models()]:
+            api_key = self._cloud_api_key()
+            if not api_key:
+                dlg = CloudKeyDialog(self, current_key="")
+                if not dlg.exec():
+                    return  # 取消：不发送，也不卡死
+                api_key = dlg.saved_key()
+                self._set_cloud_api_key(api_key)
+            # 用局部 entry 直连，不污染 _current_custom（保持选中态语义干净）
+            entry = {
+                "name": self._current_model,
+                "base_url": SILICONFLOW_BASE_URL,
+                "api_key": api_key,
+                "model": self._current_model,
+            }
+            self._add_bubble(text, "user")
+            self._messages.append({"role": "user", "content": text})
+            self._input.clear()
+            self._start_streaming(
+                lambda on_chunk, on_done, max_tokens, cancel_check:
+                    self.api.chat_stream_custom(
+                        entry, self._messages,
+                        on_chunk=on_chunk, on_done=on_done,
+                        max_tokens=max_tokens, cancel_check=cancel_check))
             return
 
         self._add_bubble(text, "user")
@@ -597,7 +877,7 @@ class ChatPage(QWidget):
         not_running = list(local.get("not_running") or [])
         self._local_split = {"running": running, "not_running": not_running}
         self._local_models = running + not_running
-        cloud_names = ([c["name"] for c in CLOUD_FREE_MODELS]
+        cloud_names = ([c["name"] for c in self._cloud_models()]
                        + [e.get("name") or e.get("model") or ""
                           for e in self._custom_models()])
 
