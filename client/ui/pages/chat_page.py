@@ -20,12 +20,15 @@ from typing import Dict, List, Optional
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                                QTextEdit, QPushButton, QLabel, QScrollArea,
-                               QMenu, QMessageBox, QInputDialog, QSizePolicy)
+                               QMenu, QMessageBox, QSizePolicy)
 from PySide6.QtCore import Qt, Signal, QSettings, QSize, QPoint, QRect
 from PySide6.QtGui import (QPixmap, QPainter, QColor, QPolygon,
                            QIcon)
 
 from core.task_runner import Worker
+from ui.widgets.custom_model_dialog import (CustomModelDialog,
+                                            load_custom_models,
+                                            save_custom_models)
 
 
 # 线上免费模型选项（UI 展示用；实际云端路由需后端接入，当前未接通）
@@ -35,10 +38,6 @@ CLOUD_FREE_MODELS: List[Dict[str, str]] = [
     {"name": "deepseek-ai/DeepSeek-V3", "tag": "SiliconFlow"},
     {"name": "meta-llama/Llama-3.1-8B-Instruct", "tag": "SiliconFlow"},
 ]
-
-# 自定义线上模型的 QSettings 存储键
-_CUSTOM_MODELS_KEY = "chat/custom_cloud_models"
-
 
 def _send_icon() -> QIcon:
     """白色向上箭头（发送）。"""
@@ -96,6 +95,7 @@ class ChatPage(QWidget):
         self._gen_id = 0                  # 当前 generation id（发送时 +1）
         self._cancel_requested = False    # 用户是否请求终止当前生成
         self._current_model: str = ""      # 当前选中的模型
+        self._current_custom: Optional[Dict] = None  # 当前选中的自定义模型 entry
         self._local_models: List[str] = []  # 刷新得到的本地模型（运行+已下载）
         self._local_split: Dict[str, List[str]] = {"running": [], "not_running": []}
         self._refresh_token = 0  # 丢弃乱序/过期的后台刷新结果
@@ -189,13 +189,13 @@ class ChatPage(QWidget):
     # ------------------------------------------------------------------ #
     # 模型选择面板（参考 WorkBuddy 模式）
     # ------------------------------------------------------------------ #
-    def _custom_cloud_models(self) -> List[str]:
-        """读取用户配置的自定义线上模型（QSettings 持久化）。"""
-        val = self._settings.value(_CUSTOM_MODELS_KEY, None)
-        if val is None:
-            # 兼容 2026-10-20 产品改名（LLMDesktop -> llmBuddy）前的旧设置
-            val = self._legacy_settings.value(_CUSTOM_MODELS_KEY, None, type=list)
-        return [str(v) for v in (val or []) if str(v).strip()]
+    def _custom_models(self) -> List[Dict]:
+        """读取自定义模型列表（新键 JSON；旧键自动一次性迁移）。"""
+        return load_custom_models(self._settings, self._legacy_settings)
+
+    def _save_custom_models(self, models: List[Dict]) -> None:
+        """写入自定义模型列表（QSettings 持久化）。"""
+        save_custom_models(self._settings, models)
 
     def _open_model_menu(self) -> None:
         """弹出模型选择面板（锚定在按钮下方）。"""
@@ -223,7 +223,7 @@ class ChatPage(QWidget):
         return {"running": running, "not_running": not_running}
 
     def _build_model_menu(self, local: Optional[Dict[str, List[str]]] = None) -> None:
-        """重建选择面板：本地模型·运行中 / 本地模型·已下载 / 线上免费模型 / 配置自定义模型。
+        """重建选择面板：本地模型·运行中 / 本地模型·已下载 / 线上免费模型 / 自定义模型 / 配置自定义模型。
 
         参数 local 缺省时使用 refresh() 缓存的 _local_split（绝不在此处发起
         网络请求——本函数会被打开菜单/选模型等交互频繁调用，必须瞬时完成）。
@@ -246,15 +246,21 @@ class ChatPage(QWidget):
             hint = self._model_menu.addAction("（暂无本地模型，请到模型库下载/加载）")
             hint.setEnabled(False)
 
-        cloud_names = [c["name"] for c in CLOUD_FREE_MODELS]
-        customs = [c for c in self._custom_cloud_models() if c not in cloud_names]
         self._model_menu.addSeparator()
         self._add_menu_header("线上免费模型")
         for c in CLOUD_FREE_MODELS:
             label = f"☁  {c['name']}" + (f"  ·  {c.get('tag', '')}" if c.get("tag") else "")
             self._add_menu_action(label, c["name"])
-        for name in customs:
-            self._add_menu_action(f"☁  {name}  ·  自定义", name)
+
+        custom_models = self._custom_models()
+        if custom_models:
+            self._model_menu.addSeparator()
+            self._add_menu_header("自定义模型")
+            for e in custom_models:
+                name = e.get("name") or e.get("model") or ""
+                if not name:
+                    continue
+                self._add_custom_menu_action(f"☁  {name}", e)
 
         self._model_menu.addSeparator()
         cfg = self._model_menu.addAction("⚙  配置自定义模型")
@@ -269,36 +275,85 @@ class ChatPage(QWidget):
         act.triggered.connect(
             lambda _checked=False, m=name: self._on_pick_model(m))
 
-    def _on_configure_custom_model(self) -> None:
-        """添加自定义线上模型（QSettings 持久化）。"""
-        text, accepted = QInputDialog.getText(
-            self, "配置自定义模型",
-            "输入线上模型名称（如 SiliconFlow 的模型 ID）：")
-        if not accepted:
+    def _add_custom_menu_action(self, label: str, entry: Dict) -> None:
+        """自定义模型菜单项：内部键 custom:{name}，避免与本地/免费模型重名。"""
+        name = entry.get("name") or entry.get("model") or ""
+        key = f"custom:{name}"
+        current_name = ""
+        if self._current_custom is not None:
+            current_name = (self._current_custom.get("name")
+                            or self._current_custom.get("model") or "")
+        act = self._model_menu.addAction(("✓  " if name == current_name else "    ") + label)
+        act.triggered.connect(
+            lambda _checked=False, k=key: self._on_pick_model(k))
+
+    def _find_custom_by_name(self, display: str) -> Optional[Dict]:
+        """按显示名查找自定义模型 entry。"""
+        for e in self._custom_models():
+            if (e.get("name") or e.get("model") or "") == display:
+                return e
+        return None
+
+    def _find_custom_by_model(self, model_id: str) -> Optional[Dict]:
+        """按模型 ID 查找自定义模型 entry（编辑后同步当前选中项用）。"""
+        for e in self._custom_models():
+            if (e.get("model") or "") == model_id:
+                return e
+        return None
+
+    def _on_configure_custom_model(self, entry: Optional[Dict] = None) -> None:
+        """打开「配置自定义模型」对话框（新建 / 编辑 / 删除）。"""
+        dlg = CustomModelDialog(self, entry=entry)
+        if not dlg.exec():
             return
-        name = text.strip()
-        if not name:
-            return
-        customs = self._custom_cloud_models()
-        if name not in customs:
-            customs.append(name)
-            self._settings.setValue(_CUSTOM_MODELS_KEY, customs)
         self._build_model_menu()
+        # 编辑可能改了当前选中项的字段（如 API Key）：按模型 ID / 名称重新同步
+        if self._current_custom is not None:
+            old = self._current_custom
+            refreshed = self._find_custom_by_model(old.get("model") or "")
+            if refreshed is None:
+                refreshed = self._find_custom_by_name(old.get("name") or old.get("model") or "")
+            if refreshed is not None:
+                self._current_custom = refreshed
+                self._current_model = refreshed.get("name") or refreshed.get("model") or ""
+            else:
+                self._current_custom = None
+                self._current_model = ""
+        self._update_model_btn()
 
     def _on_pick_model(self, name: str) -> None:
-        """选中某模型，更新当前模型与下拉按钮显示（参考 WorkBuddy：按钮显示选中项）。"""
-        self._current_model = name
+        """选中某模型，更新当前模型与下拉按钮显示（参考 WorkBuddy：按钮显示选中项）。
+
+        custom:{name} 内部键 -> 自定义模型路由；其余为本地/线上免费模型名。
+        """
+        if name.startswith("custom:"):
+            display = name[len("custom:"):]
+            entry = self._find_custom_by_name(display)
+            if entry is None:
+                return
+            self._current_custom = entry
+            self._current_model = display
+        else:
+            self._current_custom = None
+            self._current_model = name
         self._update_model_btn()
         self._build_model_menu()
 
     def _update_model_btn(self) -> None:
-        prefix = "" if self._current_model in self._local_models else "☁ "
-        text = prefix + (self._current_model or "选择模型")
+        if self._current_custom is not None:
+            prefix = "☁ "
+            display = (self._current_custom.get("name")
+                       or self._current_custom.get("model")
+                       or self._current_model)
+        else:
+            prefix = "" if self._current_model in self._local_models else "☁ "
+            display = self._current_model
+        text = prefix + (display or "选择模型")
         # 名称可能很长：按按钮最大宽度省略，tooltip 展示完整名
         from PySide6.QtGui import QFontMetrics
         fm = QFontMetrics(self._model_btn.font())
         self._model_btn.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, 170) + "  ⌄")
-        self._model_btn.setToolTip(self._current_model or "选择模型")
+        self._model_btn.setToolTip(display or "选择模型")
 
     # ------------------------------------------------------------------ #
     # 气泡
@@ -373,6 +428,32 @@ class ChatPage(QWidget):
             QMessageBox.information(self, "未选择模型",
                                     "请先点击下方「选择模型」挑选一个本地模型。")
             return
+
+        # 自定义模型：跳过本地模型拦截，走自定义 OpenAI 兼容端点
+        if self._current_custom is not None:
+            entry = self._current_custom
+            if not (entry.get("base_url") or "").strip() \
+                    or not (entry.get("api_key") or "").strip():
+                ret = QMessageBox.question(
+                    self, "自定义模型配置不完整",
+                    "该自定义模型缺少 API 地址 / Key，请重新配置。\n"
+                    "是否现在打开配置对话框？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if ret == QMessageBox.StandardButton.Yes:
+                    self._on_configure_custom_model(entry)
+                return
+            self._add_bubble(text, "user")
+            self._messages.append({"role": "user", "content": text})
+            self._input.clear()
+            self._start_streaming(
+                lambda on_chunk, on_done, max_tokens, cancel_check:
+                    self.api.chat_stream_custom(
+                        entry, self._messages,
+                        on_chunk=on_chunk, on_done=on_done,
+                        max_tokens=max_tokens, cancel_check=cancel_check))
+            return
+
+        # 线上免费模型预设：维持「未接入」拦截不变
         if self._current_model not in self._local_models:
             QMessageBox.information(
                 self, "线上模型未接入",
@@ -383,8 +464,20 @@ class ChatPage(QWidget):
         self._add_bubble(text, "user")
         self._messages.append({"role": "user", "content": text})
         self._input.clear()
-
         model = self._current_model
+        self._start_streaming(
+            lambda on_chunk, on_done, max_tokens, cancel_check:
+                self.api.chat_stream(
+                    self._messages, model,
+                    on_chunk=on_chunk, on_done=on_done,
+                    max_tokens=max_tokens, cancel_check=cancel_check))
+
+    def _start_streaming(self, stream_fn) -> None:
+        """启动流式生成（本地 / 自定义共用）：复用打字机、停止、多轮上下文逻辑。
+
+        stream_fn 接收 on_chunk/on_done/max_tokens/cancel_check 关键字参数，
+        返回 {"text": 全文, "cancelled": 是否取消}（与 api_client.chat_stream 一致）。
+        """
         self._busy = True
         self._cancel_requested = False
         self._gen_id += 1
@@ -402,8 +495,7 @@ class ChatPage(QWidget):
                 done_fired.append(True)
                 self.done_received.emit({**r, "gen_id": gen_id})
 
-            res = self.api.chat_stream(
-                self._messages, model,
+            res = stream_fn(
                 on_chunk=lambda piece: self.chunk_received.emit(gen_id, piece),
                 on_done=_on_done,
                 max_tokens=2048,
@@ -506,12 +598,14 @@ class ChatPage(QWidget):
         self._local_split = {"running": running, "not_running": not_running}
         self._local_models = running + not_running
         cloud_names = ([c["name"] for c in CLOUD_FREE_MODELS]
-                       + self._custom_cloud_models())
+                       + [e.get("name") or e.get("model") or ""
+                          for e in self._custom_models()])
 
         # 默认选中本地正在运行的模型；否则选已下载；否则空
         default = running[0] if running else (not_running[0] if not_running else "")
         if (not self._current_model
                 or self._current_model not in (self._local_models + cloud_names)):
             self._current_model = default
+            self._current_custom = None
         self._update_model_btn()
         self._build_model_menu()

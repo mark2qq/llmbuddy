@@ -27,6 +27,18 @@ class ApiError(Exception):
         self.message = message
 
 
+def custom_chat_url(base_url: str) -> str:
+    """由自定义模型 base_url 推导 chat/completions 完整地址。
+
+    规则：去尾部斜杠；若以 /v1 结尾则直接拼 /chat/completions，否则补
+    /v1/chat/completions（兼容用户只填根域名的情况）。
+    """
+    base = (base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
 class ApiClient(QObject):
     """后端 HTTP 客户端（REST + SSE）。"""
 
@@ -277,6 +289,46 @@ class ApiClient(QObject):
                     raise
         raise last_err
 
+    def _parse_sse_stream(self, resp: httpx.Response,
+                          on_chunk: Callable[[str], None],
+                          cancel_check: Optional[Callable[[], bool]]) -> Dict:
+        """共享 SSE 流式解析：逐行解析 data:，增量回调 on_chunk。
+
+        返回 {"text": 拼接全文, "finish": 最后一条 chunk, "cancelled": 是否取消}。
+        调用方负责在进入本函数前检查 status_code：>=400 时必须先 resp.read()
+        再抛 ApiError（流式响应未 read 时访问 text 会掩盖真实状态码）。
+        """
+        collected = ""
+        finish_chunk: Dict[str, Any] = {}
+        cancelled = False
+        for line in resp.iter_lines():
+            if cancel_check and cancel_check():
+                cancelled = True
+                break
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if data_str == "[DONE]":
+                break
+            if not data_str:
+                continue
+            try:
+                obj = json.loads(data_str)
+            except Exception:
+                continue
+            choices = obj.get("choices") or []
+            if choices:
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    collected += piece
+                    on_chunk(piece)
+                if obj.get("finish_reason"):
+                    finish_chunk = obj
+        return {"text": collected, "finish": finish_chunk, "cancelled": cancelled}
+
     def _chat_stream_once(self, api_key: str, messages: List[Dict[str, str]],
                           model: str, on_chunk: Callable[[str], None],
                           max_tokens: int,
@@ -293,9 +345,6 @@ class ApiClient(QObject):
         headers = self._headers()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        collected = ""
-        finish_chunk: Dict[str, Any] = {}
-        cancelled = False
 
         with httpx.Client(trust_env=False, timeout=600.0, headers=headers) as c:
             with c.stream("POST", url, json=payload) as resp:
@@ -305,34 +354,8 @@ class ApiClient(QObject):
                     # 用户只看到晦涩的 httpx 内部错误——红字 bug）。
                     resp.read()
                     raise ApiError(resp.status_code, f"HTTP {resp.status_code}: {resp.text[:300]}")
-                for line in resp.iter_lines():
-                    if cancel_check and cancel_check():
-                        cancelled = True
-                        break
-                    if not line:
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if data_str == "[DONE]":
-                        break
-                    if not data_str:
-                        continue
-                    try:
-                        obj = json.loads(data_str)
-                    except Exception:
-                        continue
-                    choices = obj.get("choices") or []
-                    if choices:
-                        delta = choices[0].get("delta") or {}
-                        piece = delta.get("content")
-                        if piece:
-                            collected += piece
-                            on_chunk(piece)
-                        if obj.get("finish_reason"):
-                            finish_chunk = obj
+                result = self._parse_sse_stream(resp, on_chunk, cancel_check)
 
-        result = {"text": collected, "finish": finish_chunk, "cancelled": cancelled}
         if on_done:
             on_done(result)
         return result
@@ -381,3 +404,39 @@ class ApiClient(QObject):
                 if e.code != 401:
                     raise
         raise last_err
+
+    def chat_stream_custom(self, entry: Dict, messages: List[Dict[str, str]],
+                           on_chunk: Callable[[str], None],
+                           max_tokens: int = 2048,
+                           on_done: Optional[Callable[[Dict], None]] = None,
+                           cancel_check: Optional[Callable[[], bool]] = None) -> Dict:
+        """
+        调用自定义 OpenAI 兼容端点 /chat/completions（stream:true）。
+
+        与 chat_stream 同签名语义，但 base_url / api_key 取自 entry，且不做
+        网关 401 重试（自定义端点没有本地网关 Key 机制）。
+        """
+        entry = entry or {}
+        model = str(entry.get("model") or entry.get("name") or "").strip()
+        api_key = str(entry.get("api_key") or "").strip()
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": int(max_tokens),
+        }
+        url = custom_chat_url(str(entry.get("base_url") or ""))
+        headers: Dict[str, str] = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        with httpx.Client(trust_env=False, timeout=600.0, headers=headers) as c:
+            with c.stream("POST", url, json=payload) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    raise ApiError(resp.status_code, f"HTTP {resp.status_code}: {resp.text[:300]}")
+                result = self._parse_sse_stream(resp, on_chunk, cancel_check)
+
+        if on_done:
+            on_done(result)
+        return result

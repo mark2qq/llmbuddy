@@ -157,16 +157,28 @@ def test_model_menu_groups_and_custom_entry():
 
 
 def test_custom_cloud_model_persist_and_show():
-    from ui.pages.chat_page import ChatPage, _CUSTOM_MODELS_KEY
+    import json
+
+    from ui.pages.chat_page import ChatPage
+    from ui.widgets.custom_model_dialog import CUSTOM_MODELS_KEY
 
     p = ChatPage(_FakeApi(), None, None)
-    p._settings.setValue(_CUSTOM_MODELS_KEY, ["my-custom-model"])
+    saved = p._settings.value(CUSTOM_MODELS_KEY, None)
+    p._settings.setValue(CUSTOM_MODELS_KEY, json.dumps(
+        [{"name": "my-custom-model", "base_url": "https://x/v1",
+          "api_key": "k", "model": "my-custom-model"}]))
     try:
         p._build_model_menu()
         texts = [a.text() for a in p._model_menu.actions() if a.text()]
-        assert any("my-custom-model" in t and "自定义" in t for t in texts)
+        # 新格式：自定义模型单独一段，条目文案 ☁ {name}
+        assert any("自定义模型" in t for t in texts)
+        assert any("☁" in t and "my-custom-model" in t for t in texts)
     finally:
-        p._settings.setValue(_CUSTOM_MODELS_KEY, [])
+        if saved is None:
+            p._settings.remove(CUSTOM_MODELS_KEY)
+        else:
+            p._settings.setValue(CUSTOM_MODELS_KEY, saved)
+        p._settings.sync()
 
 
 # ---------------------------------------------------------------------------
