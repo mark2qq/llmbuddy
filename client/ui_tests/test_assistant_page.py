@@ -208,3 +208,40 @@ def test_light_theme_covers_assistant(page):
         assert sel in css
     dark = build_stylesheet("")
     assert "#AssistantSideBar" in dark
+
+
+def test_model_controls_live_in_composer(page):
+    """模型 / 审批 / 工作区必须贴在输入框里，而不是顶部标题栏（参考 WorkBuddy）。"""
+    p, _fake = page
+    assert p._composer is not None
+    for w in (p._input, p._provider_combo, p._model_combo, p._policy_combo,
+              p._ws_btn, p._send_btn):
+        assert p._composer.isAncestorOf(w), w.objectName()
+    assert not p._composer.isAncestorOf(p._new_btn)   # 新会话仍在标题栏
+
+
+def test_send_stop_swap_while_streaming(page):
+    p, _fake = page
+    assert not p._send_btn.isHidden()
+    assert p._stop_btn.isHidden()
+    p._begin_streaming()
+    assert p._send_btn.isHidden()
+    assert not p._stop_btn.isHidden()
+    p._end_streaming()
+    assert not p._send_btn.isHidden()
+    assert p._stop_btn.isHidden()
+
+
+def test_done_after_tool_call_still_renders_answer(page):
+    """工具调用已把上一条气泡定稿，done 里的最终答复不能丢。"""
+    p, _fake = page
+    before = p._msg_layout.count()
+    p._begin_streaming()
+    p._on_event({"type": "tool_call", "name": "fs_list", "args": {},
+                 "risk": "low", "summary": "列目录"})
+    p._on_event({"type": "tool_result", "name": "fs_list", "ok": True,
+                 "content": "[]"})
+    p._on_event({"type": "done", "content": "工作区是空的。"})
+    p._end_streaming()
+    assert p._msg_layout.count() == before + 2      # 工具卡 + 最终答复气泡
+    assert p._bubble is None

@@ -61,16 +61,16 @@ class ChatBubble(QWidget):
 
 
 class StepLine(QWidget):
-    """技能阶段 / 系统提示：居中的一行小字。"""
+    """技能阶段 / 系统提示：居中的一行小字；error=True 时变成醒目的错误条。"""
 
-    def __init__(self, text: str, parent=None):
+    def __init__(self, text: str, parent=None, error: bool = False):
         super().__init__(parent)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 2)
         self.label = QLabel(text)
-        self.label.setObjectName("StepLine")
+        self.label.setObjectName("ErrorLine" if error else "StepLine")
         self.label.setWordWrap(True)
-        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setAlignment(Qt.AlignLeft if error else Qt.AlignCenter)
         lay.addWidget(self.label, 1)
 
     def set_text(self, text: str) -> None:

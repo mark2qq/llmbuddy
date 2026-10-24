@@ -598,3 +598,85 @@ QTabBar::tab:hover { color: #d6dbe8; }
     font-size: 11px;
 }
 #MiniBtn:hover { background-color: #2d3242; color: #e6e9f2; }
+
+/* ---------- 输入容器：选择项贴着对话框（参考 WorkBuddy） ---------- */
+#Composer {
+    background-color: #14161f;
+    border: 1px solid #2a3142;
+    border-radius: 12px;
+}
+#Composer[focus="true"] { border: 1px solid #4d5f96; }
+
+#Composer QTextEdit#ComposerInput,
+#Composer QTextEdit#ComposerInput:focus {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 2px;
+    color: #e6e9f2;
+    font-size: 13px;
+}
+
+/* 输入框下方的小胶囊控件（提供商 / 模型 / 密钥 / 审批 / 工作区 / 停止） */
+#Pill {
+    background-color: #1c2030;
+    color: #b3bccf;
+    border: 1px solid #2b3244;
+    border-radius: 11px;
+    padding: 2px 8px;
+    min-height: 22px;
+    max-height: 24px;
+    font-size: 11px;
+}
+#Pill:hover { background-color: #242a3b; border-color: #3a4157; color: #e6e9f2; }
+#Pill:disabled { background-color: #171b26; color: #5b6275; border-color: #232734; }
+#Pill:focus { border-color: #4d5f96; }
+
+QComboBox#Pill::drop-down { width: 14px; border: none; }
+QComboBox#Pill QLineEdit {
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: #b3bccf;
+    font-size: 11px;
+}
+QComboBox#Pill QAbstractItemView { font-size: 12px; padding: 2px; }
+
+#SendBtn {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #6c8cff, stop:1 #8a6cff);
+    color: #ffffff;
+    border: none;
+    border-radius: 11px;
+    padding: 2px 10px;
+    min-height: 22px;
+    max-height: 24px;
+    font-size: 12px;
+    font-weight: 600;
+}
+#SendBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #7d9bff, stop:1 #9a7dff);
+}
+#SendBtn:disabled { background: #2a3040; color: #6b7285; }
+
+#GhostBtn {
+    background: transparent;
+    color: #9aa3b7;
+    border: 1px solid #2f3648;
+    border-radius: 8px;
+    padding: 5px 12px;
+    font-size: 12px;
+}
+#GhostBtn:hover { background-color: #232838; color: #e6e9f2; border-color: #3d4456; }
+
+/* 错误条：比普通步骤行更醒目（模型 404 / 审批超时 / 网络失败） */
+#ErrorLine {
+    color: #ff9db2;
+    background-color: #2a1720;
+    border: 1px solid #5a2f44;
+    border-left: 3px solid #d9536f;
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-size: 12px;
+}

@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QHBoxLayout, QLabel,
+                               QFormLayout, QFrame, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
                                QMessageBox, QPlainTextEdit, QPushButton,
                                QSplitter, QTabWidget, QTextEdit, QVBoxLayout,
@@ -35,9 +35,9 @@ from ui.widgets.assistant_cards import (ApprovalCard, ChatBubble, StepLine,
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
 
 POLICY_ITEMS = [
-    ("readonly_auto", "审批：只读自动放行"),
-    ("ask_all", "审批：全部需确认"),
-    ("yolo", "审批：全部放行（危险）"),
+    ("readonly_auto", "只读自动", "只读类工具直接执行，写入/高危仍逐次确认（推荐）"),
+    ("ask_all", "全部确认", "任何工具调用都要你确认后才执行"),
+    ("yolo", "全部放行", "所有工具直接执行、不再询问（危险）"),
 ]
 RISK_TEXT = {"low": "只读", "medium": "写入", "high": "高危"}
 
@@ -89,6 +89,7 @@ class AssistantPage(QWidget):
         root.addWidget(split, 1)
 
     def _build_header(self) -> QHBoxLayout:
+        """顶部只留标题与「新会话」；模型/审批/工作区统一下沉到输入框（参考 WorkBuddy）。"""
         head = QHBoxLayout()
         head.setSpacing(8)
 
@@ -103,38 +104,11 @@ class AssistantPage(QWidget):
         head.addLayout(titles)
         head.addStretch(1)
 
-        self._provider_combo = QComboBox()
-        self._provider_combo.setMinimumWidth(132)
-        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        head.addWidget(self._provider_combo)
-
-        self._key_btn = QPushButton("密钥")
-        self._key_btn.setToolTip("配置当前提供商的 API Key / Base URL")
-        self._key_btn.setFixedWidth(56)
-        self._key_btn.clicked.connect(self._edit_provider)
-        head.addWidget(self._key_btn)
-
-        self._model_combo = QComboBox()
-        self._model_combo.setEditable(True)
-        self._model_combo.setMinimumWidth(200)
-        self._model_combo.setToolTip("本地模型留空=使用已加载的第一个模型")
-        head.addWidget(self._model_combo)
-
-        self._policy_combo = QComboBox()
-        self._policy_combo.setMinimumWidth(160)
-        for pid, label in POLICY_ITEMS:
-            self._policy_combo.addItem(label, pid)
-        self._policy_combo.currentIndexChanged.connect(self._on_policy_changed)
-        head.addWidget(self._policy_combo)
-
-        self._ws_btn = QPushButton("工作区")
-        self._ws_btn.setToolTip("切换文件工具的可访问工作区")
-        self._ws_btn.clicked.connect(self._choose_workspace)
-        head.addWidget(self._ws_btn)
-
         self._new_btn = QPushButton("新会话")
-        self._new_btn.setObjectName("PrimaryBtn")
-        self._new_btn.clicked.connect(self._new_session)
+        self._new_btn.setObjectName("GhostBtn")
+        self._new_btn.setToolTip("开一个全新的会话（当前会话会自动保存在侧栏）")
+        self._new_btn.setCursor(Qt.PointingHandCursor)
+        self._new_btn.clicked.connect(lambda: self._new_session())
         head.addWidget(self._new_btn)
         return head
 
@@ -160,31 +134,97 @@ class AssistantPage(QWidget):
         self._status.setWordWrap(True)
         lay.addWidget(self._status)
 
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self._input = QTextEdit()
-        self._input.setPlaceholderText(
-            "让助理做点什么：整理工作区的文件 / 读一下这个项目的结构 / 帮我写个脚本并运行 …（Enter 发送，Shift+Enter 换行）")
-        self._input.setFixedHeight(84)
-        self._input.installEventFilter(self)
-        row.addWidget(self._input, 1)
-
-        col = QVBoxLayout()
-        col.setSpacing(6)
-        self._send_btn = QPushButton("发送")
-        self._send_btn.setObjectName("PrimaryBtn")
-        self._send_btn.setFixedWidth(92)
-        self._send_btn.clicked.connect(self._on_send_clicked)
-        col.addWidget(self._send_btn)
-        self._stop_btn = QPushButton("停止")
-        self._stop_btn.setFixedWidth(92)
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.clicked.connect(self._stop)
-        col.addWidget(self._stop_btn)
-        col.addStretch(1)
-        row.addLayout(col)
-        lay.addLayout(row)
+        lay.addWidget(self._build_composer())
         return panel
+
+    def _build_composer(self) -> QWidget:
+        """
+        底部输入区：上方是输入框，下方一排 pill 控件
+        （模型来源 / 模型 / 密钥 / 审批 / 工作区 + 停止 + 发送），
+        对齐 WorkBuddy 的「选择项贴着对话框」的交互。
+        """
+        box = QFrame()
+        box.setObjectName("Composer")
+        box.setProperty("focus", False)
+        self._composer = box
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(12, 10, 12, 8)
+        lay.setSpacing(6)
+
+        self._input = QTextEdit()
+        self._input.setObjectName("ComposerInput")
+        self._input.setFrameShape(QFrame.NoFrame)
+        self._input.setPlaceholderText(
+            "让助理做点什么：整理工作区的文件 / 读一下这个项目的结构 / 帮我写个脚本并运行 …"
+            "（Enter 发送，Shift+Enter 换行）")
+        self._input.setFixedHeight(78)
+        self._input.installEventFilter(self)
+        lay.addWidget(self._input)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+
+        self._provider_combo = QComboBox()
+        self._provider_combo.setObjectName("Pill")
+        self._provider_combo.setMinimumWidth(100)
+        self._provider_combo.setToolTip("模型来源：本地引擎 / 硅基流动 / 自定义 OpenAI 兼容端点")
+        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        bar.addWidget(self._provider_combo)
+
+        self._model_combo = QComboBox()
+        self._model_combo.setObjectName("Pill")
+        self._model_combo.setEditable(True)
+        self._model_combo.setMinimumWidth(150)
+        self._model_combo.setToolTip("模型名可直接输入；本地模型留空 = 使用已加载的第一个模型")
+        bar.addWidget(self._model_combo)
+
+        self._key_btn = QPushButton("密钥")
+        self._key_btn.setObjectName("Pill")
+        self._key_btn.setFixedWidth(50)
+        self._key_btn.setCursor(Qt.PointingHandCursor)
+        self._key_btn.setToolTip("配置当前提供商的 API Key / Base URL")
+        self._key_btn.clicked.connect(self._edit_provider)
+        bar.addWidget(self._key_btn)
+
+        self._policy_combo = QComboBox()
+        self._policy_combo.setObjectName("Pill")
+        self._policy_combo.setMinimumWidth(96)
+        for _pid, _label, _tip in POLICY_ITEMS:
+            self._policy_combo.addItem(_label, _pid)
+            self._policy_combo.setItemData(self._policy_combo.count() - 1,
+                                           _tip, Qt.ToolTipRole)
+        self._policy_combo.setToolTip("高危动作审批策略")
+        self._policy_combo.currentIndexChanged.connect(self._on_policy_changed)
+        bar.addWidget(self._policy_combo)
+
+        self._ws_btn = QPushButton("工作区")
+        self._ws_btn.setObjectName("Pill")
+        self._ws_btn.setFixedWidth(62)
+        self._ws_btn.setCursor(Qt.PointingHandCursor)
+        self._ws_btn.setToolTip("切换文件工具可访问的工作区")
+        self._ws_btn.clicked.connect(self._choose_workspace)
+        bar.addWidget(self._ws_btn)
+
+        bar.addStretch(1)
+
+        self._stop_btn = QPushButton("停止")
+        self._stop_btn.setObjectName("Pill")
+        self._stop_btn.setFixedWidth(54)
+        self._stop_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setVisible(False)
+        self._stop_btn.clicked.connect(self._stop)
+        bar.addWidget(self._stop_btn)
+
+        self._send_btn = QPushButton("发送")
+        self._send_btn.setObjectName("SendBtn")
+        self._send_btn.setFixedWidth(72)
+        self._send_btn.setCursor(Qt.PointingHandCursor)
+        self._send_btn.clicked.connect(self._on_send_clicked)
+        bar.addWidget(self._send_btn)
+
+        lay.addLayout(bar)
+        return box
 
     # ---------------- 右侧侧栏 ----------------
     def _build_sidebar(self) -> QWidget:
@@ -317,9 +357,11 @@ class AssistantPage(QWidget):
         if not isinstance(st, dict):
             return
         self._state = st
-        self._subtitle.setText(
-            f"工作区：{st.get('workspace', '')}   ·   编排引擎："
-            f"{'LangGraph' if st.get('orchestrator') == 'langgraph' else '顺序降级'}")
+        ws = str(st.get("workspace") or "")
+        short = ws if len(ws) <= 44 else "…" + ws[-43:]
+        orch = "LangGraph 编排" if st.get("orchestrator") == "langgraph" else "顺序降级编排"
+        self._subtitle.setText(f"{orch}   ·   工作区 {short or '（未设置）'}")
+        self._ws_btn.setToolTip(f"文件工具可访问的工作区：\n{ws or '（未设置）'}\n（点击切换）")
 
         # 提供商
         cur_pid = st.get("active_provider")
@@ -519,6 +561,15 @@ class AssistantPage(QWidget):
                     return False
                 self._on_send_clicked()
                 return True
+        if obj is self._input and event.type() in (QEvent.Type.FocusIn,
+                                                  QEvent.Type.FocusOut):
+            # 输入框获得焦点时高亮整个输入容器（WorkBuddy 观感）
+            on = event.type() == QEvent.Type.FocusIn
+            box = getattr(self, "_composer", None)
+            if box is not None and bool(box.property("focus")) != on:
+                box.setProperty("focus", on)
+                box.style().unpolish(box)
+                box.style().polish(box)
         return super().eventFilter(obj, event)
 
     def _on_send_clicked(self) -> None:
@@ -559,7 +610,8 @@ class AssistantPage(QWidget):
 
     def _begin_streaming(self) -> None:
         self._busy = True
-        self._send_btn.setEnabled(False)
+        self._send_btn.setVisible(False)
+        self._stop_btn.setVisible(True)
         self._stop_btn.setEnabled(True)
         self._status.setText("助理正在工作…")
         self._bubble = None
@@ -568,8 +620,10 @@ class AssistantPage(QWidget):
 
     def _end_streaming(self) -> None:
         self._busy = False
-        self._send_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._stop_btn.setVisible(False)
+        self._send_btn.setVisible(True)
+        self._send_btn.setEnabled(True)
         if self._thinking is not None:
             self._thinking.finish()
 
@@ -646,8 +700,9 @@ class AssistantPage(QWidget):
         elif kind == "done":
             self._finish_bubble(ev.get("content") or "")
             self._status.setText("完成")
+            self._scroll_bottom()
         elif kind == "error":
-            self._add_step(f"出错了：{ev.get('message')}")
+            self._add_step(f"出错了：{ev.get('message')}", error=True)
             self._status.setText("出错，详见对话区")
         elif kind == "stopped":
             self._add_step("已停止生成")
@@ -670,9 +725,15 @@ class AssistantPage(QWidget):
         return self._bubble
 
     def _finish_bubble(self, final: str = "") -> None:
-        if self._bubble is not None:
-            text = final or self._bubble.label.text()
-            self._bubble.set_text(text, markdown=True)
+        # 注意：工具调用后 _bubble 已被定稿置空，此时 done 事件可能才带最终答复
+        # （后端兜底 / 非流式拼接），不能直接丢掉。
+        if self._bubble is None:
+            if not (final or "").strip():
+                return
+            self._bubble = ChatBubble("assistant", "")
+            self._append_widget(self._bubble)
+        text = final or self._bubble.label.text()
+        self._bubble.set_text(text, markdown=True)
         self._bubble = None
 
     def _add_bubble(self, role: str, text: str) -> ChatBubble:
@@ -681,8 +742,8 @@ class AssistantPage(QWidget):
         self._scroll_bottom()
         return b
 
-    def _add_step(self, text: str) -> None:
-        self._append_widget(StepLine(text))
+    def _add_step(self, text: str, error: bool = False) -> None:
+        self._append_widget(StepLine(text, error=error))
         self._scroll_bottom()
 
     def _append_widget(self, w: QWidget) -> None:
