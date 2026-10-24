@@ -491,3 +491,110 @@ QMenu#TrayMenu::item:disabled { color: #5b6377; }
     color: #cfd6e6;
     font-size: 12px;
 }
+
+/* ================= 智能助理（1.0.8） ================= */
+#PageTitle {
+    color: #f2f4fa;
+    font-size: 18px;
+    font-weight: 700;
+    background: transparent;
+    border: none;
+}
+#PageSubtitle {
+    color: #7d8596;
+    font-size: 11px;
+    background: transparent;
+    border: none;
+}
+
+QTabWidget::pane {
+    background-color: #14161f;
+    border: 1px solid #262b3a;
+    border-radius: 10px;
+    top: -1px;
+}
+QTabBar::tab {
+    background: transparent;
+    color: #8b93a7;
+    padding: 6px 12px;
+    margin-right: 2px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-size: 12px;
+}
+QTabBar::tab:selected { color: #ffffff; border-bottom: 2px solid #6c8cff; }
+QTabBar::tab:hover { color: #d6dbe8; }
+
+#AssistantSideBar {
+    background-color: #14161f;
+    border: 1px solid #262b3a;
+    border-radius: 10px;
+}
+
+#ChatScroll { background-color: transparent; border: none; }
+#ChatScroll > QWidget > QWidget { background-color: transparent; }
+
+#UserBubble {
+    background-color: #2a3350;
+    color: #eef1fa;
+    border: 1px solid #37426a;
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 13px;
+}
+#BotBubble {
+    background-color: #171a24;
+    color: #e2e6f0;
+    border: 1px solid #262b3a;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+}
+
+#StepLine {
+    color: #78808f;
+    font-size: 11px;
+    background: transparent;
+    border: none;
+    padding: 2px 0;
+}
+
+#ToolCard {
+    background-color: #12141d;
+    border: 1px solid #2a3040;
+    border-left: 3px solid #4a5570;
+    border-radius: 8px;
+}
+#ToolCard[risk="high"] { border-left: 3px solid #d9536f; }
+#ToolCard[risk="medium"] { border-left: 3px solid #d99b3f; }
+#ToolCard[risk="low"] { border-left: 3px solid #3f9bd9; }
+#CardHead { color: #b9c2d6; font-size: 12px; background: transparent; border: none; }
+#CardBody {
+    color: #8f98ab;
+    font-size: 11px;
+    background: transparent;
+    border: none;
+    font-family: "Consolas", "Cascadia Mono", monospace;
+}
+
+#ApprovalCard {
+    background-color: #241a22;
+    border: 1px solid #5a2f44;
+    border-left: 3px solid #d9536f;
+    border-radius: 8px;
+}
+#ApprovalTitle { color: #ffb3c4; font-size: 13px; font-weight: 700; background: transparent; border: none; }
+
+#RiskHigh { color: #ff8fa8; font-size: 11px; background: transparent; border: none; }
+#RiskMedium { color: #f0b862; font-size: 11px; background: transparent; border: none; }
+#RiskLow { color: #6fc7e8; font-size: 11px; background: transparent; border: none; }
+
+#MiniBtn {
+    background-color: #232734;
+    color: #aab2c4;
+    border: 1px solid #2f3548;
+    border-radius: 6px;
+    padding: 2px 6px;
+    font-size: 11px;
+}
+#MiniBtn:hover { background-color: #2d3242; color: #e6e9f2; }

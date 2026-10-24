@@ -256,8 +256,12 @@ def _friendly_engine_error(payload, n_ctx: int, model: str) -> Dict[str, Any]:
     return {"error": {"message": raw_msg or "本地引擎返回错误", "type": "engine_error", "code": 1009}}
 
 
-def _normalize(data: dict) -> None:
-    """工具调用时把空 content 归一为 null（符合 OpenAI 规范，避免下游 400）。"""
+def _normalize(data: dict, raw_reasoning: bool = False) -> None:
+    """工具调用时把空 content 归一为 null（符合 OpenAI 规范，避免下游 400）。
+
+    raw_reasoning=True 表示调用方（如智能助理）自己会分别处理思考与正文，
+    此时不再把 reasoning_content 回填进 content，避免把思考当答案。
+    """
     try:
         for choice in data.get("choices", []):
             msg = choice.get("message", {})
@@ -265,19 +269,22 @@ def _normalize(data: dict) -> None:
                 msg["content"] = None
             # 兜底：若引擎仍走思考通道（content 空、reasoning_content 有值），
             # 将 reasoning_content 回填到 content，避免只读 content 的客户端（如 WorkBuddy）显示空回复。
-            elif (msg.get("content") in (None, "")) and msg.get("reasoning_content"):
+            elif (not raw_reasoning and msg.get("content") in (None, "")
+                  and msg.get("reasoning_content")):
                 msg["content"] = msg["reasoning_content"]
     except Exception:
         pass
 
 
-def _rewrite_sse_line(line: bytes, model: str):
+def _rewrite_sse_line(line: bytes, model: str, raw_reasoning: bool = False):
     """
     改写 SSE 行：
       1. 把 data 行的 model 字段替换为请求模型名；
       2. 将思考通道 delta.reasoning_content 合并进 delta.content，
          保证只读 content 的客户端（如 WorkBuddy）也能看到完整流式输出
          （思考模型关闭不了思考时，正文会先进 reasoning_content，必须兜底）。
+      3. raw_reasoning=True（请求头 X-LLM-Raw-Reasoning: 1）时不合并，
+         让调用方自己区分「思考」和「正文」——智能助理用它折叠思考过程。
     """
     if not line.startswith(b"data:"):
         return line + b"\n" if line else None
@@ -292,7 +299,7 @@ def _rewrite_sse_line(line: bytes, model: str):
             if not isinstance(delta, dict):
                 continue
             reasoning = delta.get("reasoning_content")
-            if reasoning:
+            if reasoning and not raw_reasoning:
                 # 思考内容合并进 content（保留 reasoning_content 字段供高级客户端使用）
                 delta["content"] = (delta.get("content") or "") + reasoning
         return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
@@ -378,6 +385,8 @@ def list_models():
 async def chat_completions(request: Request, key: Optional[str] = Depends(require_key)):
     body = await request.json()
     model = body.get("model") or DEFAULT_MODEL
+    # 高级客户端（智能助理）用该头要求「思考/正文分开」，不做 reasoning→content 合并
+    raw_reasoning = str(request.headers.get("x-llm-raw-reasoning", "")).strip() in ("1", "true", "yes")
     # 模型绑定校验（auth 层面，先于模型可用性检查；/v1/models 不做此校验）
     bound = _model_for_key(key)
     if bound and bound != model:
@@ -441,7 +450,7 @@ async def chat_completions(request: Request, key: Optional[str] = Depends(requir
                 # 引擎错误统一翻译成可读中文（上下文超限给出调参指引）
                 return JSONResponse(status_code=resp.status_code,
                                     content=_friendly_engine_error(data, n_ctx, model))
-            _normalize(data)
+            _normalize(data, raw_reasoning)
             data["model"] = model
             return JSONResponse(content=data, status_code=resp.status_code)
         except Exception as e:
@@ -466,11 +475,11 @@ async def chat_completions(request: Request, key: Optional[str] = Depends(requir
                         buf += raw
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
-                            out = _rewrite_sse_line(line, model)
+                            out = _rewrite_sse_line(line, model, raw_reasoning)
                             if out is not None:
                                 yield out
             if buf:
-                out = _rewrite_sse_line(buf, model)
+                out = _rewrite_sse_line(buf, model, raw_reasoning)
                 if out is not None:
                     yield out
         except Exception as e:

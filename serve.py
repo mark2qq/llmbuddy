@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.pool import init_model_pool, get_model_pool
 from core.system import detect_system
-from routers import manage, gateway
+from routers import manage, gateway, assistant
 
 # ----------------------------------------------------------------------------
 # 配置（来自环境变量，与旧版保持一致）
@@ -83,6 +83,8 @@ app.add_middleware(
 # 挂载管理路由与 OpenAI 兼容网关路由
 app.include_router(manage.router)
 app.include_router(gateway.router)
+# 智能助理（1.0.8）：工具 / MCP / 技能 / 审批 / LangGraph 编排
+app.include_router(assistant.router)
 
 
 def run() -> None:

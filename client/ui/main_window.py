@@ -20,6 +20,7 @@ from app_config import APP_NAME, APP_VERSION, APP_TITLE, resource_path
 from core.task_runner import Worker
 
 from ui.widgets.status_bar import StatusBar
+from ui.pages.assistant_page import AssistantPage
 from ui.pages.dashboard_page import DashboardPage
 from ui.pages.library_page import LibraryPage
 from ui.pages.chat_page import ChatPage
@@ -31,7 +32,8 @@ class MainWindow(QMainWindow):
     """本地大模型服务主窗口。"""
 
     # 导航项（名称 -> 页面索引）
-    NAV_ITEMS = [("控制台", 0), ("模型库", 1), ("对话", 2), ("API", 3), ("设置", 4)]
+    NAV_ITEMS = [("智能助理", 0), ("控制台", 1), ("模型库", 2),
+                 ("对话", 3), ("API", 4), ("设置", 5)]
 
     def __init__(self, api, launcher, config, parent=None):
         super().__init__(parent)
@@ -109,12 +111,14 @@ class MainWindow(QMainWindow):
         root.addLayout(right, 1)
 
         # 构建页面
+        self.assistant = AssistantPage(self.api, self.launcher, self.config)
         self.dashboard = DashboardPage(self.api, self.launcher, self.config)
         self.library = LibraryPage(self.api, self.launcher, self.config)
         self.chat = ChatPage(self.api, self.launcher, self.config)
         self.api_page = ApiPage(self.api, self.launcher, self.config)
         self.settings = SettingsPage(self.api, self.launcher, self.config)
-        for p in (self.dashboard, self.library, self.chat, self.api_page, self.settings):
+        for p in (self.assistant, self.dashboard, self.library, self.chat,
+                  self.api_page, self.settings):
             self._stack.addWidget(p)
 
         # 注意：构造函数期间不要触发各页 refresh()（其内部会启动 QThread 后台任务）。
@@ -281,7 +285,8 @@ class MainWindow(QMainWindow):
         self._refresh_status_models()
 
     def _refresh_all(self) -> None:
-        for p in (self.dashboard, self.library, self.chat, self.api_page, self.settings):
+        for p in (self.assistant, self.dashboard, self.library, self.chat,
+                  self.api_page, self.settings):
             try:
                 p.refresh()
             except Exception:

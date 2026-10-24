@@ -3,6 +3,7 @@
 功能页面包（ui.pages）。
 
 页面在 main_window 中通过 QStackedWidget 切换：
+    - assistant_page  智能助理（1.0.8：工具 / MCP / 技能 / 审批 / LangGraph 编排）
     - dashboard_page  控制台
     - library_page    模型库
     - chat_page       对话

@@ -232,6 +232,32 @@ QMenu#TrayMenu::item:selected { background-color: #e2e9fb; }
 QMenu#TrayMenu::item:disabled { color: #a9b0bf; }
 QToolTip { background-color: #ffffff; color: #1f2430;
            border: 1px solid #d5dbe7; }
+
+/* 智能助理（1.0.8）：浅色下的卡片/气泡/审批卡 */
+#PageTitle { color: #1b2130; }
+#PageSubtitle { color: #6b7385; }
+#AssistantSideBar { background-color: #ffffff; border: 1px solid #dbe0ea; }
+QTabWidget::pane { background-color: #ffffff; border: 1px solid #dbe0ea; }
+QTabBar::tab { color: #5a6275; }
+QTabBar::tab:selected { color: #1b3a8f; border-bottom: 2px solid #4a6cf7; }
+#BotBubble { background-color: #f4f6fb; color: #1f2430;
+             border: 1px solid #dde2ec; }
+#StepLine { color: #7b8496; }
+#ToolCard { background-color: #f7f9fd; border: 1px solid #e1e6f0;
+            border-left: 3px solid #7f93c9; }
+#ToolCard[risk="high"] { border-left: 3px solid #d9536f; }
+#ToolCard[risk="medium"] { border-left: 3px solid #d99b3f; }
+#ToolCard[risk="low"] { border-left: 3px solid #3f9bd9; }
+#CardHead { color: #3b4354; }
+#CardBody { color: #5a6275; }
+#ApprovalCard { background-color: #fff5f7; border: 1px solid #f0c9d3;
+                border-left: 3px solid #d9536f; }
+#ApprovalTitle { color: #a12744; }
+#RiskHigh { color: #b3253f; }
+#RiskMedium { color: #9a6a12; }
+#RiskLow { color: #1f6b8f; }
+#MiniBtn { background-color: #eef1f7; color: #3b4354; border: 1px solid #d5dbe7; }
+#MiniBtn:hover { background-color: #e2e7f0; color: #12161f; }
 """
 
 
