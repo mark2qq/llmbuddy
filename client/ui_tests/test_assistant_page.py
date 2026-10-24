@@ -232,6 +232,16 @@ def test_send_stop_swap_while_streaming(page):
     assert p._stop_btn.isHidden()
 
 
+def test_skill_shortcut_prefills_input(page):
+    """输入框旁的「技能」入口：选中后把「用 xx 技能：」写进输入框。"""
+    p, _fake = page
+    p._use_skill("repo-digest")
+    assert p._input.toPlainText().startswith("用 repo-digest 技能")
+    p._input.setPlainText("看看这个项目")
+    p._use_skill("repo-digest")
+    assert p._input.toPlainText() == "用 repo-digest 技能：看看这个项目"
+
+
 def test_done_after_tool_call_still_renders_answer(page):
     """工具调用已把上一条气泡定稿，done 里的最终答复不能丢。"""
     p, _fake = page

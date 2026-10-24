@@ -272,6 +272,11 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #GhostBtn:hover { background-color: #eef1f7; color: #12161f; }
 #ErrorLine { color: #a12744; background-color: #fff5f7;
              border: 1px solid #f0c9d3; border-left: 3px solid #d9536f; }
+#IconBtn { background-color: #f2f5fa; color: #3b4354; border: 1px solid #dbe1ec; }
+#IconBtn:hover { background-color: #e8edf6; color: #12161f; border-color: #c9d3e6; }
+#StopBtn { background-color: #eef1f7; color: #1f2430; border: 1px solid #d5dbe7; }
+#StopBtn:hover { background-color: #e2e7f0; }
+#ComposerTip { color: #8b93a7; }
 """
 
 

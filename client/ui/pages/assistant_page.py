@@ -21,9 +21,10 @@ import os
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QSettings
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem,
+                               QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton,
                                QSplitter, QTabWidget, QTextEdit, QVBoxLayout,
                                QWidget)
@@ -135,56 +136,59 @@ class AssistantPage(QWidget):
         lay.addWidget(self._status)
 
         lay.addWidget(self._build_composer())
+        tip = QLabel("内容由 AI 生成，请核实重要信息")
+        tip.setObjectName("ComposerTip")
+        tip.setAlignment(Qt.AlignCenter)
+        lay.addWidget(tip)
         return panel
 
     def _build_composer(self) -> QWidget:
         """
-        底部输入区：上方是输入框，下方一排 pill 控件
-        （模型来源 / 模型 / 密钥 / 审批 / 工作区 + 停止 + 发送），
-        对齐 WorkBuddy 的「选择项贴着对话框」的交互。
+        底部输入区（对齐 WorkBuddy）：
+
+            ┌ 今天帮你做些什么？@ 添加文件，/ 选技能 ────────────────┐
+            │                                                        │
+            │ [+] [技能] [审批] [工作区] [密钥]    [来源] [模型] [↑] │
+            └────────────────────────────────────────────────────────┘
+
+        左侧是「动作与上下文」，右侧是「模型与发送」，发送在流式时原地变停止。
         """
         box = QFrame()
         box.setObjectName("Composer")
         box.setProperty("focus", False)
         self._composer = box
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(12, 10, 12, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(14, 12, 12, 10)
+        lay.setSpacing(8)
 
         self._input = QTextEdit()
         self._input.setObjectName("ComposerInput")
         self._input.setFrameShape(QFrame.NoFrame)
         self._input.setPlaceholderText(
-            "让助理做点什么：整理工作区的文件 / 读一下这个项目的结构 / 帮我写个脚本并运行 …"
-            "（Enter 发送，Shift+Enter 换行）")
-        self._input.setFixedHeight(78)
+            "今天帮你做些什么？@ 添加文件，/ 选技能（Enter 发送，Shift+Enter 换行）")
+        self._input.setFixedHeight(76)
         self._input.installEventFilter(self)
         lay.addWidget(self._input)
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
 
-        self._provider_combo = QComboBox()
-        self._provider_combo.setObjectName("Pill")
-        self._provider_combo.setMinimumWidth(100)
-        self._provider_combo.setToolTip("模型来源：本地引擎 / 硅基流动 / 自定义 OpenAI 兼容端点")
-        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        bar.addWidget(self._provider_combo)
+        # 左：附加文件
+        self._attach_btn = QPushButton("+")
+        self._attach_btn.setObjectName("IconBtn")
+        self._attach_btn.setFixedSize(26, 26)
+        self._attach_btn.setCursor(Qt.PointingHandCursor)
+        self._attach_btn.setToolTip("把这个文件加进本次提问（插入 @路径）")
+        self._attach_btn.clicked.connect(self._attach_file)
+        bar.addWidget(self._attach_btn)
 
-        self._model_combo = QComboBox()
-        self._model_combo.setObjectName("Pill")
-        self._model_combo.setEditable(True)
-        self._model_combo.setMinimumWidth(150)
-        self._model_combo.setToolTip("模型名可直接输入；本地模型留空 = 使用已加载的第一个模型")
-        bar.addWidget(self._model_combo)
-
-        self._key_btn = QPushButton("密钥")
-        self._key_btn.setObjectName("Pill")
-        self._key_btn.setFixedWidth(50)
-        self._key_btn.setCursor(Qt.PointingHandCursor)
-        self._key_btn.setToolTip("配置当前提供商的 API Key / Base URL")
-        self._key_btn.clicked.connect(self._edit_provider)
-        bar.addWidget(self._key_btn)
+        self._skill_btn = QPushButton("技能")
+        self._skill_btn.setObjectName("Pill")
+        self._skill_btn.setFixedWidth(50)
+        self._skill_btn.setCursor(Qt.PointingHandCursor)
+        self._skill_btn.setToolTip("选一个技能装进本次提问")
+        self._skill_btn.clicked.connect(self._pick_skill)
+        bar.addWidget(self._skill_btn)
 
         self._policy_combo = QComboBox()
         self._policy_combo.setObjectName("Pill")
@@ -205,26 +209,63 @@ class AssistantPage(QWidget):
         self._ws_btn.clicked.connect(self._choose_workspace)
         bar.addWidget(self._ws_btn)
 
+        self._key_btn = QPushButton("密钥")
+        self._key_btn.setObjectName("Pill")
+        self._key_btn.setFixedWidth(50)
+        self._key_btn.setCursor(Qt.PointingHandCursor)
+        self._key_btn.setToolTip("配置当前提供商的 API Key / Base URL")
+        self._key_btn.clicked.connect(self._edit_provider)
+        bar.addWidget(self._key_btn)
+
         bar.addStretch(1)
 
-        self._stop_btn = QPushButton("停止")
-        self._stop_btn.setObjectName("Pill")
-        self._stop_btn.setFixedWidth(54)
+        # 右：模型来源 / 模型 / 发送
+        self._provider_combo = QComboBox()
+        self._provider_combo.setObjectName("Pill")
+        self._provider_combo.setMinimumWidth(92)
+        self._provider_combo.setToolTip("模型来源：本地引擎 / 硅基流动 / 自定义 OpenAI 兼容端点")
+        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        bar.addWidget(self._provider_combo)
+
+        self._model_combo = QComboBox()
+        self._model_combo.setObjectName("Pill")
+        self._model_combo.setEditable(True)
+        self._model_combo.setMinimumWidth(146)
+        self._model_combo.setToolTip("模型名可直接输入；本地模型留空 = 使用已加载的第一个模型")
+        bar.addWidget(self._model_combo)
+
+        self._stop_btn = QPushButton("■")
+        self._stop_btn.setObjectName("StopBtn")
+        self._stop_btn.setFixedSize(34, 34)
         self._stop_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_btn.setToolTip("停止生成")
         self._stop_btn.setEnabled(False)
         self._stop_btn.setVisible(False)
         self._stop_btn.clicked.connect(self._stop)
         bar.addWidget(self._stop_btn)
 
-        self._send_btn = QPushButton("发送")
+        self._send_btn = QPushButton("↑")
         self._send_btn.setObjectName("SendBtn")
-        self._send_btn.setFixedWidth(72)
+        self._send_btn.setFixedSize(34, 34)
         self._send_btn.setCursor(Qt.PointingHandCursor)
+        self._send_btn.setToolTip("发送（Enter）")
         self._send_btn.clicked.connect(self._on_send_clicked)
         bar.addWidget(self._send_btn)
 
         lay.addLayout(bar)
         return box
+
+    def _attach_file(self) -> None:
+        """把本机文件作为上下文插入输入框（@路径），模型可用 fs_read 打开。"""
+        start = self._state.get("workspace") or os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(self, "把文件加进这次提问", start,
+                                              "所有文件 (*.*)")
+        if not path:
+            return
+        cur = self._input.toPlainText().rstrip()
+        self._input.setPlainText(f"{cur} @{path} ".strip() if cur else f"@{path} ")
+        self._input.moveCursor(QTextCursor.End)
+        self._input.setFocus()
 
     # ---------------- 右侧侧栏 ----------------
     def _build_sidebar(self) -> QWidget:
@@ -822,6 +863,30 @@ class AssistantPage(QWidget):
         w = Worker(self._assist.save_settings, {"workspace": path})
         w.result.connect(lambda _r: self.refresh())
         w.start()
+
+    def _pick_skill(self) -> None:
+        """技能快捷入口：选一个技能，把「用 xx 技能：」插进输入框。"""
+        skills = self._state.get("skills") or []
+        menu = QMenu(self)
+        if not skills:
+            act = menu.addAction("（暂无技能，去侧栏新建或导入 zip）")
+            act.setEnabled(False)
+        for s in skills:
+            act = menu.addAction(s.get("name") or s.get("slug"))
+            act.setToolTip(s.get("description") or "")
+            act.triggered.connect(
+                lambda _checked=False, slug=s.get("slug") or "": self._use_skill(slug))
+        menu.exec(self._skill_btn.mapToGlobal(
+            self._skill_btn.rect().bottomLeft()))
+
+    def _use_skill(self, slug: str) -> None:
+        if not slug:
+            return
+        prefix = f"用 {slug} 技能"
+        cur = self._input.toPlainText().strip()
+        self._input.setPlainText(f"{prefix}：{cur}" if cur else f"{prefix}：")
+        self._input.moveCursor(QTextCursor.End)
+        self._input.setFocus()
 
     # ------------------------------------------------------------------ #
     # 技能
