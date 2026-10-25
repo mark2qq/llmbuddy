@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
         nav_layout.setSpacing(4)
         nav_layout.addWidget(self._nav_title())
         self._nav_buttons = []
+        self._assistant_nav_host = None
         for name, idx in self.NAV_ITEMS:
             btn = QPushButton(name)
             btn.setObjectName("NavButton")
@@ -94,6 +95,16 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _checked, i=idx: self._switch_page(i))
             self._nav_buttons.append(btn)
             nav_layout.addWidget(btn)
+            if idx == 0:
+                # 「智能助理」下面直接挂二级栏目（会话列表 + 技能/工具/MCP/审计）
+                host = QWidget()
+                host.setObjectName("NavSubHost")
+                host_lay = QVBoxLayout(host)
+                host_lay.setContentsMargins(0, 2, 0, 6)
+                host_lay.setSpacing(0)
+                nav_layout.addWidget(host)
+                self._assistant_nav_host = host
+                self._assistant_nav_lay = host_lay
         nav_layout.addStretch(1)
         root.addWidget(nav)
 
@@ -121,6 +132,10 @@ class MainWindow(QMainWindow):
                   self.api_page, self.settings):
             self._stack.addWidget(p)
 
+        # 二级栏目要等页面建好才能取控件（会话列表由 AssistantPage 维护）
+        if self._assistant_nav_host is not None:
+            self._assistant_nav_lay.addWidget(self.assistant.build_nav_panel())
+
         # 注意：构造函数期间不要触发各页 refresh()（其内部会启动 QThread 后台任务）。
         # 在 Qt 事件循环启动前启动 QThread 会导致死锁/卡死（窗口永远不显示）。
         # 真正的首次刷新由 main() 在 app.exec() 之后通过 QTimer.singleShot 触发。
@@ -146,6 +161,9 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(idx)
         for i, btn in enumerate(self._nav_buttons):
             btn.setChecked(i == idx)
+        # 二级栏目属于「智能助理」页：切到别的页就收起，不占用导航高度
+        if getattr(self, "_assistant_nav_host", None) is not None:
+            self._assistant_nav_host.setVisible(idx == 0)
         if refresh:
             w = self._stack.currentWidget()
             if w is not None:

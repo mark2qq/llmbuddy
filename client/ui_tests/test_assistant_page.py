@@ -2,12 +2,15 @@
 """
 智能助理页面（1.0.8）无头烟雾测试。
 
-验证点：
+1.0.9 结构调整（照 WorkBuddy 重排）后验证点：
     - 页面可构造、导航项出现在第一位
-    - 状态回填：提供商 / 审批策略 / 技能 / 工具 / MCP / 新会话
+    - 底栏融合工具条：附件/工作区/审批/技能/模型/发送全在输入容器内，单行
+    - 模型来源与模型合并进一个下拉菜单（不再两个 QComboBox 并排）
+    - 左栏二级栏目：会话直接列出、管理入口带数量，其余进管理面板
+    - 状态回填：审批策略 / 工作区 / 技能 / 工具 / MCP / 新会话
     - SSE 事件渲染：delta → 气泡；tool_call → 工具卡片；approval_request → 审批卡
-    - 审批卡片点「允许」会回调后端
-    - 浅色主题下新增选择器被正确覆盖（不破坏既有样式）
+    - 技能 chip：挂载后发消息自动带「用 xx 技能」前缀，输入框不被改写
+    - 浅色主题覆盖新增的选择器
 """
 import os
 import sys
@@ -25,6 +28,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time  # noqa: E402
 
 import pytest  # noqa: E402
+from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -126,45 +130,176 @@ class _FakeAssistApi:
         return []
 
 
+class _FakeStream(QObject):
+    """替代 AssistantStream：只记录 payload，不真的发请求。"""
+
+    event = Signal(dict)
+    failed = Signal(str)
+    closed = Signal()
+
+    instances = []
+
+    def __init__(self, base, key, payload):
+        super().__init__()
+        self.payload = payload
+        _FakeStream.instances.append(self)
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
 @pytest.fixture()
 def page(monkeypatch):
     from ui.pages import assistant_page as mod
     fake = _FakeAssistApi()
     monkeypatch.setattr(mod, "AssistantApi", lambda *a, **kw: fake)
     p = mod.AssistantPage(_Api(), None, _Cfg())
-    p.refresh()          # 构造不自动刷新（避免 exec() 前起线程），测试里手动触发
+    p.build_nav_panel()   # 主窗口会把这块挂到左栏「智能助理」下面
+    p.refresh()           # 构造不自动刷新（避免 exec() 前起线程），测试里手动触发
     assert _pump(lambda: bool(p._state))
     assert _pump(lambda: bool(p._session_id))
+    assert _pump(lambda: p._nav_sess.count() == 1)
     return p, fake
 
 
+# ---------------------------------------------------------------------------
+# 导航
+# ---------------------------------------------------------------------------
 def test_nav_has_assistant_first():
     from ui.main_window import MainWindow
     assert MainWindow.NAV_ITEMS[0] == ("智能助理", 0)
     assert len(MainWindow.NAV_ITEMS) == 6
 
 
-def test_state_fills_ui(page):
-    p, fake = page
-    assert p._provider_combo.count() == 2
-    assert p._provider_combo.currentData() == "local"
-    assert p._policy_combo.currentData() == "readonly_auto"
-    assert p._skill_list.count() == 1
-    assert p._tool_list.count() == 2
-    assert p._mcp_list.count() == 1
-    assert "工作区" in p._subtitle.text()
+def test_nav_panel_lists_sessions_directly(page):
+    """批注：会话/技能/工具/MCP/审计 作为二级栏目放在智能助理下面直接显示。"""
+    p, _fake = page
+    assert p._nav_sess is not None          # 二级栏目在页面构造时就绪
+    assert p._nav_sess.count() == 1         # sessions() 返回 1 条
+    assert p._nav_sess.height() > 0
+    assert p._nav_entries["skills"].text() == "技能 · 1"
+    assert p._nav_entries["tools"].text() == "工具 · 2"
+    assert p._nav_entries["mcp"].text() == "MCP · 1"
+    assert p._nav_entries["audit"].text() == "审计"
+
+
+def test_nav_panel_hidden_when_empty(page):
+    p, _fake = page
+    p._apply_sessions([])
+    assert p._nav_sess.count() == 0
+    assert p._nav_sess.height() == 0        # 空列表不占位
+
+
+# ---------------------------------------------------------------------------
+# 底栏
+# ---------------------------------------------------------------------------
+def test_bottom_bar_is_single_row_inside_composer(page):
+    """附件/工作区/审批/技能/模型/发送 全部贴在输入框底栏（参考 WorkBuddy）。"""
+    p, _fake = page
+    assert p._composer is not None
+    for w in (p._input, p._attach_btn, p._ws_btn, p._policy_btn, p._skill_btn,
+              p._model_btn, p._send_btn, p._stop_btn, p._busy_lbl):
+        assert p._composer.isAncestorOf(w), w.objectName()
+    # 顶栏只留标题 + 管理入口
+    assert not p._composer.isAncestorOf(p._manage_btn)
+
+
+def test_model_source_and_model_merged_into_one_menu(page):
+    """模型来源与模型名不再各占一个下拉，合并为一个按钮 + 菜单。"""
+    p, _fake = page
+    assert not hasattr(p, "_provider_combo")
+    assert not hasattr(p, "_model_combo")
+    assert hasattr(p, "_model_btn")
+    assert _pump(lambda: "qwen3-4b" in p._model_btn.text())
+
+
+def test_state_fills_bottom_bar(page):
+    p, _fake = page
+    assert "只读自动" in p._policy_btn.text()
+    assert p._ws_btn.text() == "ws"          # E:\tmp\ws -> 目录名 ws
     assert "LangGraph" in p._subtitle.text()
+    assert "工作区" in p._subtitle.text()
 
 
 def test_policy_change_persists(page):
     p, fake = page
-    idx = p._policy_combo.findData("ask_all")
-    p._policy_combo.setCurrentIndex(idx)
+    p._set_policy("ask_all")
     assert _pump(lambda: fake.saved.get("policy") == "ask_all")
+    assert "全部确认" in p._policy_btn.text()
 
 
-def test_sse_events_render(page):
+def test_switch_model_persists_provider(page):
     p, fake = page
+    p._set_provider("siliconflow")
+    assert _pump(lambda: fake.saved.get("active_provider") == "siliconflow")
+    assert p._active_provider == "siliconflow"
+
+
+def test_skill_chip_mounts_without_touching_input(page):
+    """技能按钮变成 chip：挂载后不改写输入框，只记状态。"""
+    p, _fake = page
+    p._use_skill("repo-digest")
+    assert p._skill_slug == "repo-digest"
+    assert p._skill_btn.text() == "✕ repo-digest"
+    assert bool(p._skill_btn.property("active")) is True
+    assert p._input.toPlainText() == ""
+    p._clear_skill()
+    assert p._skill_btn.text() == "技能"
+    assert bool(p._skill_btn.property("active")) is False
+
+
+def test_skill_prefix_injected_in_payload(page, monkeypatch):
+    """挂载技能后，每条消息自动带「用 xx 技能」前缀（用户看不到，模型看得到）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    p._use_skill("repo-digest")
+    p._send_with_session({"id": p._session_id}, "看看这个项目")
+    payload = _FakeStream.instances[-1].payload
+    assert payload["message"] == "用 repo-digest 技能：看看这个项目"
+    assert payload["provider"] == "local"
+    assert payload["stream"] is True
+    p._end_streaming()
+
+
+# ---------------------------------------------------------------------------
+# 管理面板（原右侧 tab 面板）
+# ---------------------------------------------------------------------------
+def test_manager_dialog_has_five_tabs(page):
+    from ui.pages.assistant_page import ManagerDialog
+    p, _fake = page
+    dlg = ManagerDialog(p)
+    assert dlg.tabs.count() == 5
+    assert [dlg.tabs.tabText(i) for i in range(5)] == \
+        ["会话", "技能", "工具", "MCP", "审计"]
+    dlg.show_tab("mcp")
+    assert dlg.tabs.currentIndex() == 3
+    dlg.deleteLater()
+
+
+def test_manager_lists_fill_from_state(page):
+    from ui.pages.assistant_page import ManagerDialog
+    p, _fake = page
+    dlg = ManagerDialog(p)
+    p._fill_skills(p._state["skills"])
+    p._fill_tools(p._state["tools"])
+    p._fill_mcp(p._state["mcp"])
+    p._fill_sessions()
+    assert p._skill_list.count() == 1
+    assert p._tool_list.count() == 2
+    assert p._mcp_list.count() == 1
+    assert _pump(lambda: p._all_sess_list.count() == 1)
+    dlg.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# 对话渲染
+# ---------------------------------------------------------------------------
+def test_sse_events_render(page):
+    p, _fake = page
     p._begin_streaming()
     p._on_event({"type": "delta", "text": "我先看一下目录。"})
     p._on_event({"type": "tool_call", "name": "fs_read",
@@ -192,7 +327,7 @@ def test_approval_card_resolves(page):
 
 
 def test_load_session_renders_history(page):
-    p, fake = page
+    p, _fake = page
     from PySide6.QtWidgets import QListWidgetItem
     item = QListWidgetItem("历史会话")
     item.setData(0x0100, "s1")          # Qt.UserRole == 0x0100
@@ -201,45 +336,17 @@ def test_load_session_renders_history(page):
     assert p._msg_layout.count() >= 3   # 2 条消息 + 末尾 stretch
 
 
-def test_light_theme_covers_assistant(page):
-    from core.theme import build_stylesheet
-    css = build_stylesheet("#ffffff")
-    for sel in ("#AssistantSideBar", "#ApprovalCard", "#BotBubble", "#ToolCard"):
-        assert sel in css
-    dark = build_stylesheet("")
-    assert "#AssistantSideBar" in dark
-
-
-def test_model_controls_live_in_composer(page):
-    """模型 / 审批 / 工作区必须贴在输入框里，而不是顶部标题栏（参考 WorkBuddy）。"""
-    p, _fake = page
-    assert p._composer is not None
-    for w in (p._input, p._provider_combo, p._model_combo, p._policy_combo,
-              p._ws_btn, p._send_btn):
-        assert p._composer.isAncestorOf(w), w.objectName()
-    assert not p._composer.isAncestorOf(p._new_btn)   # 新会话仍在标题栏
-
-
-def test_send_stop_swap_while_streaming(page):
-    p, _fake = page
-    assert not p._send_btn.isHidden()
-    assert p._stop_btn.isHidden()
-    p._begin_streaming()
-    assert p._send_btn.isHidden()
-    assert not p._stop_btn.isHidden()
-    p._end_streaming()
-    assert not p._send_btn.isHidden()
-    assert p._stop_btn.isHidden()
-
-
-def test_skill_shortcut_prefills_input(page):
-    """输入框旁的「技能」入口：选中后把「用 xx 技能：」写进输入框。"""
-    p, _fake = page
-    p._use_skill("repo-digest")
-    assert p._input.toPlainText().startswith("用 repo-digest 技能")
-    p._input.setPlainText("看看这个项目")
-    p._use_skill("repo-digest")
-    assert p._input.toPlainText() == "用 repo-digest 技能：看看这个项目"
+def test_bubble_width_fits_content_and_caps(page):
+    """气泡宽度：短句贴合文字，长段落封顶 MAX_WIDTH（否则中文被压成很窄一列）。"""
+    from ui.widgets.assistant_cards import ChatBubble
+    short = ChatBubble("user", "你好")
+    assert short.label.maximumWidth() <= 200
+    long_text = ("把工作区里散落的文档按类型归档到 docs / images / data 三个目录，"
+                 "并保留原始目录结构。") * 4
+    big = ChatBubble("assistant", long_text)
+    assert big.label.maximumWidth() == ChatBubble.MAX_WIDTH
+    big.append_text("继续追加一段")
+    assert big.label.maximumWidth() == ChatBubble.MAX_WIDTH
 
 
 def test_done_after_tool_call_still_renders_answer(page):
@@ -255,3 +362,32 @@ def test_done_after_tool_call_still_renders_answer(page):
     p._end_streaming()
     assert p._msg_layout.count() == before + 2      # 工具卡 + 最终答复气泡
     assert p._bubble is None
+
+
+def test_send_stop_swap_while_streaming(page):
+    p, _fake = page
+    assert not p._send_btn.isHidden()
+    assert p._stop_btn.isHidden()
+    assert p._busy_lbl.isHidden()
+    p._begin_streaming()
+    assert p._send_btn.isHidden()
+    assert not p._stop_btn.isHidden()
+    assert not p._busy_lbl.isHidden()       # 运行中显示旋转指示
+    p._end_streaming()
+    assert not p._send_btn.isHidden()
+    assert p._stop_btn.isHidden()
+    assert p._busy_lbl.isHidden()
+
+
+# ---------------------------------------------------------------------------
+# 主题
+# ---------------------------------------------------------------------------
+def test_light_theme_covers_bottom_bar_and_nav(page):
+    from core.theme import build_stylesheet
+    css = build_stylesheet("#ffffff")
+    for sel in ("#BarChip", "#ModelChip", "#BarBtn", "#BusyDot", "#SendBtn",
+                "#NavSubItem", "#NavSessList", "#ApprovalCard"):
+        assert sel in css, sel
+    dark = build_stylesheet("")
+    for sel in ("#BarChip", "#ModelChip", "#NavSubItem", "#NavSessList"):
+        assert sel in dark, sel

@@ -23,9 +23,15 @@ RISK_OBJ = {"low": "RiskLow", "medium": "RiskMedium", "high": "RiskHigh"}
 class ChatBubble(QWidget):
     """一条消息气泡。role ∈ user / assistant。"""
 
+    #: 气泡最大宽度：长段落到这里换行，短句按内容贴合
+    MAX_WIDTH = 660
+    #: 估宽时预留的内边距（QSS 里 padding 8~12px + 边框）
+    PAD = 30
+
     def __init__(self, role: str, text: str = "", parent=None):
         super().__init__(parent)
         self.role = role
+        self._fit_w = -1
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 2)
         lay.setSpacing(0)
@@ -37,6 +43,7 @@ class ChatBubble(QWidget):
         self.label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         if text:
             self._apply_format(markdown=(role == "assistant"))
+        self._fit_width()
 
         if role == "user":
             lay.addStretch(1)
@@ -48,10 +55,29 @@ class ChatBubble(QWidget):
     def set_text(self, text: str, markdown: bool = True) -> None:
         self.label.setText(text or "")
         self._apply_format(markdown=markdown)
+        self._fit_width()
 
     def append_text(self, piece: str) -> None:
         """流式追加（期间用纯文本，避免半截 Markdown 抖动）。"""
         self.label.setText(self.label.text() + piece)
+        self._fit_width()
+
+    def _fit_width(self) -> None:
+        """按内容估算理想宽度。
+
+        开了 wordWrap 的 QLabel 给不出可用宽度（布局会把它压成很窄一列，
+        中文长句被切成四五行），所以这里按字宽自己算一次，换行仍交给
+        wordWrap；短句贴合文字，长段落封顶 MAX_WIDTH。
+        """
+        text = self.label.text() or ""
+        fm = self.label.fontMetrics()
+        widest = 0
+        for line in (text.splitlines() or [""]):
+            widest = max(widest, fm.horizontalAdvance(line))
+        width = min(max(widest + self.PAD, 84), self.MAX_WIDTH)
+        if width != self._fit_w:
+            self._fit_w = width
+            self.label.setFixedWidth(width)
 
     def _apply_format(self, markdown: bool) -> None:
         if markdown:

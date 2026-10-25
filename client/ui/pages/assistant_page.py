@@ -2,11 +2,25 @@
 """
 智能助理页面（ui/pages/assistant_page.py）——1.0.8 新模块。
 
-布局：
-    ┌ 顶部：标题 + 提供商/模型/审批策略 + 工作区 + 新会话 ─────────────┐
-    │ 左：对话流（气泡 / 工具卡片 / 审批卡片 / 技能阶段）+ 输入区      │ 右：侧栏
-    │                                                                  │ 会话/技能/工具/MCP/审计
-    └──────────────────────────────────────────────────────────────────┘
+布局（1.0.8 按 WorkBuddy 对话框形态重排）：
+    左栏（主窗口 NavPanel 内）              右栏（本页）
+      智能助理                          ┌ 标题 + 管理入口 ────────────────┐
+        ▸ 会话（最近 5 条，点即切换）    │ 对话流（气泡 / 工具卡 / 审批卡） │
+        ▸ 技能 / 工具 / MCP / 审计      │ ┌─ 输入框 ────────────────────┐ │
+          （点开管理面板）              │ │ [+] [工作区][审批][技能]      │ │
+                                        │ │          ◐  [模型 ▾]   [↑]  │ │
+                                        │ └─────────────────────────────┘ │
+                                        └─────────────────────────────────┘
+
+底栏与 WorkBuddy 输入框底部的对应关系（功能流程对齐，不是照搬图标）：
+    +              添加本机文件（插入 @路径 作为上下文）
+    分支 master    工作区：文件工具可访问的根目录，按钮显示目录名，点击切换
+    ⊘ 权限         审批策略：只读自动 / 全部确认 / 全部放行
+    × 团队 chip    技能 chip：挂载后每条消息自动带上「用 xx 技能」，可一键清除
+    加载环         运行中指示（◐ 旋转），与「■ 停止」按钮配套
+    模型下拉       模型 + 来源合并下拉（本地 / 硅基流动 / 自定义 + 配置密钥）
+    ↑ 发送         发送（流式中原地变成 ■ 停止）
+    🎤 语音        本机暂无语音能力，不做假按钮
 
 能力（全部走本机后端 /api/v1/assistant/*）：
     - 操作本机文件、执行命令、抓网页（工具卡片可视化每次调用）
@@ -14,19 +28,19 @@
     - 技能包 SKILL.md 的新建/编辑/导入(zip)/导出(zip)/删除
     - 高危动作审批卡片（允许 / 本会话允许同类 / 拒绝）
     - 本地模型 / 硅基流动 / 自定义 OpenAI 兼容端点切换
-    - 会话历史保存与回看
+    - 会话历史保存与回看（左栏二级栏目 + 管理面板）
 """
 import json
 import os
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton,
-                               QSplitter, QTabWidget, QTextEdit, QVBoxLayout,
+                               QSizePolicy, QTabWidget, QTextEdit, QVBoxLayout,
                                QWidget)
 
 from core.assistant_client import AssistantApi, AssistantStream
@@ -40,7 +54,14 @@ POLICY_ITEMS = [
     ("ask_all", "全部确认", "任何工具调用都要你确认后才执行"),
     ("yolo", "全部放行", "所有工具直接执行、不再询问（危险）"),
 ]
+POLICY_ICON = {"readonly_auto": "⊘", "ask_all": "✓", "yolo": "⚡"}
 RISK_TEXT = {"low": "只读", "medium": "写入", "high": "高危"}
+
+# 左栏二级栏目里直接显示的会话条数（其余进管理面板）
+NAV_MAX_SESSIONS = 5
+NAV_SESSION_ROW = 26
+# 运行中指示的旋转字符
+SPIN_FRAMES = "◐◓◑◒"
 
 
 class AssistantPage(QWidget):
@@ -64,6 +85,23 @@ class AssistantPage(QWidget):
         self._busy = False
         self._loading = False
 
+        # 底栏状态（1.0.8 界面提审）：模型来源 / 模型名 / 挂载的技能
+        self._active_provider = "local"
+        self._active_model = ""
+        self._skill_slug = ""
+        self._model_cache: Dict[str, List[str]] = {}
+        # 管理面板懒创建（会话/技能/工具/MCP/审计 tab 在里面）
+        self._manager: Optional["ManagerDialog"] = None
+        self._spin_i = 0
+        # 各管理列表在面板未创建时为 None，填充函数都要判空
+        self._all_sess_list = None
+        self._skill_list = None
+        self._tool_list = None
+        self._mcp_list = None
+        self._audit_view = None
+        self._nav_sess = None
+        self._nav_entries: Dict[str, QPushButton] = {}
+
         self._build_ui()
         # 注意：不在这里调 refresh()。构造函数运行在 QApplication.exec() 之前，
         # 此时启动 QThread（Worker）会导致窗口永不显示（见 main_window / task_runner
@@ -75,22 +113,16 @@ class AssistantPage(QWidget):
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(18, 14, 18, 8)
+        root.setSpacing(6)
 
         root.addLayout(self._build_header())
-
-        split = QSplitter(Qt.Horizontal)
-        split.setChildrenCollapsible(False)
-        split.addWidget(self._build_chat_panel())
-        split.addWidget(self._build_sidebar())
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 0)
-        split.setSizes([740, 320])
-        root.addWidget(split, 1)
+        # 右侧 tab 面板已取消：会话/技能/工具/MCP/审计 全部移到左栏二级栏目
+        # 与「管理」面板（批注：作为二级栏目放在智能助理下面直接显示）。
+        root.addWidget(self._build_chat_panel(), 1)
 
     def _build_header(self) -> QHBoxLayout:
-        """顶部只留标题与「新会话」；模型/审批/工作区统一下沉到输入框（参考 WorkBuddy）。"""
+        """顶部只留标题与副标题；模型/审批/工作区统一下沉到输入框底栏。"""
         head = QHBoxLayout()
         head.setSpacing(8)
 
@@ -105,138 +137,159 @@ class AssistantPage(QWidget):
         head.addLayout(titles)
         head.addStretch(1)
 
-        self._new_btn = QPushButton("新会话")
-        self._new_btn.setObjectName("GhostBtn")
-        self._new_btn.setToolTip("开一个全新的会话（当前会话会自动保存在侧栏）")
-        self._new_btn.setCursor(Qt.PointingHandCursor)
-        self._new_btn.clicked.connect(lambda: self._new_session())
-        head.addWidget(self._new_btn)
+        self._manage_btn = QPushButton("管理")
+        self._manage_btn.setObjectName("GhostBtn")
+        self._manage_btn.setToolTip("打开管理面板：会话 / 技能 / 工具 / MCP / 审计")
+        self._manage_btn.setCursor(Qt.PointingHandCursor)
+        self._manage_btn.clicked.connect(lambda: self.open_manager())
+        head.addWidget(self._manage_btn)
         return head
 
-    # ---------------- 左侧对话区 ----------------
+    # ---------------- 对话区（内容列居中，参考 WorkBuddy） ----------------
     def _build_chat_panel(self) -> QWidget:
         panel = QWidget()
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(0)
 
         self._scroll = AutoHideScrollArea()
         self._scroll.setObjectName("ChatScroll")
         self._container = QWidget()
-        self._msg_layout = QVBoxLayout(self._container)
+        row = QHBoxLayout(self._container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        # 内容列最宽 940：窗口拉宽后对话与输入框居中，不横向铺满整个屏幕
+        self._col = QWidget()
+        self._col.setObjectName("ChatColumn")
+        self._col.setMaximumWidth(940)
+        self._col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._msg_layout = QVBoxLayout(self._col)
         self._msg_layout.setContentsMargins(2, 2, 8, 2)
         self._msg_layout.setSpacing(6)
         self._msg_layout.addStretch(1)
+        row.addStretch(1)
+        row.addWidget(self._col, 100)   # 先抢满，被 maximumWidth 限住后两侧等分
+        row.addStretch(1)
         self._scroll.setWidget(self._container)
         lay.addWidget(self._scroll, 1)
+
+        lay.addWidget(self._build_footer())
+        return panel
+
+    def _build_footer(self) -> QWidget:
+        """底部固定区：状态提示 / 输入框 / 合规提示（与对话列同宽居中）。"""
+        foot = QWidget()
+        outer = QHBoxLayout(foot)
+        outer.setContentsMargins(0, 8, 0, 2)
+        outer.setSpacing(0)
+
+        inner = QWidget()
+        inner.setMaximumWidth(940)
+        inner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(0, 0, 0, 0)
+        il.setSpacing(6)
 
         self._status = QLabel("")
         self._status.setObjectName("PageSubtitle")
         self._status.setWordWrap(True)
-        lay.addWidget(self._status)
+        self._status.setVisible(False)
+        il.addWidget(self._status)
 
-        lay.addWidget(self._build_composer())
+        il.addWidget(self._build_composer())
+
         tip = QLabel("内容由 AI 生成，请核实重要信息")
         tip.setObjectName("ComposerTip")
         tip.setAlignment(Qt.AlignCenter)
-        lay.addWidget(tip)
-        return panel
+        il.addWidget(tip)
+
+        outer.addStretch(1)
+        outer.addWidget(inner, 100)
+        outer.addStretch(1)
+        return foot
 
     def _build_composer(self) -> QWidget:
         """
-        底部输入区（对齐 WorkBuddy）：
+        底部输入区（对齐 WorkBuddy 输入框底部工具条）：
 
-            ┌ 今天帮你做些什么？@ 添加文件，/ 选技能 ────────────────┐
+            ┌ 今天帮你做些什么？ ───────────────────────────────┐
             │                                                        │
-            │ [+] [技能] [审批] [工作区] [密钥]    [来源] [模型] [↑] │
+            │ [+] [工作区] [⊘ 只读自动] [技能]     ◐  [模型 ▾]  [↑] │
             └────────────────────────────────────────────────────────┘
 
-        左侧是「动作与上下文」，右侧是「模型与发送」，发送在流式时原地变停止。
+        左侧是「动作与上下文」，右侧是「运行状态 / 模型 / 发送」；
+        发送在流式时原地变成停止。
         """
         box = QFrame()
         box.setObjectName("Composer")
         box.setProperty("focus", False)
         self._composer = box
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(14, 12, 12, 10)
-        lay.setSpacing(8)
+        lay.setContentsMargins(12, 10, 10, 8)
+        lay.setSpacing(2)
 
         self._input = QTextEdit()
         self._input.setObjectName("ComposerInput")
         self._input.setFrameShape(QFrame.NoFrame)
         self._input.setPlaceholderText(
-            "今天帮你做些什么？@ 添加文件，/ 选技能（Enter 发送，Shift+Enter 换行）")
-        self._input.setFixedHeight(76)
+            "今天帮你做些什么？（Enter 发送，Shift+Enter 换行）")
+        self._input.setFixedHeight(66)
         self._input.installEventFilter(self)
         lay.addWidget(self._input)
 
         bar = QHBoxLayout()
-        bar.setSpacing(6)
+        bar.setSpacing(2)
 
-        # 左：附加文件
+        # 左：附件 / 工作区 / 审批策略 / 技能
         self._attach_btn = QPushButton("+")
-        self._attach_btn.setObjectName("IconBtn")
+        self._attach_btn.setObjectName("BarBtn")
         self._attach_btn.setFixedSize(26, 26)
         self._attach_btn.setCursor(Qt.PointingHandCursor)
-        self._attach_btn.setToolTip("把这个文件加进本次提问（插入 @路径）")
+        self._attach_btn.setToolTip("把本机文件加进本次提问（插入 @路径）")
         self._attach_btn.clicked.connect(self._attach_file)
         bar.addWidget(self._attach_btn)
 
-        self._skill_btn = QPushButton("技能")
-        self._skill_btn.setObjectName("Pill")
-        self._skill_btn.setFixedWidth(50)
-        self._skill_btn.setCursor(Qt.PointingHandCursor)
-        self._skill_btn.setToolTip("选一个技能装进本次提问")
-        self._skill_btn.clicked.connect(self._pick_skill)
-        bar.addWidget(self._skill_btn)
-
-        self._policy_combo = QComboBox()
-        self._policy_combo.setObjectName("Pill")
-        self._policy_combo.setMinimumWidth(96)
-        for _pid, _label, _tip in POLICY_ITEMS:
-            self._policy_combo.addItem(_label, _pid)
-            self._policy_combo.setItemData(self._policy_combo.count() - 1,
-                                           _tip, Qt.ToolTipRole)
-        self._policy_combo.setToolTip("高危动作审批策略")
-        self._policy_combo.currentIndexChanged.connect(self._on_policy_changed)
-        bar.addWidget(self._policy_combo)
-
         self._ws_btn = QPushButton("工作区")
-        self._ws_btn.setObjectName("Pill")
-        self._ws_btn.setFixedWidth(62)
+        self._ws_btn.setObjectName("BarChip")
         self._ws_btn.setCursor(Qt.PointingHandCursor)
         self._ws_btn.setToolTip("切换文件工具可访问的工作区")
         self._ws_btn.clicked.connect(self._choose_workspace)
         bar.addWidget(self._ws_btn)
 
-        self._key_btn = QPushButton("密钥")
-        self._key_btn.setObjectName("Pill")
-        self._key_btn.setFixedWidth(50)
-        self._key_btn.setCursor(Qt.PointingHandCursor)
-        self._key_btn.setToolTip("配置当前提供商的 API Key / Base URL")
-        self._key_btn.clicked.connect(self._edit_provider)
-        bar.addWidget(self._key_btn)
+        self._policy_btn = QPushButton("⊘ 只读自动")
+        self._policy_btn.setObjectName("BarChip")
+        self._policy_btn.setCursor(Qt.PointingHandCursor)
+        self._policy_btn.setToolTip("高危动作审批策略（点击切换）")
+        self._policy_btn.clicked.connect(self._show_policy_menu)
+        bar.addWidget(self._policy_btn)
+
+        self._skill_btn = QPushButton("技能")
+        self._skill_btn.setObjectName("BarChip")
+        self._skill_btn.setCursor(Qt.PointingHandCursor)
+        self._skill_btn.setToolTip("挂载技能：之后每条消息自动带上「用 xx 技能」")
+        self._skill_btn.clicked.connect(self._show_skill_menu)
+        bar.addWidget(self._skill_btn)
 
         bar.addStretch(1)
 
-        # 右：模型来源 / 模型 / 发送
-        self._provider_combo = QComboBox()
-        self._provider_combo.setObjectName("Pill")
-        self._provider_combo.setMinimumWidth(92)
-        self._provider_combo.setToolTip("模型来源：本地引擎 / 硅基流动 / 自定义 OpenAI 兼容端点")
-        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        bar.addWidget(self._provider_combo)
+        # 右：运行指示 / 模型 / 发送
+        self._busy_lbl = QLabel("")
+        self._busy_lbl.setObjectName("BusyDot")
+        self._busy_lbl.setFixedWidth(16)
+        self._busy_lbl.setToolTip("助理正在工作")
+        self._busy_lbl.setVisible(False)
+        bar.addWidget(self._busy_lbl)
 
-        self._model_combo = QComboBox()
-        self._model_combo.setObjectName("Pill")
-        self._model_combo.setEditable(True)
-        self._model_combo.setMinimumWidth(146)
-        self._model_combo.setToolTip("模型名可直接输入；本地模型留空 = 使用已加载的第一个模型")
-        bar.addWidget(self._model_combo)
+        self._model_btn = QPushButton("模型")
+        self._model_btn.setObjectName("ModelChip")
+        self._model_btn.setCursor(Qt.PointingHandCursor)
+        self._model_btn.setToolTip("切换模型来源与模型")
+        self._model_btn.clicked.connect(self._show_model_menu)
+        bar.addWidget(self._model_btn)
 
         self._stop_btn = QPushButton("■")
         self._stop_btn.setObjectName("StopBtn")
-        self._stop_btn.setFixedSize(34, 34)
+        self._stop_btn.setFixedSize(30, 30)
         self._stop_btn.setCursor(Qt.PointingHandCursor)
         self._stop_btn.setToolTip("停止生成")
         self._stop_btn.setEnabled(False)
@@ -246,14 +299,40 @@ class AssistantPage(QWidget):
 
         self._send_btn = QPushButton("↑")
         self._send_btn.setObjectName("SendBtn")
-        self._send_btn.setFixedSize(34, 34)
+        self._send_btn.setFixedSize(30, 30)
         self._send_btn.setCursor(Qt.PointingHandCursor)
         self._send_btn.setToolTip("发送（Enter）")
         self._send_btn.clicked.connect(self._on_send_clicked)
         bar.addWidget(self._send_btn)
 
         lay.addLayout(bar)
+
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(120)
+        self._spin_timer.timeout.connect(self._tick_spin)
         return box
+
+    # ---------------- 运行中指示（WorkBuddy 的加载环） ----------------
+    def _tick_spin(self) -> None:
+        self._spin_i = (self._spin_i + 1) % len(SPIN_FRAMES)
+        self._busy_lbl.setText(SPIN_FRAMES[self._spin_i])
+
+    def _start_spin(self) -> None:
+        self._spin_i = 0
+        self._busy_lbl.setText(SPIN_FRAMES[0])
+        self._busy_lbl.setVisible(True)
+        self._spin_timer.start()
+
+    def _stop_spin(self) -> None:
+        self._spin_timer.stop()
+        self._busy_lbl.setVisible(False)
+
+    # ---------------- 底栏弹出菜单（贴近窗口底部，向上展开） ----------------
+    def _popup_above(self, menu: QMenu, anchor: QWidget) -> None:
+        menu.ensurePolished()
+        size = menu.sizeHint()
+        pos = anchor.mapToGlobal(QPoint(0, 0))
+        menu.exec(QPoint(pos.x(), pos.y() - size.height() - 6))
 
     def _attach_file(self) -> None:
         """把本机文件作为上下文插入输入框（@路径），模型可用 fs_read 打开。"""
@@ -267,80 +346,169 @@ class AssistantPage(QWidget):
         self._input.moveCursor(QTextCursor.End)
         self._input.setFocus()
 
-    # ---------------- 右侧侧栏 ----------------
-    def _build_sidebar(self) -> QWidget:
-        side = QWidget()
-        side.setObjectName("AssistantSideBar")
-        side.setMinimumWidth(300)
-        side.setMaximumWidth(420)
-        lay = QVBoxLayout(side)
-        lay.setContentsMargins(10, 8, 10, 10)
+    # ---------------- 左栏二级栏目（挂到主窗口 NavPanel） ----------------
+    def build_nav_panel(self) -> QWidget:
+        """一级「智能助理」下面的二级栏目：会话直接列出，管理入口紧随其后。
+
+        批注要求：把原先右侧那个「会话 / 技能 / 工具 / MCP / 审计」tab 面板
+        「作为二级栏目放在智能助理下面直接显示」，所以右侧面板整块取消，
+        会话列表直接铺在左栏，其余四项点开管理面板。
+        """
+        panel = QWidget()
+        panel.setObjectName("NavSub")
+        # 必须由页面强引用：主窗口 addWidget 之后父对象变了，但页面释放时也要能找回来
+        self._nav_panel = panel
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(1)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(20, 7, 10, 2)
+        head.setSpacing(4)
+        title = QLabel("会话")
+        title.setObjectName("NavSubTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        add = QPushButton("+")
+        add.setObjectName("NavSubAdd")
+        add.setFixedSize(18, 18)
+        add.setCursor(Qt.PointingHandCursor)
+        add.setToolTip("新会话")
+        add.clicked.connect(lambda: self._new_session())
+        head.addWidget(add)
+        lay.addLayout(head)
+
+        self._nav_sess = QListWidget()
+        self._nav_sess.setObjectName("NavSessList")
+        self._nav_sess.setFrameShape(QFrame.NoFrame)
+        self._nav_sess.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._nav_sess.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._nav_sess.setFixedHeight(0)
+        self._nav_sess.setToolTip("点一条会话即切换（全部历史在「管理」里）")
+        self._nav_sess.itemClicked.connect(self._load_session_item)
+        lay.addWidget(self._nav_sess)
+
+        self._nav_entries: Dict[str, QPushButton] = {}
+        for key, label in (("skills", "技能"), ("tools", "工具"),
+                           ("mcp", "MCP"), ("audit", "审计")):
+            btn = QPushButton(label)
+            btn.setObjectName("NavSubItem")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _c=False, k=key: self.open_manager(k))
+            lay.addWidget(btn)
+            self._nav_entries[key] = btn
+        self._sync_nav_entries()
+        return panel
+
+    def _sync_nav_entries(self) -> None:
+        """二级管理入口带数量（技能 3 / 工具 14 / MCP 0）。"""
+        entries = getattr(self, "_nav_entries", None) or {}
+        counts = {
+            "skills": len(self._state.get("skills") or []),
+            "tools": len(self._state.get("tools") or []),
+            "mcp": len(self._state.get("mcp") or []),
+        }
+        for key, label in (("skills", "技能"), ("tools", "工具"),
+                           ("mcp", "MCP"), ("audit", "审计")):
+            btn = entries.get(key)
+            if btn is None:
+                continue
+            btn.setText(f"{label} · {counts[key]}" if key in counts else label)
+
+    # ---------------- 管理面板（会话 / 技能 / 工具 / MCP / 审计） ----------------
+    def open_manager(self, key: str = "sessions") -> None:
+        if self._manager is None:
+            self._manager = ManagerDialog(self)
+        dlg = self._manager
+        # 每次打开前用当前 state 回填，避免面板空着等下一次 refresh
+        self._fill_skills(self._state.get("skills") or [])
+        self._fill_tools(self._state.get("tools") or [])
+        self._fill_mcp(self._state.get("mcp") or [])
+        self._fill_sessions()
+        if key == "audit":
+            self._refresh_audit()
+        dlg.show_tab(key)
+        dlg.exec()
+
+    def _build_sessions_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
+        lay.addWidget(self._hint(
+            f"左栏只直接显示最近 {NAV_MAX_SESSIONS} 条，完整历史在这里。"
+            "双击可打开会话。"))
+        self._all_sess_list = QListWidget()
+        self._all_sess_list.itemDoubleClicked.connect(self._load_session_item)
+        lay.addWidget(self._all_sess_list, 1)
+        row = QHBoxLayout()
+        b_new = QPushButton("新会话")
+        b_new.clicked.connect(lambda: self._new_session())
+        b_open = QPushButton("打开")
+        b_open.clicked.connect(
+            lambda: self._load_session_item(self._all_sess_list.currentItem()))
+        b_del = QPushButton("删除")
+        b_del.clicked.connect(self._delete_session)
+        for b in (b_new, b_open, b_del):
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        return w
 
-        self._tabs = QTabWidget()
-        lay.addWidget(self._tabs, 1)
-
-        # 会话
-        self._sess_tab = QWidget()
-        sl = QVBoxLayout(self._sess_tab)
-        sl.setContentsMargins(0, 6, 0, 0)
-        self._sess_list = QListWidget()
-        self._sess_list.itemDoubleClicked.connect(self._load_session_item)
-        sl.addWidget(self._sess_list, 1)
-        srow = QHBoxLayout()
-        s_load = QPushButton("打开")
-        s_load.clicked.connect(lambda: self._load_session_item(self._sess_list.currentItem()))
-        s_del = QPushButton("删除")
-        s_del.clicked.connect(self._delete_session)
-        srow.addWidget(s_load)
-        srow.addWidget(s_del)
-        srow.addStretch(1)
-        sl.addLayout(srow)
-        self._tabs.addTab(self._sess_tab, "会话")
-
-        # 技能
-        self._skill_tab = QWidget()
-        kl = QVBoxLayout(self._skill_tab)
-        kl.setContentsMargins(0, 6, 0, 0)
+    def _build_skills_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        lay.addWidget(self._hint(
+            "技能 = SKILL.md（frontmatter: name / description / tools）+ 正文；"
+            "与 OpenClaw、Claude 技能包同构，可用 zip 互相导入导出。"))
         self._skill_list = QListWidget()
         self._skill_list.itemDoubleClicked.connect(self._edit_skill_item)
-        kl.addWidget(self._skill_list, 1)
-        krow1 = QHBoxLayout()
+        lay.addWidget(self._skill_list, 1)
+        row1 = QHBoxLayout()
         b_new = QPushButton("新建")
         b_new.clicked.connect(self._new_skill)
         b_edit = QPushButton("编辑")
-        b_edit.clicked.connect(lambda: self._edit_skill_item(self._skill_list.currentItem()))
+        b_edit.clicked.connect(
+            lambda: self._edit_skill_item(self._skill_list.currentItem()))
         b_del = QPushButton("删除")
         b_del.clicked.connect(self._delete_skill)
         for b in (b_new, b_edit, b_del):
-            krow1.addWidget(b)
-        kl.addLayout(krow1)
-        krow2 = QHBoxLayout()
+            row1.addWidget(b)
+        row1.addStretch(1)
+        lay.addLayout(row1)
+        row2 = QHBoxLayout()
         b_import = QPushButton("导入 zip")
         b_import.clicked.connect(self._import_skill)
         b_export = QPushButton("导出 zip")
         b_export.clicked.connect(self._export_skill)
-        krow2.addWidget(b_import)
-        krow2.addWidget(b_export)
-        kl.addLayout(krow2)
-        self._tabs.addTab(self._skill_tab, "技能")
+        row2.addWidget(b_import)
+        row2.addWidget(b_export)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+        return w
 
-        # 工具
-        self._tool_tab = QWidget()
-        tl = QVBoxLayout(self._tool_tab)
-        tl.setContentsMargins(0, 6, 0, 0)
+    def _build_tools_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
         self._tool_list = QListWidget()
-        tl.addWidget(self._tool_list, 1)
-        tl.addWidget(self._hint("只读工具自动执行；写入/高危按审批策略处理"))
-        self._tabs.addTab(self._tool_tab, "工具")
+        lay.addWidget(self._tool_list, 1)
+        lay.addWidget(self._hint("只读工具自动执行；写入 / 高危按底栏的审批策略处理"))
+        return w
 
-        # MCP
-        self._mcp_tab = QWidget()
-        ml = QVBoxLayout(self._mcp_tab)
-        ml.setContentsMargins(0, 6, 0, 0)
+    def _build_mcp_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        lay.addWidget(self._hint(
+            "连接成功后，MCP 工具自动以 mcp__<标识>__<工具> 进白名单，审批规则同上。"))
         self._mcp_list = QListWidget()
-        ml.addWidget(self._mcp_list, 1)
-        mrow = QHBoxLayout()
+        lay.addWidget(self._mcp_list, 1)
+        row = QHBoxLayout()
         b_add = QPushButton("添加")
         b_add.clicked.connect(self._add_mcp)
         b_conn = QPushButton("连接/断开")
@@ -348,26 +516,28 @@ class AssistantPage(QWidget):
         b_rm = QPushButton("删除")
         b_rm.clicked.connect(self._delete_mcp)
         for b in (b_add, b_conn, b_rm):
-            mrow.addWidget(b)
-        ml.addLayout(mrow)
-        self._tabs.addTab(self._mcp_tab, "MCP")
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        return w
 
-        # 审计
-        self._audit_tab = QWidget()
-        al = QVBoxLayout(self._audit_tab)
-        al.setContentsMargins(0, 6, 0, 0)
+    def _build_audit_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        lay.addWidget(self._hint("每次工具调用 / 审批结果都落在 audit 目录的 jsonl 里，"
+                                 "这里是最新记录。"))
         self._audit_view = QPlainTextEdit()
         self._audit_view.setReadOnly(True)
-        al.addWidget(self._audit_view, 1)
-        arow = QHBoxLayout()
+        lay.addWidget(self._audit_view, 1)
+        row = QHBoxLayout()
         b_ref = QPushButton("刷新审计")
         b_ref.clicked.connect(self._refresh_audit)
-        arow.addWidget(b_ref)
-        arow.addStretch(1)
-        al.addLayout(arow)
-        self._tabs.addTab(self._audit_tab, "审计")
-
-        return side
+        row.addWidget(b_ref)
+        row.addStretch(1)
+        lay.addLayout(row)
+        return w
 
     @staticmethod
     def _hint(text: str) -> QLabel:
@@ -377,7 +547,7 @@ class AssistantPage(QWidget):
         return lbl
 
     # ------------------------------------------------------------------ #
-    # 刷新：状态 / 提供商 / 技能 / 工具 / MCP / 会话
+    # 刷新：状态 / 底栏按钮 / 技能 / 工具 / MCP / 会话
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
         if self._loading:
@@ -391,7 +561,7 @@ class AssistantPage(QWidget):
 
     def _on_state_error(self, msg: str) -> None:
         self._loading = False
-        self._status.setText(f"后端未就绪：{msg}（请先在控制台启动服务）")
+        self._set_status(f"后端未就绪：{msg}（请先在控制台启动服务）")
 
     def _apply_state(self, st: Dict[str, Any]) -> None:
         self._loading = False
@@ -399,31 +569,21 @@ class AssistantPage(QWidget):
             return
         self._state = st
         ws = str(st.get("workspace") or "")
-        short = ws if len(ws) <= 44 else "…" + ws[-43:]
+        ws_name = os.path.basename(ws.rstrip("\\/")) if ws else ""
         orch = "LangGraph 编排" if st.get("orchestrator") == "langgraph" else "顺序降级编排"
-        self._subtitle.setText(f"{orch}   ·   工作区 {short or '（未设置）'}")
-        self._ws_btn.setToolTip(f"文件工具可访问的工作区：\n{ws or '（未设置）'}\n（点击切换）")
+        self._subtitle.setText(f"{orch}   ·   工作区 {ws_name or '（未设置）'}")
+        self._subtitle.setToolTip(ws or "（未设置）")
 
-        # 提供商
-        cur_pid = st.get("active_provider")
-        self._provider_combo.blockSignals(True)
-        self._provider_combo.clear()
-        for p in st.get("providers") or []:
-            if p.get("enabled", True):
-                self._provider_combo.addItem(p.get("label") or p["id"], p["id"])
-        idx = self._provider_combo.findData(cur_pid)
-        if idx >= 0:
-            self._provider_combo.setCurrentIndex(idx)
-        self._provider_combo.blockSignals(False)
-        self._fill_models(cur_pid)
-
-        # 审批策略
-        pid = st.get("policy")
-        i = self._policy_combo.findData(pid)
-        if i >= 0:
-            self._policy_combo.blockSignals(True)
-            self._policy_combo.setCurrentIndex(i)
-            self._policy_combo.blockSignals(False)
+        # 底栏三件套：工作区 / 审批策略 / 模型
+        self._refresh_ws_btn(ws)
+        self._refresh_policy_btn()
+        pid = str(st.get("active_provider") or "local")
+        self._active_provider = pid
+        if not self._active_model:
+            provider = next((p for p in (st.get("providers") or [])
+                             if p.get("id") == pid), {})
+            self._active_model = str(provider.get("model") or "")
+        self._fill_models(pid)
 
         self._fill_skills(st.get("skills") or [])
         self._fill_tools(st.get("tools") or [])
@@ -434,24 +594,61 @@ class AssistantPage(QWidget):
         if not self._session_id:
             self._new_session(silent=True)
 
-    # ---------------- 模型 ----------------
+    def _set_status(self, text: str) -> None:
+        """状态行：有内容才占位，避免底栏上方常驻一条空白。"""
+        self._status.setText(text or "")
+        self._status.setVisible(bool((text or "").strip()))
+
+    # ---------------- 底栏按钮文本 ----------------
+    def _refresh_ws_btn(self, ws: str = "") -> None:
+        """工作区按钮显示目录名（WorkBuddy 的「分支 master」位：当前上下文根）。"""
+        path = ws or str(self._state.get("workspace") or "")
+        name = os.path.basename(path.rstrip("\\/")) if path else ""
+        if len(name) > 12:
+            name = name[:11] + "…"
+        self._ws_btn.setText(name or "工作区")
+        self._ws_btn.setToolTip(
+            f"文件工具可访问的工作区：\n{path or '（未设置）'}\n（点击切换）")
+
+    def _refresh_policy_btn(self) -> None:
+        pid = str(self._state.get("policy") or "readonly_auto")
+        label = next((lb for p, lb, _t in POLICY_ITEMS if p == pid), pid)
+        tip = next((t for p, _lb, t in POLICY_ITEMS if p == pid), "")
+        self._policy_btn.setText(f"{POLICY_ICON.get(pid, '⊘')} {label}")
+        self._policy_btn.setToolTip(f"审批策略：{label}\n{tip}\n（点击切换）")
+
+    def _refresh_model_btn(self) -> None:
+        names = self._model_cache.get(self._active_provider) or []
+        model = self._active_model or (names[0] if names else "")
+        provider = next((p for p in (self._state.get("providers") or [])
+                         if p.get("id") == self._active_provider), {})
+        plabel = provider.get("label") or self._active_provider or "模型"
+        text = model or "选择模型"
+        if len(text) > 26:
+            text = text[:25] + "…"
+        self._model_btn.setText(f"{text}   ▾")
+        self._model_btn.setToolTip(
+            f"当前：{plabel} · {model or '（默认）'}\n"
+            "点击切换来源 / 模型，或配置密钥与端点")
+
+    # ---------------- 模型清单 ----------------
     def _fill_models(self, provider_id: str) -> None:
-        """模型清单（本地引擎走后台请求，避免阻塞 UI）。"""
+        """采集模型名（本地引擎走后台请求，避免阻塞 UI）。"""
         provider = next((p for p in (self._state.get("providers") or [])
                          if p.get("id") == provider_id), {})
-        self._key_btn.setEnabled(provider_id != "local")
         # 硅基流动：首次进入时把对话页已存的 Key 同步到助理配置，免二次输入
         if provider_id == "siliconflow" and not (provider.get("api_key") or ""):
             key = str(self._settings.value("chat/cloud_api_key", "") or "").strip()
             if key:
                 self._save_provider_patch("siliconflow", {"api_key": key})
-        current = self._model_combo.currentText().strip()
-        saved = current or provider.get("model") or ""
+
+        self._refresh_model_btn()
 
         def collect() -> List[str]:
             if provider_id == "local":
                 try:
-                    return [m.get("id") for m in self.api.list_models()]
+                    return [m.get("id") for m in self.api.list_models()
+                            if isinstance(m, dict) and m.get("id")]
                 except Exception:
                     return []
             try:
@@ -462,40 +659,52 @@ class AssistantPage(QWidget):
                     if isinstance(it, dict) and it.get("name")]
 
         w = Worker(collect)
-        w.result.connect(lambda names: self._apply_models(names or [], saved))
+        w.result.connect(
+            lambda names, pid=provider_id: self._apply_models(pid, names or []))
         w.start()
 
-    def _apply_models(self, names: List[str], saved: str) -> None:
-        self._model_combo.blockSignals(True)
-        self._model_combo.clear()
-        for n in names:
-            if n:
-                self._model_combo.addItem(n)
-        self._model_combo.setEditText(saved)
-        self._model_combo.blockSignals(False)
+    def _apply_models(self, provider_id: str, names: List[str]) -> None:
+        self._model_cache[provider_id] = names
+        if provider_id != self._active_provider:
+            return
+        if not self._active_model and names:
+            self._active_model = names[0]
+        self._refresh_model_btn()
 
-    # ---------------- 侧栏填充 ----------------
+    # ---------------- 二级栏目 / 管理面板填充 ----------------
     def _fill_skills(self, skills: List[Dict[str, Any]]) -> None:
-        self._skill_list.clear()
+        self._sync_nav_entries()
+        lst = getattr(self, "_skill_list", None)
+        if lst is None:
+            return
+        lst.clear()
         for s in skills:
             item = QListWidgetItem(f"{s.get('name')}   ·  {len(s.get('tools') or [])} 工具")
             item.setData(Qt.UserRole, s.get("slug"))
             item.setToolTip(s.get("description") or "")
-            self._skill_list.addItem(item)
+            lst.addItem(item)
         if not skills:
-            self._skill_list.addItem("（暂无技能，点「新建」或「导入 zip」）")
+            lst.addItem("（暂无技能，点「新建」或「导入 zip」）")
 
     def _fill_tools(self, tools: List[Dict[str, Any]]) -> None:
-        self._tool_list.clear()
+        self._sync_nav_entries()
+        lst = getattr(self, "_tool_list", None)
+        if lst is None:
+            return
+        lst.clear()
         for t in tools:
             risk = RISK_TEXT.get(t.get("risk"), t.get("risk"))
             src = t.get("source") or "builtin"
             item = QListWidgetItem(f"[{risk}] {t.get('name')}   · {src}")
             item.setToolTip(t.get("description") or "")
-            self._tool_list.addItem(item)
+            lst.addItem(item)
 
     def _fill_mcp(self, servers: List[Dict[str, Any]]) -> None:
-        self._mcp_list.clear()
+        self._sync_nav_entries()
+        lst = getattr(self, "_mcp_list", None)
+        if lst is None:
+            return
+        lst.clear()
         for s in servers:
             mark = {"connected": "●", "error": "×"}.get(s.get("status"), "○")
             item = QListWidgetItem(
@@ -504,9 +713,9 @@ class AssistantPage(QWidget):
             item.setData(Qt.UserRole, s.get("id"))
             if s.get("error"):
                 item.setToolTip(s["error"])
-            self._mcp_list.addItem(item)
+            lst.addItem(item)
         if not servers:
-            self._mcp_list.addItem("（未配置 MCP 服务器）")
+            lst.addItem("（未配置 MCP 服务器）")
 
     def _fill_sessions(self) -> None:
         w = Worker(self._assist.sessions)
@@ -514,16 +723,43 @@ class AssistantPage(QWidget):
         w.start()
 
     def _apply_sessions(self, items) -> None:
-        self._sess_list.clear()
-        for s in (items or []):
-            item = QListWidgetItem(f"{s.get('title') or '新会话'}   "
-                                   f"（{s.get('message_count', 0)} 条）")
-            item.setData(Qt.UserRole, s.get("id"))
-            if s.get("id") == self._session_id:
-                item.setSelected(True)
-            self._sess_list.addItem(item)
-        if not items:
-            self._sess_list.addItem("（还没有会话）")
+        items = [s for s in (items or []) if isinstance(s, dict)]
+
+        # 左栏二级栏目：只显示最近 NAV_MAX_SESSIONS 条，点一条即切换
+        nav = getattr(self, "_nav_sess", None)
+        if nav is not None:
+            nav.blockSignals(True)
+            nav.clear()
+            for s in items[:NAV_MAX_SESSIONS]:
+                text = s.get("title") or "新会话"
+                if len(text) > 10:
+                    text = text[:9] + "…"
+                item = QListWidgetItem(text)
+                item.setData(Qt.UserRole, s.get("id"))
+                item.setSizeHint(QSize(0, NAV_SESSION_ROW))
+                item.setToolTip(f"{s.get('title') or '新会话'}\n"
+                                f"{s.get('message_count', 0)} 条消息")
+                if s.get("id") == self._session_id:
+                    item.setSelected(True)
+                nav.addItem(item)
+            rows = min(len(items), NAV_MAX_SESSIONS)
+            nav.setFixedHeight(rows * NAV_SESSION_ROW + 2 if rows else 0)
+            nav.setVisible(bool(rows))
+            nav.blockSignals(False)
+
+        # 管理面板里的完整会话列表（面板未打开时为 None）
+        lst = getattr(self, "_all_sess_list", None)
+        if lst is not None:
+            lst.clear()
+            for s in items:
+                item = QListWidgetItem(f"{s.get('title') or '新会话'}   "
+                                       f"（{s.get('message_count', 0)} 条）")
+                item.setData(Qt.UserRole, s.get("id"))
+                if s.get("id") == self._session_id:
+                    item.setSelected(True)
+                lst.addItem(item)
+            if not items:
+                lst.addItem("（还没有会话）")
 
     # ------------------------------------------------------------------ #
     # 会话
@@ -531,7 +767,7 @@ class AssistantPage(QWidget):
     def _new_session(self, silent: bool = False) -> None:
         w = Worker(self._assist.new_session)
         w.result.connect(lambda s: self._on_session_created(s, silent))
-        w.error.connect(lambda m: self._status.setText(f"新建会话失败：{m}"))
+        w.error.connect(lambda m: self._set_status(f"新建会话失败：{m}"))
         w.start()
 
     def _on_session_created(self, session: Dict[str, Any], silent: bool) -> None:
@@ -557,7 +793,7 @@ class AssistantPage(QWidget):
             return
         w = Worker(self._assist.session, sid)
         w.result.connect(self._apply_session_detail)
-        w.error.connect(lambda m: self._status.setText(f"加载会话失败：{m}"))
+        w.error.connect(lambda m: self._set_status(f"加载会话失败：{m}"))
         w.start()
 
     def _apply_session_detail(self, data: Dict[str, Any]) -> None:
@@ -572,9 +808,11 @@ class AssistantPage(QWidget):
                 bubble = ChatBubble(role, content)
                 self._append_widget(bubble)
         self._add_step("已载入历史会话")
+        self._fill_sessions()      # 同步左栏二级栏目的选中态
 
     def _delete_session(self) -> None:
-        item = self._sess_list.currentItem()
+        lst = getattr(self, "_all_sess_list", None)
+        item = lst.currentItem() if lst is not None else None
         sid = item.data(Qt.UserRole) if item else None
         if not sid:
             return
@@ -593,7 +831,6 @@ class AssistantPage(QWidget):
     # 对话
     # ------------------------------------------------------------------ #
     def eventFilter(self, obj, event):  # noqa: N802
-        from PySide6.QtCore import QEvent
         if obj is self._input and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             mods = event.modifiers()
@@ -628,18 +865,20 @@ class AssistantPage(QWidget):
 
     def _send_with_session(self, session: Any, text: str) -> None:
         if not isinstance(session, dict) or not session.get("id"):
-            self._status.setText("会话创建失败，请检查后端服务")
+            self._set_status("会话创建失败，请检查后端服务")
             return
         self._session_id = session["id"]
         self._input.clear()
         self._add_bubble("user", text)
         self._begin_streaming()
 
+        # 技能 chip：挂载后每条消息自动带上「用 xx 技能」，输入框本身保持干净
+        message = f"用 {self._skill_slug} 技能：{text}" if self._skill_slug else text
         payload = {
             "session_id": self._session_id,
-            "message": text,
-            "provider": self._provider_combo.currentData() or "",
-            "model": self._model_combo.currentText().strip(),
+            "message": message,
+            "provider": self._active_provider or "",
+            "model": self._active_model or "",
             "stream": True,
         }
         self._stream = AssistantStream(
@@ -654,7 +893,8 @@ class AssistantPage(QWidget):
         self._send_btn.setVisible(False)
         self._stop_btn.setVisible(True)
         self._stop_btn.setEnabled(True)
-        self._status.setText("助理正在工作…")
+        self._start_spin()
+        self._set_status("助理正在工作…")
         self._bubble = None
         self._thinking = None
         self._tool_cards = []
@@ -665,6 +905,7 @@ class AssistantPage(QWidget):
         self._stop_btn.setVisible(False)
         self._send_btn.setVisible(True)
         self._send_btn.setEnabled(True)
+        self._stop_spin()
         if self._thinking is not None:
             self._thinking.finish()
 
@@ -676,11 +917,11 @@ class AssistantPage(QWidget):
             Worker(lambda s=sid: self._assist.stop(s)).start()
         self._add_step("已请求停止")
         self._end_streaming()
-        self._status.setText("已停止")
+        self._set_status("已停止")
 
     def _on_stream_failed(self, msg: str) -> None:
         self._add_step(f"连接失败：{msg}")
-        self._status.setText("请求失败，请确认后端已启动")
+        self._set_status("请求失败，请确认后端已启动")
 
     def _on_stream_closed(self) -> None:
         self._stream = None
@@ -694,7 +935,7 @@ class AssistantPage(QWidget):
         if kind == "session":
             self._session_id = ev.get("session_id") or self._session_id
         elif kind == "model":
-            self._status.setText(f"模型：{ev.get('model')}")
+            self._set_status(f"模型：{ev.get('model')}")
         elif kind == "delta":
             self._ensure_bubble().append_text(ev.get("text") or "")
             self._scroll_bottom()
@@ -740,22 +981,22 @@ class AssistantPage(QWidget):
             self._add_step(str(ev.get("message") or ""))
         elif kind == "done":
             self._finish_bubble(ev.get("content") or "")
-            self._status.setText("完成")
+            self._set_status("完成")
             self._scroll_bottom()
         elif kind == "error":
             self._add_step(f"出错了：{ev.get('message')}", error=True)
-            self._status.setText("出错，详见对话区")
+            self._set_status("出错，详见对话区")
         elif kind == "stopped":
             self._add_step("已停止生成")
         elif kind == "end":
             self._end_streaming()
             if not ev.get("error"):
-                self._status.setText("就绪")
+                self._set_status("就绪")
             self._approvals.clear()
 
     def _resolve_approval(self, aid: str, approve: bool, remember: bool) -> None:
         w = Worker(self._assist.resolve_approval, aid, approve, remember)
-        w.error.connect(lambda m: self._status.setText(f"审批提交失败：{m}"))
+        w.error.connect(lambda m: self._set_status(f"审批提交失败：{m}"))
         w.start()
 
     # ---------------- 消息渲染 ----------------
@@ -806,16 +1047,69 @@ class AssistantPage(QWidget):
         bar.setValue(bar.maximum())
 
     # ------------------------------------------------------------------ #
-    # 提供商 / 策略 / 工作区
+    # 底栏：模型 / 审批策略 / 工作区 / 技能
     # ------------------------------------------------------------------ #
-    def _on_provider_changed(self, _idx: int) -> None:
-        pid = self._provider_combo.currentData()
-        if not pid:
+    def _show_model_menu(self) -> None:
+        """模型下拉（WorkBuddy 的「模型 ⌄」位）：来源 + 模型 + 密钥一屏搞定。"""
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
+
+        src = menu.addMenu("模型来源")
+        for p in (self._state.get("providers") or []):
+            if not p.get("enabled", True):
+                continue
+            act = src.addAction(p.get("label") or p.get("id"))
+            act.setCheckable(True)
+            act.setChecked(p.get("id") == self._active_provider)
+            act.triggered.connect(
+                lambda _c=False, pid=p.get("id"): self._set_provider(pid))
+
+        menu.addSeparator()
+
+        names = self._model_cache.get(self._active_provider) or []
+        if names:
+            for n in names[:20]:
+                act = menu.addAction(n)
+                act.setCheckable(True)
+                act.setChecked(n == self._active_model)
+                act.triggered.connect(lambda _c=False, m=n: self._set_model(m))
+            if len(names) > 20:
+                more = menu.addAction(f"（还有 {len(names) - 20} 个，去「管理」里选）")
+                more.setEnabled(False)
+        else:
+            act = menu.addAction("（暂无可用模型，点下面刷新）")
+            act.setEnabled(False)
+
+        menu.addSeparator()
+        act = menu.addAction("刷新模型列表")
+        act.triggered.connect(lambda: self._fill_models(self._active_provider))
+        if self._active_provider != "local":
+            act = menu.addAction("配置密钥与端点…")
+            act.triggered.connect(self._edit_provider)
+        self._popup_above(menu, self._model_btn)
+
+    def _set_provider(self, pid: str) -> None:
+        if not pid or pid == self._active_provider:
             return
+        self._active_provider = pid
+        provider = next((p for p in (self._state.get("providers") or [])
+                         if p.get("id") == pid), {})
+        self._active_model = str(provider.get("model") or "")
+        self._refresh_model_btn()
         self._fill_models(pid)
         w = Worker(self._assist.save_settings, {"active_provider": pid})
-        w.result.connect(lambda _r: None)
+        w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
         w.start()
+        self._set_status(f"模型来源已切换到：{provider.get('label') or pid}")
+
+    def _set_model(self, name: str) -> None:
+        name = (name or "").strip()
+        if not name or name == self._active_model:
+            return
+        self._active_model = name
+        self._refresh_model_btn()
+        self._save_provider_patch(self._active_provider, {"model": name})
+        self._set_status(f"模型：{name}")
 
     def _save_provider_patch(self, pid: str, patch: Dict[str, Any]) -> None:
         """更新某个提供商的字段（key / base_url / model）并回写整份 providers。"""
@@ -826,16 +1120,17 @@ class AssistantPage(QWidget):
         target.update(patch)
         for p in providers:
             if p.get("id") == "local":
-                p["model"] = ""
-            elif not p.get("model"):
+                # 本地模型名可能由用户显式指定，不再强制清空
+                continue
+            if not p.get("model"):
                 p["model"] = "Qwen/Qwen3-8B" if p["id"] == "siliconflow" else ""
         w = Worker(self._assist.save_settings, {"providers": providers})
         w.result.connect(lambda _r: self.refresh())
-        w.error.connect(lambda m: self._status.setText(f"保存失败：{m}"))
+        w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
         w.start()
 
     def _edit_provider(self) -> None:
-        pid = self._provider_combo.currentData()
+        pid = self._active_provider
         if not pid or pid == "local":
             return
         provider = next((p for p in (self._state.get("providers") or [])
@@ -847,46 +1142,84 @@ class AssistantPage(QWidget):
         if patch:
             self._save_provider_patch(pid, patch)
 
-    def _on_policy_changed(self, _idx: int) -> None:
-        pid = self._policy_combo.currentData()
+    def _show_policy_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
+        cur = str(self._state.get("policy") or "readonly_auto")
+        for pid, label, tip in POLICY_ITEMS:
+            act = menu.addAction(f"{POLICY_ICON.get(pid, '')} {label}".strip())
+            act.setCheckable(True)
+            act.setChecked(pid == cur)
+            act.setToolTip(tip)
+            act.triggered.connect(lambda _c=False, p=pid: self._set_policy(p))
+        self._popup_above(menu, self._policy_btn)
+
+    def _set_policy(self, pid: str) -> None:
         if not pid:
             return
+        self._state["policy"] = pid
+        self._refresh_policy_btn()
         w = Worker(self._assist.save_settings, {"policy": pid})
+        w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
         w.start()
-        self._status.setText(f"审批策略已更新：{self._policy_combo.currentText()}")
+        label = next((lb for p, lb, _t in POLICY_ITEMS if p == pid), pid)
+        self._set_status(f"审批策略已更新：{label}")
 
     def _choose_workspace(self) -> None:
         start = self._state.get("workspace") or os.path.expanduser("~")
         path = QFileDialog.getExistingDirectory(self, "选择工作区", start)
         if not path:
             return
+        self._state["workspace"] = path
+        self._refresh_ws_btn(path)
         w = Worker(self._assist.save_settings, {"workspace": path})
         w.result.connect(lambda _r: self.refresh())
         w.start()
 
-    def _pick_skill(self) -> None:
-        """技能快捷入口：选一个技能，把「用 xx 技能：」插进输入框。"""
-        skills = self._state.get("skills") or []
+    def _show_skill_menu(self) -> None:
+        """技能 chip（WorkBuddy 的「× 团队」位）：挂载 / 更换 / 清除。"""
         menu = QMenu(self)
+        menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
+        if self._skill_slug:
+            act = menu.addAction(f"✕ 清除 {self._skill_slug}")
+            act.triggered.connect(self._clear_skill)
+            menu.addSeparator()
+        skills = self._state.get("skills") or []
         if not skills:
-            act = menu.addAction("（暂无技能，去侧栏新建或导入 zip）")
+            act = menu.addAction("（暂无技能，去左栏「技能」里新建或导入 zip）")
             act.setEnabled(False)
         for s in skills:
             act = menu.addAction(s.get("name") or s.get("slug"))
             act.setToolTip(s.get("description") or "")
+            act.setCheckable(True)
+            act.setChecked(s.get("slug") == self._skill_slug)
             act.triggered.connect(
-                lambda _checked=False, slug=s.get("slug") or "": self._use_skill(slug))
-        menu.exec(self._skill_btn.mapToGlobal(
-            self._skill_btn.rect().bottomLeft()))
+                lambda _c=False, slug=s.get("slug") or "": self._use_skill(slug))
+        self._popup_above(menu, self._skill_btn)
 
     def _use_skill(self, slug: str) -> None:
+        """挂载技能：之后每条消息自动带上「用 xx 技能」，输入框本身保持干净。"""
         if not slug:
             return
-        prefix = f"用 {slug} 技能"
-        cur = self._input.toPlainText().strip()
-        self._input.setPlainText(f"{prefix}：{cur}" if cur else f"{prefix}：")
-        self._input.moveCursor(QTextCursor.End)
-        self._input.setFocus()
+        self._skill_slug = slug
+        self._refresh_skill_btn()
+        self._set_status(f"已挂载技能：{slug}（发送时自动带上，再点可清除）")
+
+    def _clear_skill(self) -> None:
+        self._skill_slug = ""
+        self._refresh_skill_btn()
+        self._set_status("已清除技能")
+
+    def _refresh_skill_btn(self) -> None:
+        slug = self._skill_slug
+        self._skill_btn.setText(f"✕ {slug}" if slug else "技能")
+        self._skill_btn.setToolTip(
+            f"已挂载技能：{slug}\n点击更换或清除" if slug
+            else "挂载技能：之后每条消息自动带上「用 xx 技能」")
+        if bool(self._skill_btn.property("active")) != bool(slug):
+            self._skill_btn.setProperty("active", bool(slug))
+            self._skill_btn.style().unpolish(self._skill_btn)
+            self._skill_btn.style().polish(self._skill_btn)
 
     # ------------------------------------------------------------------ #
     # 技能
@@ -915,7 +1248,7 @@ class AssistantPage(QWidget):
     def _save_skill(self, slug: str, content: str) -> None:
         w = Worker(self._assist.save_skill, slug, content)
         w.result.connect(lambda _r: (self.refresh(),
-                                     self._status.setText(f"技能已保存：{slug}")))
+                                     self._set_status(f"技能已保存：{slug}")))
         w.error.connect(lambda m: QMessageBox.warning(self, "保存失败", m))
         w.start()
 
@@ -968,7 +1301,7 @@ class AssistantPage(QWidget):
             return path
 
         w = Worker(do_export)
-        w.result.connect(lambda p: self._status.setText(f"已导出：{p}"))
+        w.result.connect(lambda p: self._set_status(f"已导出：{p}"))
         w.error.connect(lambda m: QMessageBox.warning(self, "导出失败", m))
         w.start()
 
@@ -994,7 +1327,7 @@ class AssistantPage(QWidget):
             QMessageBox.warning(self, "MCP 连接失败",
                                 f"服务器已保存，但连接失败：\n{err}")
         else:
-            self._status.setText("MCP 服务器已连接")
+            self._set_status("MCP 服务器已连接")
 
     def _toggle_mcp(self) -> None:
         item = self._mcp_list.currentItem()
@@ -1043,6 +1376,47 @@ class AssistantPage(QWidget):
 # ----------------------------------------------------------------------------
 # 对话框
 # ----------------------------------------------------------------------------
+class ManagerDialog(QDialog):
+    """智能助理管理面板（原右侧 tab 面板整块搬到这里）。
+
+    左栏二级栏目只做「会话直显 + 四个入口」，真正需要空间的列表操作
+    （全部会话、技能包导入导出、工具清单、MCP 增删、审计明细）在面板里。
+    """
+
+    TABS = [("sessions", "会话"), ("skills", "技能"), ("tools", "工具"),
+            ("mcp", "MCP"), ("audit", "审计")]
+
+    def __init__(self, page):
+        super().__init__(page)
+        self.page = page
+        self.setWindowTitle("智能助理 · 管理")
+        self.setMinimumSize(760, 560)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(page._build_sessions_tab(), "会话")
+        self.tabs.addTab(page._build_skills_tab(), "技能")
+        self.tabs.addTab(page._build_tools_tab(), "工具")
+        self.tabs.addTab(page._build_mcp_tab(), "MCP")
+        self.tabs.addTab(page._build_audit_tab(), "审计")
+        lay.addWidget(self.tabs, 1)
+
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(self.reject)
+        close_btn = box.button(QDialogButtonBox.StandardButton.Close)
+        if close_btn is not None:
+            close_btn.setText("关闭")
+        lay.addWidget(box)
+
+    def show_tab(self, key: str) -> None:
+        keys = [k for k, _ in self.TABS]
+        if key in keys:
+            self.tabs.setCurrentIndex(keys.index(key))
+
+
 _SKILL_TEMPLATE = """---
 name: my-skill
 description: 一句话说明这个技能做什么

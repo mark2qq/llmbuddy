@@ -277,6 +277,33 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #StopBtn { background-color: #eef1f7; color: #1f2430; border: 1px solid #d5dbe7; }
 #StopBtn:hover { background-color: #e2e7f0; }
 #ComposerTip { color: #8b93a7; }
+
+/* 输入框底栏融合工具条：浅色 */
+#BarBtn { color: #3b4354; }
+#BarBtn:hover { background-color: #eceff6; color: #12161f; }
+#BarChip { background-color: #f2f5fa; color: #3b4354; }
+#BarChip:hover { background-color: #e8edf6; color: #12161f; }
+#BarChip[active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
+#ModelChip { color: #2b3242; }
+#ModelChip:hover { background-color: #eceff6; color: #12161f; }
+#BusyDot { color: #6b7385; }
+#SendBtn { background-color: #1b2130; color: #ffffff; }
+#SendBtn:hover { background-color: #2b3242; }
+#SendBtn:disabled { background-color: #e6eaf2; color: #aab1c0; }
+#StopBtn { background-color: #1b2130; color: #ffffff; border: none; }
+#StopBtn:hover { background-color: #2b3242; }
+
+/* 左栏二级栏目：浅色 */
+#NavSubHost, #NavSub { background: transparent; }
+#NavSubTitle { color: #7b8496; }
+#NavSubAdd { color: #5a6275; }
+#NavSubAdd:hover { background-color: #e2e7f0; color: #12161f; }
+#NavSessList { background: transparent; border: none; }
+#NavSessList::item { color: #3a4152; border-bottom: none; }
+#NavSessList::item:hover { background-color: #e2e7f0; color: #12161f; }
+#NavSessList::item:selected { background-color: #dbe4fb; color: #1b3a8f; }
+#NavSubItem { color: #3a4152; }
+#NavSubItem:hover { background-color: #e2e7f0; color: #12161f; }
 """
 
 
