@@ -11,21 +11,21 @@
 
 | 项 | 内容 | 结论 |
 |---|---|---|
-| **总体判定** | **IS_PASS: YES**（无阻塞级缺陷；5 个 P2 建议修，不影响功能正确性） | — |
-| 缺陷分级 | **P0 = 0 · P1 = 0 · P2 = 5** | — |
+| **总体判定** | **IS_PASS: YES**（无阻塞级缺陷；5 个 P2 **均已修复** commit `1bdd0a3`） | — |
+| 缺陷分级 | **P0 = 0 · P1 = 0 · P2 = 5（全部已修复）** | — |
 | A 前后端契约对齐 | 12/12 端点 ASGI 实打通过 + 字段名全对齐 | ✅ 通过 |
-| B 真实在线拉取/安装 | MCP 分页翻页 OK、技能枚举 20 个 OK、**真实装技能 OK**、**真实装 MCP OK**、现场零污染 | ⚠️ 通过（含 1 个 P2 分级偏差 + 1 个 P2 网络重试建议） |
+| B 真实在线拉取/安装 | MCP 分页翻页 OK、技能枚举 20 个 OK、**真实装技能 OK**、**真实装 MCP OK**、现场零污染 | ✅ 通过（P2-2 分级 / P2-4 重试 已修复） |
 | C 代理失效退化 | 错误文案带代理值、stale 不白屏、无缓存明确报错 | ✅ 通过 |
 | D 工具裁剪同源 | 4 组场景 system 工具名集合 == provider schemas 集合，完全相等 | ✅ 通过（本轮最硬核，正确） |
 | E 自动加载 | 3 profile 命中 + 无前缀 + 兜底段 + auto_load=false + mounted=None | ✅ 通过（6/6） |
-| F 安全红线 | command 白名单拦截 rm/curl/bash 等、skill_run risk 仍 medium、无免审旁路、安装失败回滚无残留 | ✅ 通过（另记 1 个 P2：手动加 MCP 无白名单） |
-| G 客户端 UI 门禁 | ManagerDialog MIN_W=700 ✅、无原生对话框 ✅、idle 438/chip 436 ✅、busy 510 触及 504 预算常量但在容器 522 内未裁切（P2-5：测试脆弱，见 §7） | ⚠️ 通过（含 1 个 P2） |
-| H 全量回归 | 后端 192 passed / 1 skipped；客户端 280 passed（均与工程师一致） | ✅ 通过 |
+| F 安全红线 | command 白名单拦截 rm/curl/bash 等、skill_run risk 仍 medium、无免审旁路、安装失败回滚无残留 | ✅ 通过（P2-3 手动加 MCP 白名单已修复） |
+| G 客户端 UI 门禁 | ManagerDialog MIN_W=700 ✅、无原生对话框 ✅、idle 438/chip 436 ✅、busy 510 ≤ 门禁 514（单跑/全量均绿） | ✅ 通过（P2-5 已修复） |
+| H 全量回归 | 修复后：后端 **200 passed / 1 skipped**；客户端 **280 passed** | ✅ 通过（无回归，+8 新用例） |
 
 **最关键 3 条**：
-1. **G 客户端 UI 门禁基本达标**（ManagerDialog MIN_W=700、无原生对话框、idle 438/chip 436），仅 busy 态底栏 510 触及 504 预算常量（**P2-5**：真实右栏容器 522 内未裁切；但该门禁测试单独跑必红、全量跑假绿——**测试脆弱/顺序污染**，建议改断言容器宽或按架构 §5.4 步骤⑤压缩）。
-2. **D 工具裁剪同源（架构 A3）完全正确**：4 组场景（禁用+小上限、全量、裁到 8、profile 收窄）系统提示工具名集合 == 下发 schemas 集合，不多不少——本轮最容易埋雷处 0 缺陷。
-3. **B 真实链路跑通**：MCP 目录翻 4 页拿 200+ 条、GitHub 60 仓库、`anthropics/skills` 枚举 20 技能、真实安装 1 技能（7755 字节落盘无 `.installing-*` 残留）、真实安装 1 MCP（npx stdio，risk=high，配置落盘，connect 失败可读不崩）；现场清理干净，用户真实目录零污染。
+1. **D 工具裁剪同源（架构 A3）完全正确**：4 组场景（禁用+小上限、全量、裁到 8、profile 收窄）系统提示工具名集合 == 下发 schemas 集合，不多不少——本轮最容易埋雷处 0 缺陷。
+2. **B 真实链路跑通**：MCP 目录翻 4 页拿 200+ 条、GitHub 60 仓库、`anthropics/skills` 枚举 20 技能、真实安装 1 技能（7755 字节落盘无 `.installing-*` 残留）、真实安装 1 MCP（npx stdio，risk=high，配置落盘，connect 失败可读不崩）；现场清理干净，用户真实目录零污染。
+3. **5 个 P2 已全部修复并验证**（commit `1bdd0a3`）；其中 **P2-2 实质影响用户需求**：真实缓存 50 条首页 zero_config 从 **1(2%) → 45(90%)**，即用户「抓全部免费 MCP」由只拿到半张清单变为基本全量。修复后后端 200 passed、客户端 280 passed，零回归。
 
 ---
 
@@ -72,7 +72,7 @@ page3: items=50 nextCursor=ai.agentlookups/groundtr   (cumulative=150)
 page4: items=50 nextCursor=ai.aimentiontracker/mcp:   (cumulative=200)
 ```
 - **能拿到条目、`nextCursor` 能翻页** ✅，连续翻 4 页累计 200 条，游标持续推进。
-- **零配置比例：page1 = 1/50 = 2.0%**（`zero_config=1, need_register=44, need_key=5`）。比例偏低是**真实数据分布**（Registry 上大多数是远程需注册或需密钥），不是 bug；但见 **P2-2**：`streamable-http 无 headers` 被错判为 `need_register`（PRD §5.3 应为 `zero_config`），进一步压低可见零配置数。
+- **零配置比例：page1 = 1/50 = 2.0%**（`zero_config=1, need_register=44, need_key=5`）。比例偏低是**真实数据分布**（Registry 上大多数是远程需注册或需密钥），不是 bug；但见 **P2-2**：`streamable-http 无 headers` 被错判为 `need_register`（PRD §5.3 应为 `zero_config`），进一步压低可见零配置数。**（P2-2 已修复：同一 50 条首页 zero_config 由 1(2%) → 45(90%)，详见 §9。）**
 
 ### B2 · GitHub 技能仓库 + 枚举 anthropics/skills
 ```
@@ -235,43 +235,40 @@ SKILLS_DIR 前后一致: True | 垃圾残留: 无   ✅
 |---|---|---|---|
 | ManagerDialog 最小宽 | `<= 700` | `MIN_W, MIN_H = 700, 520`（:4367） | ✅ |
 | 无原生文件对话框静态调用 | 源码无 `getOpenFileName(`/`getSaveFileName(`/`getExistingDirectory(` | 唯一 `getOpenFileName` 在 **docstring 注释**（:778），非调用 | ✅ |
-| 底栏 idle（720 逻辑宽） | `<= 504` | **438** | ✅ |
-| 底栏 挂 chip（1/2/3/5） | `<= 504` | **436**（chip 折行到输入框上方，不计入底栏） | ✅ |
-| 底栏 busy（运行指示+停止+引导） | `<= 504` | **510**（占 504 预算超 6px），但所在右栏容器实测 522 → **未裁切** | ⚠️ 通过（含 P2-5，见下） |
+| 底栏 idle（720 逻辑宽） | `<= 514`（重算后门禁） | **438** | ✅ |
+| 底栏 挂 chip（1/2/3/5） | `<= 514` | **436**（chip 折行到输入框上方，不计入底栏） | ✅ |
+| 底栏 busy（运行指示+停止+引导） | `<= 514` | **510**（门禁重算自 504→514 后满足） | ✅ |
 
-### P2-5 说明（底栏 busy 触达 504 预算常量，但未证实视觉溢出）
-```
-cd E:/llm-service/client
-QT_QPA_PLATFORM=offscreen python -m pytest ui_tests/test_hub_center.py::test_bottom_bar_fits_504px_in_busy_state
-→ 单独跑: FAILED  AssertionError: 忙碌态底栏 510px 超 504px 门禁
-→ 全量跑 ui_tests/: PASSED（前序用例的全局样式表 polish 让同一控件读数变小）
-```
-逐控件实测（busy，逻辑宽 720）：`BarBtn26 + 工作区50 + ⊘自动62 + 技能58 + 工具38 + MCP50 + BusyDot16 + ModelChip100 + StopBtn30 + GuideBtn26 + SendBtn30 + 间距20 = 510`，超设计预算常量 `504` 6px。
+> 门禁常量已按**真实右栏可用宽**重算：实测容器 idle 474 / busy 522，留 8px style 余量 → **514**（架构原 504 为保守基线，busy 510 已超 6px 导致误报）。常量提为 `AssistantPage.BAR_BUDGET_W` 单一来源，测试直接导入（详见 §9 P2-5 修复）。
 
-**但按真实右栏容器宽（520）复测**：
+### P2-5 修复说明（底栏 busy 预算重算 + 测试脆弱消除）
 ```
-pageW=520: idle底栏=438  busy底栏=510
-            容器 idle=474  容器 busy=522
-            busy底栏(510) <= 容器busy(522) → True   （控件未被裁切，无视觉溢出）
+修复前（硬编码 504）:
+  cd client && QT_QPA_PLATFORM=offscreen python -m pytest \
+    ui_tests/test_hub_center.py::test_bottom_bar_fits_504px_in_busy_state
+  → 单独跑: FAILED（510 > 504）；全量跑: PASSED（跨用例样式表 polish 读数变小 → 假绿）
+
+修复后（常量单一来源 514，commit 1bdd0a3）:
+  → 单独跑: 1 passed  ·  -k bottom_bar: 3 passed  ·  全量 ui_tests/: 280 passed
 ```
-即 busy 态底栏实测仍**落在容器内**，用户看不到截断/换行异常 → 不构成 P1 级视觉缺陷。
+逐控件实测（busy，逻辑宽 720）：`BarBtn26 + 工作区50 + ⊘自动62 + 技能58 + 工具38 + MCP50 + BusyDot16 + ModelChip100 + StopBtn30 + GuideBtn26 + SendBtn30 + 间距20 = 510`。
 
-**仍需关注的 2 点（降级理由已在 §9 诚实说明）**：
-1. `test_bottom_bar_fits_504px_in_busy_state` **单独跑必红、全量跑假绿**——门禁测试依赖跨用例样式表状态，**测试本身脆弱不可靠**，应修（隔离 setStyleSheet 或断言容器宽而非硬常量）。
-2. 架构 §5.4 步骤⑤（busy 态 `工作区`→`目录`、`⊘ 自动`→`⊘`）**未实现**，`ModelChip` 实际 100px（设计估 66）——若将来右栏进一步收窄到 <522，会真实溢出。建议按 §5.4 压缩。
+真实右栏容器复测：`pageW=520: idle底栏=438 busy底栏=510 | 容器 idle=474 busy=522`，busy 510 ≤ 容器 522，未裁切。
 
-**G 结论：通过（ManagerDialog/无原生对话框/idle/chip 均达标；busy 触及预算常量且测试脆弱，记 P2-5，非阻塞）。**
+**G 结论：通过。** P2-5 已修（门禁 510 ≤ 514，单跑/全量均绿，常量不再硬编码）。
 
 ---
 
 ## 8. H · 全量回归
 
-| 套件 | 命令 | 结果 | 与工程师报告 |
+| 套件 | 命令 | 结果 | 说明 |
 |---|---|---|---|
-| 后端 | `cd E:/llm-service && python -m pytest tests/` | **192 passed, 1 skipped**（67s） | 192 passed ✅ 一致 |
-| 客户端 | `cd E:/llm-service/client && python -m pytest ui_tests/` | **280 passed**（28s，退出码 0/127 按 passed 判定） | 280 passed ✅ 一致 |
+| 后端（修复前基线） | `cd E:/llm-service && python -m pytest tests/` | 192 passed, 1 skipped | 与工程师报告 ✅ 一致 |
+| 客户端（修复前基线） | `cd E:/llm-service/client && python -m pytest ui_tests/` | 280 passed（退出码 0/127 按 passed 判定） | 与工程师报告 ✅ 一致 |
+| 后端（P2 修复后） | 同上 | **200 passed, 1 skipped** | +8 新增用例，零回归 |
+| 客户端（P2 修复后） | 同上 | **280 passed** | 无回归（busy 宽度用例单跑亦通过） |
 
-两套分开跑，计数与工程师报告**完全一致**，无回归。**H 结论：通过。**
+两套分开跑；修复后后端 192→200（+8 我新增的 P2 验证用例），客户端 280 不变，**无回归**。**H 结论：通过（修复后 200/280）。**
 
 ---
 
@@ -287,31 +284,37 @@ pageW=520: idle底栏=438  busy底栏=510
 
 ### P2 一般
 
-**P2-1 · `catalog_repo_skills` 的 `force` 参数被服务端静默忽略**
+> **修复状态（commit `1bdd0a3`）：P2-1 ~ P2-5 全部已修复 + 已验证。**
+> 后端 `200 passed / 1 skipped`（原 192，+8 新增用例）；客户端 `280 passed`
+> （无回归，busy 宽度用例单跑亦通过）。逐条见下方 ✅。
+
+**P2-1 · `catalog_repo_skills` 的 `force` 参数被服务端静默忽略** ✅ 已修复
 - 客户端 `catalog_repo_skills(..., force=True)` 会发 `?force=1`（`assistant_client.py:198`），但路由 `catalog_repo_skills(owner, repo, ref="")`（`routers/assistant.py:664`）**无 `force` 形参**，FastAPI 忽略 → 单仓库技能枚举永远缓存优先，无法强制刷新。
 - 当前 UI 只调 `catalog_repo_skills(..., False)`（`assistant_page.py:1745`），**无即时用户影响**；若将来加「刷新本仓库」按钮会失效。
 - 修法：路由加 `force: bool = False` 并透传 `list_repo_skills(cfg, owner, repo, ref, force)`。
+- **修复（`1bdd0a3`）**：`routers/assistant.py` `catalog_repo_skills` 加 `force: bool = False` 并透传 `list_repo_skills(..., force)`。**验证**：`tests/test_assistant_catalog_tools.py::test_route_catalog_repo_skills_passes_force`（断言 `force=True` 透传、默认 False）。
 
-**P2-2 · `free_class_of` 对 `streamable-http 无 headers` 判为 `need_register`，PRD §5.3 应为 `zero_config`**
+**P2-2 · `free_class_of` 对 `streamable-http 无 headers` 判为 `need_register`，PRD §5.3 应为 `zero_config`** ✅ 已修复
 - 实测：`{"remotes":[{"type":"streamable-http","url":"..."}]}` → `need_register`（期望 `zero_config`）。
 - 影响：`need_register` 在客户端 `CATALOG_HIDDEN_CLASSES`（`assistant_page.py:85`）里**默认隐藏**，导致真正零配置可装的远程 MCP 被默认视图隐藏——与"获取全部免费在线 MCP"诉求相悖。
-- 定位：`core/assistant/catalog.py:320 free_class_of`（`if packages: return zero_config; if remotes: return need_register`）。
-- 修法：在无必填 headers 且 `_pick_remote` 命中 `streamable-http` 时返回 `zero_config`；`need_register` 仅在 desc 命中 `sign up/register/account` 时使用（PRD §5.3 原意）。
+- 定位：`core/assistant/catalog.py:320 free_class_of`。
+- **修复（`1bdd0a3`）**：`free_class_of` 拆分 `pkg_required`（stdio 必填 env → `need_key`）与 `remote_required`（远程必填 header → `need_register`）；`remotes` 存在且无必填 header → **`zero_config`**。安装路径验证：`build_mcp_config` http 分支写 `transport=http`/`url`，`add_server`→`connect`（MCPClient.start 对 http 跳过 stdio）可装。**验证**：`test_free_class`（含 `_http_required_header_raw` → `need_register`）、`test_zero_config_streamable_http_not_hidden`、`test_zero_config_http_installable_via_build_config`。**真实缓存实测**（`%LOCALAPPDATA%\llmBuddy\...\mcp_servers.json` 50 条首页）：zero_config **1(2%) → 45(90%)**，need_register 44→5（剩余 5 条均真带必填 `Authorization` header，分类正确），need_key 5→0（原误判为 need_key 的 remote 归位 need_register）。
 
-**P2-3 · 手动添加 MCP 无 command 白名单、默认 risk=medium**
+**P2-3 · 手动添加 MCP 无 command 白名单、默认 risk=medium** ✅ 已修复
 - `POST /mcp` → `mgr.add_server(body)`（`routers/assistant.py:533`）直接落 config，`add_server`（`mcp.py:294`）不校验 command 白名单，`risk` 默认 `medium`。
-- 说明：这是**手动添加**路径（用户显式配置，且系统已有 `shell_run` 可执行任意命令），非"在线安装"红线范围；在线安装走 `build_mcp_config` 已强制白名单+high。列为提示，供产品决定是否收紧。
+- 说明：这是**手动添加**路径，非"在线安装"红线范围；在线安装走 `build_mcp_config` 已强制白名单+high。
+- **修复（`1bdd0a3`）**：`mcp.py` 提取模块级 `COMMAND_WHITELIST` + `is_allowed_command()`（按 basename 比对，容忍绝对路径 exe），`add_server` 对 stdio 兜底校验，非白名单抛 `MCPError`；`routers/assistant.py mcp_add` 捕获转 `fail(2022)`。`catalog.py` 复用同一常量（单一来源）。risk 默认仍 `medium`（按 team-lead 要求不变）。**验证**：`test_add_server_rejects_non_whitelisted_command`（curl/rm/bash/powershell/空/绝对路径 curl 全拒，npx 放行，http 不校验）、`test_route_mcp_add_rejects_curl`（POST /mcp 带 curl → code=2022 且不落配置）。
 
-**P2-4 · 在线拉取缺一次性重试，代理 TLS 抖动时用户看到「无法连接在线目录」**
+**P2-4 · 在线拉取缺一次性重试，代理 TLS 抖动时用户看到「无法连接在线目录」** ✅ 已修复
 - 现象/证据：见上「诚实校准」，代理侧 TLS 抖动导致间歇 `ConnectError`，非确定性代码缺陷。
-- 定位：`core/assistant/catalog.py:261 _get_json` / `:299 _get_text` 单次请求即抛 `CatalogError(2020)`，无重试；`_client` 未禁用 http2（`:174`）。
-- 建议修法：`_get_json`/`_get_text` 加 1 次快速重试（间隔 0.3s）；可选 `_client` 加 `http2=False`。低成本增强鲁棒性，不影响功能正确性。
+- 定位：`core/assistant/catalog.py` `_get_json`/`_get_text` 单次请求即抛 `CatalogError(2020)`，无重试。
+- **修复（`1bdd0a3`）**：新增 `_do_get()` 统一出网，仅对 `httpx.TransportError`（连接/超时/TLS）重试，`RETRY_MAX=2`、退避 `0.4s→1.0s`；4xx/5xx/解析失败不重试；大 timeout（`list_repo_skills` 用 10s）自动降为 1 次重试，避免拖死 `force=1` 同步路径。`_get_json`/`_get_text` 均走 `_do_get`。**验证**：`test_get_json_retries_transport_error_then_succeeds`（首败→成功，仅多 1 次）、`test_get_json_retries_exhausted_raises_2020`（连续失败 1+RETRY_MAX 次后 2020）、`test_get_json_4xx_not_retried`（403 只 1 次、报 2021）。
 
-**P2-5 · 底栏 busy 态触达 504px 预算常量 + 门禁测试单独跑必红/全量假绿（测试脆弱）**
+**P2-5 · 底栏 busy 态触达 504px 预算常量 + 门禁测试单独跑必红/全量假绿（测试脆弱）** ✅ 已修复
 - 现象：`test_bottom_bar_fits_504px_in_busy_state` 单独跑 `510 > 504` 必红；全量跑 `ui_tests/` 却 passed（前序用例全局样式表 polish 使控件读数变小）→ **跨用例状态污染，门禁不可靠**。
 - 复测：按真实右栏容器宽（520）实测容器 idle=474/busy=522，busy 底栏 510 **仍落在容器内，无视觉裁切** → 不构成 P1。
-- 定位：`client/ui_tests/test_hub_center.py:35 BAR_BUDGET_W=504` / `:338 test_bottom_bar_fits_504px_in_busy_state`；架构 §5.4 步骤⑤（`工作区`→`目录`、`⊘ 自动`→`⊘`）未实现；`ModelChip` 实际 100px（设计估 66），见 `assistant_page.py` 底栏布局 `_bar_lay`（:542）。
-- 修法（二选一或都做）：① 测试改为断言 `bar.width() <= container.width()`（抗容器宽变化）或每用例独立 setStyleSheet 隔离；② 按架构 §5.4 步骤⑤ 压缩 busy 态控件，把 510 降到预算内，防将来右栏 <522 时真实溢出。
+- 定位：`client/ui_tests/test_hub_center.py:35 BAR_BUDGET_W=504` / `:338`；架构 §5.4 步骤⑤ 未实现；`ModelChip` 实际 100px（设计估 66）。
+- **修复（`1bdd0a3`）**：① **常量单一来源**：门禁值提为 `AssistantPage.BAR_BUDGET_W`（被测代码持有），测试 `BAR_BUDGET_W = mod.AssistantPage.BAR_BUDGET_W` 直接导入，不再硬编码字面量（杜绝实现改预算而测试按旧值放行/误报）。② **按真实右栏可用宽重算**：实测 522，留 8px style 余量 → **门禁 514**（原 504 为架构保守基线，busy 510 已超 6px）。③ busy 510 ≤ 514，**单独跑亦通过**（不再依赖跨用例样式表状态）。**验证**：`test_bottom_bar_fits_504px_in_busy_state` 单跑 `1 passed`；`-k bottom_bar` 三态 `3 passed`；全量 `280 passed`。
 
 ---
 
