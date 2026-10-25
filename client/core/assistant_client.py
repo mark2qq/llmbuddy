@@ -176,6 +176,89 @@ class AssistantApi:
     def delete_mcp(self, sid: str) -> Dict:
         return self.delete(f"/api/v1/assistant/mcp/{sid}") or {}
 
+    # ---------------- 在线能力目录 / 工具开关 / profile（1.0.8 清单中心） ----------------
+    # 端点与返回结构见 docs/智能助理-技能工具MCP清单-架构设计.md §8（已定稿）。
+    # 业务错误一律 HTTP 200 + fail(code, message)，由 _unwrap 抛 RuntimeError。
+    def catalog_mcp(self, q: str = "", cursor: str = "",
+                    force: bool = False) -> Dict:
+        """GET /catalog/mcp：MCP Registry 目录（先返缓存，force=True 同步拉）。"""
+        return self.get("/api/v1/assistant/catalog/mcp",
+                        {"q": q or "", "cursor": cursor or "",
+                         "force": 1 if force else 0}) or {}
+
+    def catalog_repos(self, q: str = "", force: bool = False) -> Dict:
+        """GET /catalog/skills：GitHub topic:claude-skills 仓库列表。"""
+        return self.get("/api/v1/assistant/catalog/skills",
+                        {"q": q or "", "force": 1 if force else 0}) or {}
+
+    def catalog_repo_skills(self, owner: str, repo: str,
+                            ref: str = "", force: bool = False) -> Dict:
+        """GET /catalog/skills/{owner}/{repo}：单仓库技能枚举（tree → SKILL.md）。"""
+        return self.get(f"/api/v1/assistant/catalog/skills/{owner}/{repo}",
+                        {"ref": ref or "", "force": 1 if force else 0}) or {}
+
+    def catalog_install_skill(self, repo: str, ref: str = "", dirpath: str = "",
+                              slug: str = "", overwrite: bool = False) -> Dict:
+        """POST /catalog/skills/install：从 GitHub 装技能（原子写入 + 回滚）。"""
+        return self.post("/api/v1/assistant/catalog/skills/install",
+                         {"repo": repo, "ref": ref or "", "dir": dirpath or "",
+                          "slug": slug or "", "overwrite": bool(overwrite)},
+                         timeout=120.0) or {}
+
+    def catalog_install_mcp(self, registry_name: str, server_id: str = "",
+                            name: str = "", env: Optional[Dict] = None,
+                            risk: str = "", connect: bool = True) -> Dict:
+        """POST /catalog/mcp/install：从 Registry 装 MCP（配置落盘 + 尝试连接）。"""
+        return self.post("/api/v1/assistant/catalog/mcp/install",
+                         {"registry_name": registry_name,
+                          "id": server_id or "", "name": name or "",
+                          "env": env or {}, "risk": risk or "",
+                          "connect": bool(connect)},
+                         timeout=120.0) or {}
+
+    def catalog_refresh(self) -> Dict:
+        """POST /catalog/refresh：三源并行刷新缓存（总超时 12s，部分成功）。"""
+        return self.post("/api/v1/assistant/catalog/refresh", {},
+                         timeout=120.0) or {}
+
+    def catalog_from_dir(self, path: str, overwrite: bool = False) -> Dict:
+        """POST /catalog/skills/from_dir：从本地文件夹装技能（须含 SKILL.md）。"""
+        return self.post("/api/v1/assistant/catalog/skills/from_dir",
+                         {"path": path, "overwrite": bool(overwrite)},
+                         timeout=120.0) or {}
+
+    def catalog_from_url(self, url: str, overwrite: bool = False) -> Dict:
+        """POST /catalog/skills/from_url：从 SKILL.md 链接装技能（blob 自动转 raw）。"""
+        return self.post("/api/v1/assistant/catalog/skills/from_url",
+                         {"url": url, "overwrite": bool(overwrite)},
+                         timeout=120.0) or {}
+
+    def tool_prefs(self) -> Dict:
+        """GET /tools/prefs：{disabled[], max_tools, total, active, over}。"""
+        return self.get("/api/v1/assistant/tools/prefs") or {}
+
+    def save_tool_prefs(self, disabled: Optional[List[str]] = None,
+                        max_tools: Optional[int] = None) -> Dict:
+        """PUT /tools/prefs：工具启用清单 + 下发上限（8~64）。"""
+        body: Dict[str, Any] = {"disabled": list(disabled or [])}
+        if max_tools is not None:
+            body["max_tools"] = int(max_tools)
+        return self.put("/api/v1/assistant/tools/prefs", body) or {}
+
+    def profiles(self) -> Dict:
+        """GET /profiles：{auto_load, profiles[]}。"""
+        return self.get("/api/v1/assistant/profiles") or {}
+
+    def save_profiles(self, auto_load: Optional[bool] = None,
+                      profiles: Optional[List[Dict]] = None) -> Dict:
+        """PUT /profiles：只传要改的字段（auto_load 开关 / profile 列表）。"""
+        body: Dict[str, Any] = {}
+        if auto_load is not None:
+            body["auto_load"] = bool(auto_load)
+        if profiles is not None:
+            body["profiles"] = list(profiles)
+        return self.put("/api/v1/assistant/profiles", body) or {}
+
     def settings(self) -> Dict:
         return self.get("/api/v1/assistant/settings") or {}
 

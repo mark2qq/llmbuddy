@@ -6,6 +6,7 @@
     ToolCard       工具调用卡片（可展开看参数与结果）
     ApprovalCard   高危动作审批卡片（允许 / 本任务允许 / 拒绝）
     StepLine       技能阶段提示（plan/act/review 的细线文字）
+    AutoLoadPrompt 自动加载提示行：StepLine 文案 + 行尾 MiniBtn（1.0.8，不改 StepLine）
     ThinkingBlock  模型思考过程（WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠）
 
 全部控件只用 objectName + QSS，不写死颜色，浅色主题由 theme.py 覆盖。
@@ -168,6 +169,39 @@ class StepLine(QWidget):
 
     def set_text(self, text: str) -> None:
         self.label.setText(text)
+
+
+class AutoLoadPrompt(QWidget):
+    """自动加载提示行：`StepLine` 文案 + 行尾一个 MiniBtn 动作按钮。
+
+    为什么不改造 `StepLine`：`assistant_cards.py` 的 `StepLine` 只有一个居中的
+    QLabel，页面侧 `_add_step()` 有 5 处调用（`skill_step` / `note` / `dequeued` /
+    `stopped` / `queued` 等）；加按钮位会破坏居中 QSS 并波及这 5 处签名。
+    这里做「组合」而不是「继承改造」：内部原样复用 `StepLine`，按钮复用既有的
+    `#MiniBtn` 样式（`core/theme.py` 已覆盖，无需新增选择器）。
+
+    用法见 `AssistantPage._add_step_with_action()`（1.0.8 自动加载提示）。
+    """
+
+    def __init__(self, text: str, action_label: str, parent=None,
+                 error: bool = False):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(6)
+        lay.addStretch(1)
+        # 原样复用既有组件：文案样式与所有其它 StepLine 完全一致
+        self.step = StepLine(text, error=error)
+        lay.addWidget(self.step)
+        self.btn = QPushButton(action_label)
+        self.btn.setObjectName("MiniBtn")
+        self.btn.setFixedHeight(20)
+        self.btn.setCursor(Qt.PointingHandCursor)
+        lay.addWidget(self.btn)
+        lay.addStretch(1)
+
+    def set_text(self, text: str) -> None:
+        self.step.set_text(text)
 
 
 class _Collapsible(QFrame):

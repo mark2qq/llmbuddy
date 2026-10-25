@@ -147,7 +147,7 @@ QPushButton:disabled { background-color: #f2f4f8; color: #aab1c0;
                 border: 1px solid #d5dbe7; }
 #ModelDropBtn:hover { background-color: #e8ecf5; border-color: #c3cbdb; }
 #ModelChip { background-color: #f7f9fd; border: 1px solid #e1e6f0;
-             color: #2b3242; }
+             color: #2b3242; padding: 2px 6px; }
 #SendCircleBtn { background-color: #dbe4fb; }
 #SendCircleBtn:hover { background-color: #cdd9fa; }
 #RowBtn { background-color: #4a6cf7; color: #ffffff; }
@@ -286,7 +286,7 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #BarChip { background-color: #f2f5fa; color: #3b4354; }
 #BarChip:hover { background-color: #e8edf6; color: #12161f; }
 #BarChip[active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
-#ModelChip { color: #2b3242; }
+#ModelChip { color: #2b3242; padding: 2px 6px; }
 #ModelChip:hover { background-color: #eceff6; color: #12161f; }
 #BusyDot { color: #6b7385; }
 #SendBtn { background-color: #1b2130; color: #ffffff; }
@@ -345,6 +345,33 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #GuideBtn:hover { background-color: #e8edf6; color: #12161f;
                   border-color: #c9d3e6; }
 #BubbleTime { color: #8b93a7; }
+
+/* 能力清单中心（1.0.8）：技能列表 + 详情 / 工具开关 / MCP / 在线目录 */
+#HubSplitter { background: transparent; }
+#HubSplitter::handle { background-color: #e6ebf3; width: 3px; }
+#HubList { background-color: #ffffff; border: 1px solid #dbe0ea;
+           border-radius: 6px; }
+#HubList::item { color: #2b3242; padding: 4px 6px;
+                 border-bottom: 1px solid #eef1f7; }
+#HubList::item:hover { background-color: #f2f5fa; color: #12161f; }
+#HubList::item:selected { background-color: #dbe4fb; color: #1b3a8f; }
+#HubDetail { background-color: #f7f9fd; border: 1px solid #e1e6f0;
+             border-radius: 6px; color: #2b3242; }
+#HubSearch, #HubCombo { background-color: #ffffff; color: #2b3242;
+                        border: 1px solid #dbe0ea; border-radius: 6px;
+                        padding: 3px 6px; }
+#HubSearch:focus, #HubCombo:focus { border-color: #9fb3e8; }
+#HubHeadCount { color: #3b4354; }
+#HubToolName { color: #2b3242; }
+#HubToolNameDim { color: #a5adbd; }
+#HubToolDim { color: #9a6a12; }
+#CatalogWarn { color: #9a6a12; background-color: #fff8e8;
+               border: 1px solid #ecd9a8; border-radius: 6px;
+               padding: 4px 8px; }
+#CatalogNote { color: #6b7385; background-color: #f2f5fa;
+               border: 1px solid #e1e6f0; border-radius: 6px;
+               padding: 4px 8px; }
+#SkillChipsRow { background: transparent; }
 """
 
 

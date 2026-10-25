@@ -43,6 +43,7 @@ from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
                                QInputDialog, QLabel, QPushButton, QMessageBox)
 from ui.widgets.assistant_cards import ChatBubble  # noqa: E402
+from ui.pages.assistant_page import _ellipsis, parse_mcp_json  # noqa: E402
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -103,6 +104,28 @@ class _FakeAssistApi:
         self.deleted_items = []   # (sid, item_id)
         self.moved = []           # (sid, item_id, delta)
         self.cleared = []         # sid
+        # ---------------- 1.0.8 清单中心 / 工具开关 / 自动加载 ----------------
+        self.tool_prefs_calls = 0
+        self.tool_prefs = {"disabled": [], "max_tools": 24, "total": 2,
+                           "active": 2, "over": None}
+        self.saved_prefs = []     # (disabled[], max_tools)
+        self.profiles_calls = 0
+        self.profiles_data = {"auto_load": True,
+                              "profiles": [{"id": "file-organize",
+                                            "name": "文件整理",
+                                            "skills": ["workspace-organizer"]}]}
+        self.saved_profiles = []  # (auto_load, profiles)
+        self.catalog_refreshed = 0
+        self.catalog_mcp_data = {"items": [], "cursor": None, "fetched_at": 0,
+                                 "stale": False, "error": ""}
+        self.catalog_repos_data = {"items": [], "total_count": 0,
+                                   "fetched_at": 0, "stale": False, "error": ""}
+        self.catalog_fail = ""    # 非空则在 catalog_* 上抛该错误（离线退化用例）
+        self.installed_dir = []   # from_dir 的 path
+        self.installed_url = []   # from_url 的 url
+        self.installed_skill = []  # (repo, ref, dir, slug)
+        self.installed_mcp = []   # (registry_name, env)
+        self.added_mcp = []       # 粘贴 JSON 添加走的 add_mcp payload
 
     def spaces(self):
         return [{"path": r"E://tmp//ws", "name": "ws", "count": len(self.tasks),
@@ -240,6 +263,76 @@ class _FakeAssistApi:
     def mcp_servers(self):
         return []
 
+    # ---------------- 1.0.8 工具偏好 / profile / 在线目录 ----------------
+    def tool_prefs(self):
+        self.tool_prefs_calls += 1
+        return dict(self.tool_prefs)
+
+    def save_tool_prefs(self, disabled=None, max_tools=None):
+        self.saved_prefs.append((list(disabled or []), max_tools))
+        self.tool_prefs = {"disabled": list(disabled or []),
+                           "max_tools": int(max_tools or 24),
+                           "total": 2,
+                           "active": max(0, 2 - len(disabled or [])),
+                           "over": None}
+        return dict(self.tool_prefs)
+
+    def profiles(self):
+        self.profiles_calls += 1
+        return dict(self.profiles_data)
+
+    def save_profiles(self, auto_load=None, profiles=None):
+        self.saved_profiles.append((auto_load, profiles))
+        if auto_load is not None:
+            self.profiles_data = {**self.profiles_data, "auto_load": auto_load}
+        return dict(self.profiles_data)
+
+    def _catalog_guard(self):
+        if self.catalog_fail:
+            raise RuntimeError(self.catalog_fail)
+
+    def catalog_mcp(self, q="", cursor="", force=False):
+        self._catalog_guard()
+        return dict(self.catalog_mcp_data)
+
+    def catalog_repos(self, q="", force=False):
+        self._catalog_guard()
+        return dict(self.catalog_repos_data)
+
+    def catalog_repo_skills(self, owner, repo, ref="", force=False):
+        self._catalog_guard()
+        return {"commit": "abc", "items": [
+            {"slug": "pdf", "dir": "skills/pdf", "name": "pdf",
+             "description": "PDF 处理", "files": ["SKILL.md"],
+             "has_scripts": False}]}
+
+    def catalog_install_skill(self, repo, ref="", dirpath="", slug="",
+                              overwrite=False):
+        self.installed_skill.append((repo, ref, dirpath, slug))
+        return {"slug": slug, "files": 1, "bytes": 100, "has_scripts": False}
+
+    def catalog_install_mcp(self, registry_name, server_id="", name="",
+                            env=None, risk="", connect=True):
+        self.installed_mcp.append((registry_name, dict(env or {})))
+        return {"server": {"id": "x", "name": "Remote FS"},
+                "connected": True, "error": ""}
+
+    def catalog_refresh(self):
+        self.catalog_refreshed += 1
+        return {"ok": True, "counts": {"mcp": 12, "gh_repos": 3}, "errors": []}
+
+    def catalog_from_dir(self, path, overwrite=False):
+        self.installed_dir.append(path)
+        return {"slug": "from-dir", "files": 2, "bytes": 200}
+
+    def catalog_from_url(self, url, overwrite=False):
+        self.installed_url.append(url)
+        return {"slug": "from-url", "files": 1, "bytes": 100}
+
+    def add_mcp(self, cfg):
+        self.added_mcp.append(dict(cfg))
+        return {"id": cfg.get("id"), "connected": True, "error": ""}
+
 
 class _FakeStream(QObject):
     """替代 AssistantStream：只记录 payload，不真的发请求。"""
@@ -347,7 +440,10 @@ def test_model_source_and_model_merged_into_one_menu(page):
 
 def test_state_fills_bottom_bar(page):
     p, _fake = page
-    assert "只读自动" in p._policy_btn.text()
+    # 宽度压缩：底栏策略按钮只显示短名（「⊘ 自动」），完整名在 tooltip
+    from ui.pages.assistant_page import POLICY_SHORT
+    assert POLICY_SHORT["readonly_auto"] in p._policy_btn.text()
+    assert "只读自动" in p._policy_btn.toolTip()
     assert p._ws_btn.text() == "ws"          # E:\tmp\ws -> 目录名 ws
     assert "LangGraph" in p._subtitle.text()
     assert "工作区" in p._subtitle.text()
@@ -357,7 +453,9 @@ def test_policy_change_persists(page):
     p, fake = page
     p._set_policy("ask_all")
     assert _pump(lambda: fake.saved.get("policy") == "ask_all")
-    assert "全部确认" in p._policy_btn.text()
+    from ui.pages.assistant_page import POLICY_SHORT
+    assert POLICY_SHORT["ask_all"] in p._policy_btn.text()
+    assert "全部确认" in p._policy_btn.toolTip()
 
 
 def test_switch_model_persists_provider(page):
@@ -390,7 +488,12 @@ def test_multi_skill_mount_renders_chips_without_touching_input(page):
 
 
 def test_multi_skill_prefix_injected_in_payload(page, monkeypatch):
-    """多技能挂载后，每条消息自动带「用 xx、yy 技能」前缀（用户看不到，模型看得到）。"""
+    """多技能挂载后走 `mounted_skills` 字段，**不再污染 message 正文**（1.0.8 A4）。
+
+    老实现把「用 xx、yy 技能：<text>」拼进 message，落库后历史正文被污染
+    （用户复制 / 回看会看到前缀）。新协议：message 是原文，挂载列表走
+    `mounted_skills`，后端写进 system 段。
+    """
     from ui.pages import assistant_page as mod
     monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
     p, _fake = page
@@ -398,21 +501,42 @@ def test_multi_skill_prefix_injected_in_payload(page, monkeypatch):
     p._add_skill("code-review")
     p._send_with_session({"id": p._session_id}, "看看这个项目")
     payload = _FakeStream.instances[-1].payload
-    assert payload["message"] == "用 repo-digest、code-review 技能：看看这个项目"
+    assert payload["message"] == "看看这个项目"          # 原文，无前缀
+    assert payload["mounted_skills"] == ["repo-digest", "code-review"]
     assert payload["provider"] == "local"
     assert payload["stream"] is True
     p._end_streaming()
 
 
+def test_no_mounted_skills_key_when_nothing_mounted(page, monkeypatch):
+    """没挂载技能时不发 `mounted_skills`（老后端不认识该字段也不受影响）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    p._skill_slugs = []
+    p._send_with_session({"id": p._session_id}, "裸消息")
+    assert "mounted_skills" not in _FakeStream.instances[-1].payload
+    p._end_streaming()
+
+
 def test_attach_plus_menu_has_five_entries(page):
-    """底栏 [+]：第一项添加附件，分隔线后四个管理入口（技能/工具/MCP/审计）。"""
+    """底栏 [+]：首项添加附件，含 4 类添加入口 + 汇总清单入口，以「审计」结尾（4 段）。"""
     p, _fake = page
     menu = p._build_attach_menu()
     texts = [a.text() for a in menu.actions() if a.text()]
     seps = sum(1 for a in menu.actions() if a.isSeparator())
     assert texts[0] == "添加附件…"
-    assert texts[1:] == ["技能", "工具", "MCP", "审计"]
-    assert seps == 1
+    # 1.0.8：只保留「添加类」+ 一个汇总入口，管理类压成末尾一组（架构 §9.2 R-S5）
+    for must in ("能力清单（技能 / 工具 / MCP）…",
+                 "从清单添加技能…", "从清单添加 MCP…",
+                 "从本地文件夹导入技能…", "导入技能 zip…",
+                 "粘贴 URL 安装技能…", "粘贴 JSON 添加 MCP…",
+                 "刷新在线目录"):
+        assert must in texts, must
+    assert texts[-1] == "审计"
+    assert texts[-4:] == ["技能", "工具", "MCP", "审计"]
+    assert seps == 5          # 4 个分组段 + 末尾管理类前的一段
+    assert len(texts) == 13
 
 
 def test_sixth_skill_rejected(page):
@@ -1089,7 +1213,9 @@ def test_choose_workspace_saves_and_updates_button(page, monkeypatch, tmp_path):
     p, fake = page
     p._choose_workspace()
     # 按钮立刻跟着变，不用等后端 refresh 回来（避免「选完像没接上」）
-    assert p._ws_btn.text() == "newws"
+    # 底栏宽度预算规则①：工作区名最多显示 4 个字，超出用「…」截断（完整名在 tooltip）
+    assert p._ws_btn.text() == _ellipsis("newws", 4)
+    assert target in p._ws_btn.toolTip()
     assert _pump(lambda: fake.saved.get("workspace") == target)
 
 
@@ -1161,7 +1287,8 @@ def test_workspace_restored_on_refresh(page):
     st = dict(p._state)
     st["workspace"] = r"E:\llm-service\newspace"
     p._apply_state(st)
-    assert p._ws_btn.text() == "newspace"
+    # 底栏宽度预算规则①：按钮只显示 4 个字，完整名放在 tooltip
+    assert p._ws_btn.text() == _ellipsis("newspace", 4)
     assert "newspace" in p._ws_btn.toolTip()
 
 
@@ -1173,7 +1300,7 @@ def test_workspace_falls_back_to_local_memory(page, tmp_path):
     st = dict(p._state)
     st["workspace"] = ""
     p._apply_state(st)
-    assert p._ws_btn.text() == "newws"
+    assert p._ws_btn.text() == _ellipsis("newws", 4)
     assert _pump(lambda: {"workspace": target} in fake.save_calls)
 
 

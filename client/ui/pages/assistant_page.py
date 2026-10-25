@@ -44,18 +44,19 @@ from typing import Any, Dict, List, Optional
 from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import (QColor, QIcon, QPainter, QPainterPath, QPixmap,
                            QTextCursor)
-from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QInputDialog,
-                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-                               QSizePolicy, QTabWidget, QTextEdit, QVBoxLayout,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+                               QInputDialog, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMenu, QMessageBox,
+                               QPlainTextEdit, QPushButton, QSizePolicy,
+                               QSplitter, QTabWidget, QTextEdit, QVBoxLayout,
                                QWidget)
 
 from core.assistant_client import AssistantApi, AssistantStream
 from core.task_runner import Worker
 from core.theme import is_light
-from ui.widgets.assistant_cards import (ApprovalCard, ChatBubble, StepLine,
-                                       ThinkingBlock, ToolCard)
+from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
+                                        StepLine, ThinkingBlock, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
 from ui.widgets.queue_item import QueueItemRow
 
@@ -65,7 +66,26 @@ POLICY_ITEMS = [
     ("yolo", "全部放行", "所有工具直接执行、不再询问（危险）"),
 ]
 POLICY_ICON = {"readonly_auto": "⊘", "ask_all": "✓", "yolo": "⚡"}
+#: 底栏按钮上的策略短名（宽度压缩：底栏可用 504px，完整名只在 tooltip）
+POLICY_SHORT = {"readonly_auto": "自动", "ask_all": "确认", "yolo": "放行"}
 RISK_TEXT = {"low": "只读", "medium": "写入", "high": "高危"}
+
+# 在线目录条目的「零配置 / 需密钥 / 需注册 / 未知」徽标（PRD §5.3 判定规则）
+#   zero_config    green  默认可见
+#   need_key       yellow 默认隐藏，需筛选勾选
+#   need_register  grey   同上
+#   unknown        no install button，只给「查看源」
+CATALOG_CLASS_BADGE = {
+    "zero_config": "[零配置]",
+    "need_key": "[需密钥]",
+    "need_register": "[需注册]",
+    "unknown": "[未知]",
+}
+#: 「需密钥 / 需注册」默认隐藏（PRD §5.3 结论）
+CATALOG_HIDDEN_CLASSES = ("need_key", "need_register")
+
+# 在线安装的 MCP `command` 白名单（PRD §8.5 安全红线）
+MCP_COMMAND_WHITELIST = ("npx", "uvx", "python", "python3", "node", "docker")
 
 # 左栏「任务 / 空间」两区（对齐 WorkBuddy 的语义）：
 #   任务 = 一次对话（后端仍是 sessions），空间 = 任务所属的工作区目录。
@@ -126,6 +146,112 @@ def _ellipsis(text: str, limit: int = 12) -> str:
     """左栏只有 200px，标题必须截断（完整标题放 tooltip）。"""
     text = " ".join(str(text or "").split()) or "未命名任务"
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _compact_chip(btn) -> None:
+    """把底栏 chip 压成文字宽度，避免 QPushButton 默认 81px 的最小宽把底栏顶爆。
+
+    架构 §4 宽度门禁：逻辑 720 → 右栏可用 504px，底栏 6 个 chip + 模型 + 发送
+    全部要塞进 439px。Qt 的 QPushButton 默认 `sizeHint().width()` 是 81px
+    （受 QSS padding 与 style 最小宽影响），这里显式钉死紧凑的水平内边距，
+    让 `sizeHint()` 反映真实占用，门禁测试才有意义。
+    """
+    btn.setStyleSheet("padding: 2px 6px;")
+    btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+    btn.setFixedHeight(26)
+
+
+def _slug_id(text: str, fallback: str = "") -> str:
+    """把任意名字转成可用的 MCP 服务器 id（与 skills._slugify 同规则）。"""
+    import re as _re
+    s = _re.sub(r"[^a-zA-Z0-9._-]+", "-", str(text or "")).strip("-.")
+    return s or fallback
+
+
+def parse_mcp_json(text: str) -> List[Dict[str, Any]]:
+    """把一段 MCP JSON 配置解析成 `/mcp` 可直接 POST 的服务器配置列表。
+
+    兼容三种写法（PRD §5.1.1「粘贴 JSON 添加 MCP」）：
+
+    1. **Claude Desktop 片段**（最常见）::
+
+           {"mcpServers": {"filesystem": {"command": "npx",
+             "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}}}
+
+    2. 单个服务器对象（含 `command` 或 `url`）::
+
+           {"command": "npx", "args": ["-y", "xxx"]}
+
+    3. 服务器数组 / 多个键的对象（无 `mcpServers` 包裹时按值判定）。
+
+    返回每条：`{id, name, transport, command, args, url, env, risk,
+    enabled, connect}`。**不做任何执行**，只落配置（安全红线 PRD §8.5）。
+    非法 JSON 或一条可用配置都没有时抛 `ValueError`（中文说明，UI 直接展示）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("内容为空，请粘贴 MCP 配置 JSON。")
+    try:
+        data = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"不是合法的 JSON：{e}") from e
+
+    def looks_like_server(obj: Any) -> bool:
+        return isinstance(obj, dict) and ("command" in obj or "url" in obj
+                                          or "baseUrl" in obj)
+
+    candidates: List[tuple] = []      # (name_hint, obj)
+    if isinstance(data, dict) and isinstance(data.get("mcpServers"), dict):
+        for k, v in data["mcpServers"].items():
+            if looks_like_server(v):
+                candidates.append((str(k), v))
+    elif isinstance(data, dict) and looks_like_server(data):
+        candidates.append((str(data.get("id") or data.get("name") or ""), data))
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            if looks_like_server(v):
+                candidates.append((str(v.get("id") or v.get("name")
+                                       or f"mcp{i + 1}"), v))
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            if looks_like_server(v):
+                candidates.append((str(k), v))
+
+    out: List[Dict[str, Any]] = []
+    seen: Dict[str, int] = {}
+    for hint, obj in candidates:
+        url = str(obj.get("url") or obj.get("baseUrl") or "").strip()
+        cmd = str(obj.get("command") or "").strip()
+        transport = "http" if url else "stdio"
+        name = str(obj.get("name") or hint or cmd or url).strip()
+        base = _slug_id(hint or name or cmd or "mcp", "mcp")
+        # 冲突加 -2 / -3（与架构 A5 同口径）
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        sid = base if n == 1 else f"{base}-{n}"
+        args = obj.get("args") or []
+        if isinstance(args, str):
+            args = [args]
+        args = [str(a) for a in args]
+        env = obj.get("env") or {}
+        if not isinstance(env, dict):
+            env = {}
+        risk = str(obj.get("risk") or ("high" if transport == "stdio" else "medium"))
+        out.append({
+            "id": sid,
+            "name": name or sid,
+            "transport": transport,
+            "command": cmd or ("npx" if transport == "stdio" else ""),
+            "args": args,
+            "url": url,
+            "env": {str(k): str(v) for k, v in env.items()},
+            "risk": risk if risk in RISK_TEXT else "high",
+            "enabled": True,
+            "connect": True,
+        })
+    if not out:
+        raise ValueError("没有找到任何 MCP 服务器配置（需要一个 command 或 url）。")
+    return out
 # 运行中指示的旋转字符
 SPIN_FRAMES = "◐◓◑◒"
 
@@ -177,6 +303,17 @@ class AssistantPage(QWidget):
         self._active_model = ""
         self._skill_slugs: List[str] = []
         self._model_cache: Dict[str, List[str]] = {}
+        #: 1.0.8 清单中心 / 自动加载
+        #: _tool_prefs: 后端 GET /tools/prefs 快照（disabled / max_tools / active）
+        #: _profiles: GET /profiles 快照（auto_load / profiles）
+        #: _catalog_*: 在线区缓存（打开清单中心时先渲染，再后台补）
+        #: _auto_tips: 已提示过的 (session_id, profile) —— 同任务同 profile 只提示一次
+        self._tool_prefs: Dict[str, Any] = {}
+        self._profiles: Dict[str, Any] = {}
+        self._catalog_mcp: Dict[str, Any] = {}
+        self._catalog_repos: Dict[str, Any] = {}
+        self._auto_tips: set = set()
+        self._auto_off = False      # 本会话已关闭自动加载（立即失效，不等后端）
         # 管理面板 / 任务列表：记住用户选中的任务与最近一次列表快照
         # （列表会被 refresh 重建，重建瞬间 currentItem 为 None，必须靠 _sel_sid 兜底）
         self._sel_sid = ""
@@ -370,20 +507,28 @@ class AssistantPage(QWidget):
 
             ┌ 今天帮你做些什么？ ───────────────────────────────┐
             │                                                        │
-            │ [+] [工作区] [⊘ 只读自动] [技能]     ◐  [模型 ▾]  [⚡][↑] │
+            │ [+] [工作区][⊘只读自动][技能][工具][MCP]  ◐  [模型▾] [⚡][↑] │
             └────────────────────────────────────────────────────────┘
 
         左侧是「动作与上下文」，右侧是「运行状态 / 模型 / 发送」。
         1.0.9 引导会话：忙碌态 ↑ 语义变为「排队入队」、左侧新增 ⚡
         「引导发送」、停止 ■ 同时可见；空闲态保持现状（■/⚡ 隐藏）。
+
+        1.0.8 清单中心宽度约束（架构 §5.4，逻辑屏宽 720 → 可用 504px）：
+          ① 工作区文案压到 ≤4 字（`_refresh_ws_btn`）；② 模型名短名 ≤8 字
+             （`_refresh_model_btn`）；③ 底栏 spacing 4→2、边距 8→6；
+          ④ 挂载 chip ≥3 个时折行到输入框上方（`_reparent_skill_chips`）。
+        **不做**任何宽度自适应隐藏 —— 三个按钮必须始终可见且带文字。
         """
         box = QFrame()
         box.setObjectName("Composer")
         box.setProperty("focus", False)
         self._composer = box
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(12, 10, 10, 8)
+        # ③ 边距 12/10/8 → 10/8/6：横向省 3px/侧，纵向省 2px/侧
+        lay.setContentsMargins(10, 8, 6, 6)
         lay.setSpacing(2)
+        self._composer_lay = lay
 
         self._input = QTextEdit()
         self._input.setObjectName("ComposerInput")
@@ -395,26 +540,33 @@ class AssistantPage(QWidget):
         lay.addWidget(self._input)
 
         bar = QHBoxLayout()
+        # ③ spacing 4 → 2：11 个 gap 省 22px
         bar.setSpacing(2)
+        bar.setContentsMargins(0, 0, 0, 0)
+        self._bar_lay = bar
 
-        # 左：附件 / 工作区 / 审批策略 / 技能
+        # 左：附件 / 工作区 / 审批策略 / 技能 / 工具 / MCP
         self._attach_btn = QPushButton("+")
         self._attach_btn.setObjectName("BarBtn")
+        self._attach_btn.setStyleSheet("padding: 0px;")
         self._attach_btn.setFixedSize(26, 26)
         self._attach_btn.setCursor(Qt.PointingHandCursor)
-        self._attach_btn.setToolTip("添加附件，或打开管理面板（技能 / 工具 / MCP / 审计）")
+        self._attach_btn.setToolTip(
+            "添加附件，或打开能力清单中心（技能 / 工具 / MCP）")
         self._attach_btn.clicked.connect(self._show_attach_menu)
         bar.addWidget(self._attach_btn)
 
         self._ws_btn = QPushButton("工作区")
         self._ws_btn.setObjectName("BarChip")
+        _compact_chip(self._ws_btn)
         self._ws_btn.setCursor(Qt.PointingHandCursor)
         self._ws_btn.setToolTip("切换文件工具可访问的工作区")
         self._ws_btn.clicked.connect(self._choose_workspace)
         bar.addWidget(self._ws_btn)
 
-        self._policy_btn = QPushButton("⊘ 只读自动")
+        self._policy_btn = QPushButton("⊘ 自动")
         self._policy_btn.setObjectName("BarChip")
+        _compact_chip(self._policy_btn)
         self._policy_btn.setCursor(Qt.PointingHandCursor)
         self._policy_btn.setToolTip("高危动作审批策略（点击切换）")
         self._policy_btn.clicked.connect(self._show_policy_menu)
@@ -422,12 +574,32 @@ class AssistantPage(QWidget):
 
         self._skill_btn = QPushButton("技能")
         self._skill_btn.setObjectName("BarChip")
+        _compact_chip(self._skill_btn)
         self._skill_btn.setCursor(Qt.PointingHandCursor)
-        self._skill_btn.setToolTip("挂载技能：之后每条消息自动带上「用 xx 技能」")
+        self._skill_btn.setToolTip("挂载技能 / 添加技能（本地文件夹 · zip · URL · 在线清单）")
         self._skill_btn.clicked.connect(self._show_skill_menu)
         bar.addWidget(self._skill_btn)
 
-        # 多技能挂载区：每个已挂载技能一个可移除 chip（最多 5 个）
+        # [工具]：工具启用开关 + 当前下发数（用户原话「对话框底部技能、工具、MCP」）
+        self._tool_btn = QPushButton("工具")
+        self._tool_btn.setObjectName("BarChip")
+        _compact_chip(self._tool_btn)
+        self._tool_btn.setCursor(Qt.PointingHandCursor)
+        self._tool_btn.setToolTip("工具启用开关与当前下发给模型的数量")
+        self._tool_btn.clicked.connect(self._show_tool_menu)
+        bar.addWidget(self._tool_btn)
+        # [MCP]：服务器连接态 + 在线清单安装 + 手动添加
+        self._mcp_btn = QPushButton("MCP")
+        self._mcp_btn.setObjectName("BarChip")
+        _compact_chip(self._mcp_btn)
+        self._mcp_btn.setCursor(Qt.PointingHandCursor)
+        self._mcp_btn.setToolTip("MCP 服务器：连接/断开、从在线清单安装、手动添加")
+        self._mcp_btn.clicked.connect(self._show_mcp_menu)
+        bar.addWidget(self._mcp_btn)
+
+        # 多技能挂载区：每个已挂载技能一个可移除 chip（最多 5 个）。
+        # ④ ≥3 个时 reparent 到输入框上方（`_reparent_skill_chips`），
+        #    否则会顶出底栏 504px 门禁。
         self._skill_chip_cont = QWidget()
         self._skill_chip_cont.setObjectName("SkillChips")
         chip_lay = QHBoxLayout(self._skill_chip_cont)
@@ -436,6 +608,9 @@ class AssistantPage(QWidget):
         self._skill_chip_lay = chip_lay
         self._skill_chip_cont.setVisible(False)
         bar.addWidget(self._skill_chip_cont)
+        #: chip 容器当前挂在哪（"bar" = 底栏内联 / "col" = 输入框上方独立一行）
+        self._chips_row = "bar"
+        self._skill_chips_row: Optional[QWidget] = None
 
         bar.addStretch(1)
 
@@ -449,6 +624,7 @@ class AssistantPage(QWidget):
 
         self._model_btn = QPushButton("模型")
         self._model_btn.setObjectName("ModelChip")
+        _compact_chip(self._model_btn)
         self._model_btn.setCursor(Qt.PointingHandCursor)
         self._model_btn.setToolTip("切换模型来源与模型")
         self._model_btn.clicked.connect(self._show_model_menu)
@@ -456,6 +632,7 @@ class AssistantPage(QWidget):
 
         self._stop_btn = QPushButton("■")
         self._stop_btn.setObjectName("StopBtn")
+        self._stop_btn.setStyleSheet("padding: 0px;")
         self._stop_btn.setFixedSize(30, 30)
         self._stop_btn.setCursor(Qt.PointingHandCursor)
         self._stop_btn.setToolTip("停止生成")
@@ -469,6 +646,7 @@ class AssistantPage(QWidget):
         # 对话流」vs「本轮结束后按序发送」。
         self._guide_btn = QPushButton("⚡")
         self._guide_btn.setObjectName("GuideBtn")
+        self._guide_btn.setStyleSheet("padding: 0px;")
         self._guide_btn.setFixedSize(26, 26)
         self._guide_btn.setCursor(Qt.PointingHandCursor)
         self._guide_btn.setToolTip(
@@ -480,6 +658,7 @@ class AssistantPage(QWidget):
 
         self._send_btn = QPushButton("↑")
         self._send_btn.setObjectName("SendBtn")
+        self._send_btn.setStyleSheet("padding: 0px;")
         self._send_btn.setFixedSize(30, 30)
         self._send_btn.setCursor(Qt.PointingHandCursor)
         self._send_btn.setToolTip("发送（Enter）")
@@ -508,6 +687,78 @@ class AssistantPage(QWidget):
         self._spin_timer.stop()
         self._busy_lbl.setVisible(False)
 
+    # ---------------- 挂载 chip：≥3 个折行到输入框上方（宽度压缩规则 ④） ----------------
+    #: 底栏可用宽度（逻辑 720 → 左栏 200 → 右栏 520 → 再扣内边距 = 504px，
+    #: 架构 §4 求和表）。
+    BAR_BUDGET_W = 504
+
+    def _chips_width_over_budget(self, count: int) -> bool:
+        """估算把 `count` 个已挂载技能 chip 留在底栏内联是否会顶爆 504px。
+
+        规则④原话是「≥3 个折行」，但两个长 slug（如 `repo-digest` +
+        `code-review`）内联就已经 687px，光靠数量判断不够。这里按 chip 实际
+        `sizeHint()` 求和（chip 已经建好，直接量最准），超预算就提前折行。
+        """
+        lay = getattr(self, "_skill_chip_lay", None)
+        if lay is None or count <= 0 or lay.count() == 0:
+            return False
+        chips_w = 0
+        spacing = max(0, lay.spacing())
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if w is not None:
+                chips_w += w.sizeHint().width()
+        chips_w += spacing * max(0, lay.count() - 1)
+        # 底栏其它固定项（+ / 工作区 / 策略 / 技能 / 工具 / MCP / 模型 / 发送…）
+        # 404 是实测的空底栏 sizeHint；留 8px 余量吃掉 style 抖动。
+        base = 404
+        return (base + chips_w + 8) > self.BAR_BUDGET_W
+
+    def _reparent_skill_chips(self, count: int) -> None:
+        """挂载 ≥3 个技能时把 chip 容器从底栏搬到输入框上方独立一行。
+
+        为什么不能留在底栏：每个 chip ≈62px（`✕ <slug>`），3 个就 186px，
+        而逻辑 720 宽下底栏可用宽只有 504px（架构 §5.4 求和表：保守基线 538
+        已超 34）。搬走后底栏恒 ≤439px，chip 在独立一行可以横向铺开。
+        搬动用 reparent + 重新 addWidget，**不销毁** widget（否则已连接的
+        clicked 信号会丢，chip 点了没反应）。
+        """
+        bar = getattr(self, "_bar_lay", None)
+        lay = getattr(self, "_composer_lay", None)
+        cont = getattr(self, "_skill_chip_cont", None)
+        if bar is None or lay is None or cont is None:
+            return
+        flat = bool(count >= 3) or self._chips_width_over_budget(count)
+        want = "col" if flat else "bar"
+        if getattr(self, "_chips_row", "bar") == want:
+            return
+        # 先从当前布局摘下（两个布局都试，幂等）
+        bar.removeWidget(cont)
+        lay.removeWidget(cont)
+        if flat:
+            if self._skill_chips_row is None:
+                row = QWidget()
+                row.setObjectName("SkillChipsRow")
+                row_lay = QHBoxLayout(row)
+                row_lay.setContentsMargins(0, 0, 0, 0)
+                row_lay.setSpacing(4)
+                row_lay.addWidget(cont)
+                row_lay.addStretch(1)
+                row.setVisible(False)
+                # 插在输入框之后、底栏之前（index 1 = 紧贴输入框下方独立一行）
+                lay.insertWidget(1, row)
+                self._skill_chips_row = row
+            self._skill_chips_row.setVisible(True)
+        else:
+            if self._skill_chips_row is not None:
+                self._skill_chips_row.setParent(None)
+                self._skill_chips_row.deleteLater()
+                self._skill_chips_row = None
+            # 恢复到 addStretch 之前的原位置（bar 末项是 stretch）
+            bar.insertWidget(max(0, bar.count() - 1), cont)
+        self._chips_row = want
+        cont.setVisible(bool(count))
+
     # ---------------- 底栏弹出菜单（贴近窗口底部，向上展开） ----------------
     def _popup_above(self, menu: QMenu, anchor: QWidget) -> None:
         menu.ensurePolished()
@@ -518,20 +769,27 @@ class AssistantPage(QWidget):
     # ---------------- 文件选择（统一入口，禁止原生对话框） ----------------
     def _pick_file(self, title: str, start: str = "",
                    name_filter: str = "所有文件 (*.*)", save: bool = False,
-                   default_name: str = "", accept_text: str = "选择") -> str:
-        """统一的文件选择入口，返回选中路径（取消返回 ""）。
+                   default_name: str = "", accept_text: str = "选择",
+                   directory: bool = False) -> str:
+        """统一的文件/目录选择入口，返回选中路径（取消返回 ""）。
 
         **必须 DontUseNativeDialog**：本机冻结包里，系统原生文件对话框一调用就
         以 `0x8001010E RPC_E_WRONG_THREAD`（COM 套间错误）直接杀掉进程，
         crash.log 留有栈：`_attach_file → QFileDialog.getOpenFileName`。
         表现为「点 + 或点工作区就闪退」且没有任何 Python 异常。自绘框没有这条
         路径依赖，最坏情况只是不弹出。同时标签写死中文，不依赖 Qt 翻译文件。
+
+        directory=True：选目录（「从本地文件夹导入技能」用），复用同一份中文标签，
+        避免与 `_choose_workspace` 的 20 行实例化逻辑漂移出两套文案。
         """
         try:
             fd = QFileDialog(self._dialog_parent(), title, start)
             fd.setOption(QFileDialog.Option.DontUseNativeDialog, True)
             fd.setNameFilter(name_filter)
-            if save:
+            if directory:
+                fd.setOption(QFileDialog.Option.ShowDirsOnly, True)
+                fd.setFileMode(QFileDialog.FileMode.Directory)
+            elif save:
                 fd.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
                 fd.setFileMode(QFileDialog.FileMode.AnyFile)
                 if default_name:
@@ -539,8 +797,11 @@ class AssistantPage(QWidget):
             else:
                 fd.setFileMode(QFileDialog.FileMode.ExistingFile)
             fd.setLabelText(QFileDialog.DialogLabel.LookIn, "位置：")
-            fd.setLabelText(QFileDialog.DialogLabel.FileName,
-                            "文件名：" if save else "文件：")
+            if directory:
+                fd.setLabelText(QFileDialog.DialogLabel.FileName, "目录：")
+            else:
+                fd.setLabelText(QFileDialog.DialogLabel.FileName,
+                                "文件名：" if save else "文件：")
             fd.setLabelText(QFileDialog.DialogLabel.FileType, "类型：")
             fd.setLabelText(QFileDialog.DialogLabel.Accept, accept_text)
             fd.setLabelText(QFileDialog.DialogLabel.Reject, "取消")
@@ -564,14 +825,63 @@ class AssistantPage(QWidget):
         self._input.moveCursor(QTextCursor.End)
         self._input.setFocus()
 
-    # ---------------- 底栏 [+] 菜单：附件 + 四个管理入口 ----------------
+    # ---------------- 底栏 [+] 菜单：添加附件 + 清单中心 + 添加类 + 刷新 + 管理类 ----------------
     def _build_attach_menu(self) -> "QMenu":
-        """[+] 弹出菜单：第一项「添加附件」走原逻辑，分隔线后四个管理入口。"""
+        """[+] 弹出菜单（PRD §5.1.1，4 段）。
+
+        原则：只保留「添加类」动作 + 一个汇总入口，管理类跳转压成末尾一组，
+        避免 200% 缩放下菜单高到接近屏高 1/3（架构 §9.2 R-S5）。
+
+            添加附件…
+            ────
+            能力清单（技能 / 工具 / MCP）…
+            ────
+            从清单添加技能… / 从清单添加 MCP…
+            ────
+            从本地文件夹导入技能… / 导入技能 zip… / 粘贴 URL 安装技能… / 粘贴 JSON 添加 MCP…
+            ────
+            刷新在线目录
+            ────
+            技能 / 工具 / MCP / 审计（原跳转，术语与 Tab 对应）
+        """
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用深浅样式
         add = menu.addAction("添加附件…")
         add.setToolTip("把本机文件加进本次提问（插入 @路径）")
         add.triggered.connect(self._attach_file)
+
+        menu.addSeparator()
+        hub = menu.addAction("能力清单（技能 / 工具 / MCP）…")
+        hub.setToolTip("打开清单中心，停在技能页")
+        hub.triggered.connect(lambda _c=False: self.open_manager("skills"))
+
+        menu.addSeparator()
+        act = menu.addAction("从清单添加技能…")
+        act.setToolTip("打开清单中心并聚焦技能搜索框")
+        act.triggered.connect(lambda _c=False: self.open_manager("skills", focus=True))
+        act = menu.addAction("从清单添加 MCP…")
+        act.setToolTip("打开清单中心的 MCP 在线目录")
+        act.triggered.connect(lambda _c=False: self.open_manager("mcp"))
+
+        menu.addSeparator()
+        act = menu.addAction("从本地文件夹导入技能…")
+        act.setToolTip("选中含 SKILL.md 的文件夹，复制进技能目录")
+        act.triggered.connect(lambda _c=False: self._import_skill_from_dir())
+        act = menu.addAction("导入技能 zip…")
+        act.setToolTip("从 zip 技能包导入（与 OpenClaw / Claude 技能包同构）")
+        act.triggered.connect(lambda _c=False: self._import_skill())
+        act = menu.addAction("粘贴 URL 安装技能…")
+        act.setToolTip("支持 GitHub / Gitee 的 SKILL.md 直链与含 /blob/ 的网页链接")
+        act.triggered.connect(lambda _c=False: self._install_skill_from_url())
+        act = menu.addAction("粘贴 JSON 添加 MCP…")
+        act.setToolTip("粘贴 Claude Desktop 配置片段（mcpServers）即可添加")
+        act.triggered.connect(lambda _c=False: self._paste_mcp_json())
+
+        menu.addSeparator()
+        act = menu.addAction("刷新在线目录")
+        act.setToolTip("三源并行刷新（MCP Registry / GitHub 仓库 / 技能树）")
+        act.triggered.connect(lambda _c=False: self._refresh_catalog())
+
         menu.addSeparator()
         for label, key in (("技能", "skills"), ("工具", "tools"),
                            ("MCP", "mcp"), ("审计", "audit")):
@@ -1084,8 +1394,14 @@ class AssistantPage(QWidget):
         w.start()
 
 
-    # ---------------- 管理面板（任务 / 技能 / 工具 / MCP / 审计） ----------------
-    def open_manager(self, key: str = "sessions") -> None:
+    # ---------------- 管理面板（能力清单中心：任务/技能/工具/MCP/审计） ----------------
+    def open_manager(self, key: str = "sessions", focus: bool = False) -> None:
+        """打开清单中心。
+
+        key 取值（架构接缝 S5，已定稿）：`sessions` / `skills` / `tools` /
+        `mcp` / `audit`；`focus=True` 时把焦点打到搜索框（`[技能]` 菜单的
+        「从在线清单安装…」用它）。
+        """
         if self._manager is None:
             self._manager = ManagerDialog(self)
         dlg = self._manager
@@ -1097,7 +1413,17 @@ class AssistantPage(QWidget):
         if key == "audit":
             self._refresh_audit()
         dlg.show_tab(key)
+        # 尺寸：主窗口 86% × 84%（架构 A7，逻辑 720×680 下必须放得下）
+        dlg.fit_to_parent()
+        # 在线区与工具偏好是懒加载的：打开时补一次（先渲染缓存，不阻塞）
+        if key in ("skills", "mcp", "tools"):
+            self._load_tool_prefs()
+        if key in ("skills", "mcp") and getattr(dlg, "_online_visible", False):
+            self._load_online_catalog(force=False)
         dlg.exec()
+        if focus:
+            # exec() 之后焦点已交给面板，这里把光标放到技能搜索框
+            dlg.focus_search()
 
     def _build_sessions_tab(self) -> QWidget:
         w = QWidget()
@@ -1247,6 +1573,16 @@ class AssistantPage(QWidget):
         self._show_task_menu(str(sid), lst.mapToGlobal(pos))
 
     def _build_skills_tab(self) -> QWidget:
+        """技能 Tab（PRD §5.2 / 架构 A7）：左列表 62% + 右详情 38%。
+
+        - 左：`QSplitter` 内的 `QListWidget`（**属性名保持 `_skill_list`**），
+          两行纯文本 `名称 · vX.Y` + `描述`，前置来源标识 `[内置]/[在线]/[已装]`；
+          纯文本随 DPI 自动缩放，200% 缩放下不会像自绘卡片那样错位。
+        - 右：只读 `QPlainTextEdit`（`_skill_detail`），**纯文本，不做 Markdown 渲染**
+          （架构 §0.2 P2-3 降级决定）。
+        - 工具条：搜索（name/description）+ 来源下拉 + 排序下拉 + ⟳ 刷新在线目录。
+        - 宽 <720 时详情自动折叠（`_auto_fold_detail`）。
+        """
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -1254,63 +1590,492 @@ class AssistantPage(QWidget):
         lay.addWidget(self._hint(
             "技能 = SKILL.md（frontmatter: name / description / tools）+ 正文；"
             "与 OpenClaw、Claude 技能包同构，可用 zip 互相导入导出。"))
+
+        # ---- 工具条：搜索 / 来源 / 排序 / 刷新 ----
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        self._skill_search = QLineEdit()
+        self._skill_search.setObjectName("HubSearch")
+        self._skill_search.setPlaceholderText("搜索技能（名称 / 描述）")
+        self._skill_search.setClearButtonEnabled(True)
+        self._skill_search.textChanged.connect(
+            lambda _t: self._fill_skills(self._state.get("skills") or []))
+        bar.addWidget(self._skill_search, 1)
+        self._skill_source = QComboBox()
+        self._skill_source.setObjectName("HubCombo")
+        for label, val in (("全部来源", "all"), ("内置", "builtin"),
+                           ("本地", "local"), ("在线", "online")):
+            self._skill_source.addItem(label, val)
+        self._skill_source.currentIndexChanged.connect(
+            lambda _i: self._fill_skills(self._state.get("skills") or []))
+        bar.addWidget(self._skill_source)
+        self._skill_sort = QComboBox()
+        self._skill_sort.setObjectName("HubCombo")
+        for label, val in (("默认排序", "default"), ("名称 A→Z", "name"),
+                           ("⭐ star 降序", "stars")):
+            self._skill_sort.addItem(label, val)
+        self._skill_sort.currentIndexChanged.connect(
+            lambda _i: self._fill_skills(self._state.get("skills") or []))
+        bar.addWidget(self._skill_sort)
+        b_ref = QPushButton("⟳ 刷新")
+        b_ref.setObjectName("MiniBtn")
+        b_ref.setToolTip("三源并行刷新在线目录（MCP Registry / GitHub / 技能树）")
+        b_ref.clicked.connect(lambda _c=False: self._refresh_catalog())
+        bar.addWidget(b_ref)
+        lay.addLayout(bar)
+
+        # ---- 左列表 + 右详情 ----
+        self._skill_split = QSplitter(Qt.Horizontal)
+        self._skill_split.setObjectName("HubSplitter")
+        self._skill_split.setChildrenCollapsible(True)
+
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(4)
         self._skill_list = QListWidget()
+        self._skill_list.setObjectName("HubList")
+        self._skill_list.setWordWrap(False)
         self._skill_list.itemDoubleClicked.connect(self._edit_skill_item)
-        lay.addWidget(self._skill_list, 1)
+        self._skill_list.currentItemChanged.connect(
+            lambda cur, _prev: self._on_skill_selected(cur))
+        left_lay.addWidget(self._skill_list, 1)
+        self._skill_split.addWidget(left)
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(4)
+        self._skill_detail = QPlainTextEdit()
+        self._skill_detail.setObjectName("HubDetail")
+        self._skill_detail.setReadOnly(True)
+        self._skill_detail.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._skill_detail.setPlaceholderText("选中左侧技能查看详情")
+        right_lay.addWidget(self._skill_detail, 1)
+        det_row = QHBoxLayout()
+        det_row.setSpacing(4)
+        b_mount = QPushButton("挂载")
+        b_mount.setObjectName("MiniBtn")
+        b_mount.setToolTip("挂载到当前任务（之后每条消息带上 mounted_skills）")
+        b_mount.clicked.connect(lambda _c=False: self._mount_selected_skill())
+        b_export = QPushButton("导出 zip")
+        b_export.setObjectName("MiniBtn")
+        b_export.clicked.connect(lambda _c=False: self._export_skill())
+        b_del = QPushButton("删除")
+        b_del.setObjectName("MiniBtn")
+        b_del.clicked.connect(lambda _c=False: self._delete_skill())
+        for b in (b_mount, b_export, b_del):
+            det_row.addWidget(b)
+        det_row.addStretch(1)
+        right_lay.addLayout(det_row)
+        self._skill_split.addWidget(right)
+        # 62% / 38%（PRD §5.2）
+        self._skill_split.setStretchFactor(0, 62)
+        self._skill_split.setStretchFactor(1, 38)
+        self._skill_split.setSizes([620, 380])
+        lay.addWidget(self._skill_split, 1)
+
+        # ---- 按钮行 ----
         row1 = QHBoxLayout()
+        row1.setSpacing(4)
         b_new = QPushButton("新建")
         b_new.clicked.connect(self._new_skill)
         b_edit = QPushButton("编辑")
         b_edit.clicked.connect(
-            lambda: self._edit_skill_item(self._skill_list.currentItem()))
-        b_del = QPushButton("删除")
-        b_del.clicked.connect(self._delete_skill)
-        for b in (b_new, b_edit, b_del):
+            lambda: self._edit_skill_item(self._skill_list.currentItem()
+                                          if self._skill_list is not None else None))
+        b_import = QPushButton("导入 zip")
+        b_import.clicked.connect(self._import_skill)
+        b_dir = QPushButton("从文件夹导入")
+        b_dir.setToolTip("选中含 SKILL.md 的文件夹")
+        b_dir.clicked.connect(lambda _c=False: self._import_skill_from_dir())
+        b_url = QPushButton("粘贴 URL")
+        b_url.setToolTip("GitHub / Gitee 的 SKILL.md 直链")
+        b_url.clicked.connect(lambda _c=False: self._install_skill_from_url())
+        for b in (b_new, b_edit, b_import, b_dir, b_url):
             row1.addWidget(b)
         row1.addStretch(1)
         lay.addLayout(row1)
-        row2 = QHBoxLayout()
-        b_import = QPushButton("导入 zip")
-        b_import.clicked.connect(self._import_skill)
-        b_export = QPushButton("导出 zip")
-        b_export.clicked.connect(self._export_skill)
-        row2.addWidget(b_import)
-        row2.addWidget(b_export)
-        row2.addStretch(1)
-        lay.addLayout(row2)
+
+        # ---- 在线区：提示条 + 仓库列表（首屏先渲染缓存，不阻塞）----
+        self._skill_online_banner = QLabel("")
+        self._skill_online_banner.setObjectName("PageSubtitle")
+        self._skill_online_banner.setWordWrap(True)
+        self._skill_online_banner.setVisible(False)
+        lay.addWidget(self._skill_online_banner)
+        self._skill_online_list = QListWidget()
+        self._skill_online_list.setObjectName("HubList")
+        self._skill_online_list.setWordWrap(False)
+        self._skill_online_list.setMaximumHeight(140)
+        self._skill_online_list.itemDoubleClicked.connect(
+            lambda it: self._open_online_repo(it))
+        self._skill_online_list.setVisible(False)
+        lay.addWidget(self._skill_online_list)
+        self._skill_online_btn = QPushButton("🔍 浏览在线技能目录")
+        self._skill_online_btn.setObjectName("MiniBtn")
+        self._skill_online_btn.setToolTip(
+            "GitHub topic:claude-skills 仓库列表（双击仓库枚举其中的 SKILL.md）")
+        self._skill_online_btn.clicked.connect(
+            lambda _c=False: self._toggle_online_skills())
+        lay.addWidget(self._skill_online_btn)
         return w
 
+    def _toggle_online_skills(self) -> None:
+        """展开/收起在线技能仓库列表（展开时立即拉缓存 + 后台刷新）。"""
+        lst = getattr(self, "_skill_online_list", None)
+        if lst is None:
+            return
+        show = not lst.isVisibleTo(self)
+        lst.setVisible(show)
+        btn = getattr(self, "_skill_online_btn", None)
+        if btn is not None:
+            btn.setText("⇱ 收起在线技能目录" if show else "🔍 浏览在线技能目录")
+        if show:
+            self._load_online_catalog(force=False)
+
+    def _open_online_repo(self, item) -> None:
+        """双击在线仓库 → 枚举它的技能（GET /catalog/skills/{owner}/{repo}）。"""
+        repo = (item.data(Qt.UserRole) if item is not None else None) or {}
+        full = str(repo.get("full_name") or "")
+        if "/" not in full:
+            return
+        owner, name = full.split("/", 1)
+        ref = str(repo.get("default_branch") or "")
+        self._set_status(f"正在枚举 {full} 里的技能…")
+        w = Worker(self._assist.catalog_repo_skills, owner, name, ref, False)
+        w.result.connect(lambda res, r=repo: self._on_repo_skills(res, r))
+        w.error.connect(lambda m: self._set_status(f"枚举仓库失败：{m}"))
+        w.start()
+
+    def _on_repo_skills(self, res: Any, repo: Dict[str, Any]) -> None:
+        items = (res or {}).get("items") if isinstance(res, dict) else None
+        if not items:
+            self._set_status("该仓库里没有找到 SKILL.md")
+            return
+        full = str(repo.get("full_name") or "")
+        ref = str(repo.get("default_branch") or "")
+        stars = int(repo.get("stars") or 0)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            slug = str(it.get("slug") or "")
+            ok = self._confirm_install_skill(
+                repo=full, ref=ref, dirpath=str(it.get("dir") or ""),
+                slug=slug, stars=stars,
+                files=list(it.get("files") or []),
+                has_scripts=bool(it.get("has_scripts")),
+                description=str(it.get("description") or ""))
+            if not ok:
+                continue
+            self._set_status(f"正在安装技能 {slug}…")
+            w = Worker(self._assist.catalog_install_skill, full, ref,
+                       str(it.get("dir") or ""), slug, False)
+            w.result.connect(self._on_installed_online_skill)
+            w.error.connect(lambda m, s=slug: self._on_install_failed(m, s))
+            w.start()
+
+    def _on_installed_online_skill(self, res: Any) -> None:
+        slug = (res or {}).get("slug") if isinstance(res, dict) else ""
+        self.refresh()
+        self._set_status(f"已安装技能：{slug or '（未知）'}")
+        self._auto_refresh_manager_lists()
+
+    def _confirm_install_skill(self, repo: str, ref: str, dirpath: str,
+                               slug: str, stars: int, files: List[str],
+                               has_scripts: bool, description: str) -> bool:
+        """在线技能安装确认框（P0-7 强制项：来源 / ⭐ / 文件数 / 脚本警示 / 风险）。"""
+        lines = [
+            f"来源：{repo}" + (f" · {dirpath}" if dirpath else ""),
+            f"标识：{slug}",
+            f"⭐ star：{stars}",
+            f"文件数：{len(files)}" + (f"（{'、'.join(files[:6])}…）"
+                                      if len(files) > 6 else
+                                      (f"（{'、'.join(files)}）" if files else "")),
+            "风险等级：medium（技能正文只会作为提示词，但可能引导模型调用高危工具）",
+        ]
+        if description:
+            lines.insert(2, f"说明：{description}")
+        if has_scripts:
+            lines.append("")
+            lines.append("⚠ 该技能包含 scripts/ 或可执行文件，运行时有额外风险。")
+        lines.append("")
+        lines.append("安装只会落文件，不会自动执行任何下载到的脚本。")
+        ans = QMessageBox.question(
+            self._dialog_parent(), "从在线来源安装",
+            "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return ans == QMessageBox.StandardButton.Yes
+
+    def _confirm_install_mcp(self, item: Dict[str, Any],
+                             suggest: Dict[str, Any]) -> bool:
+        """在线 MCP 安装确认框（含传输 / 是否需密钥 / 风险=high）。"""
+        required = [str(e.get("name")) for e in
+                    (suggest.get("required_env") or []) if isinstance(e, dict)]
+        transport = str(suggest.get("transport") or item.get("transport") or "stdio")
+        lines = [
+            f"来源：Registry {item.get('registry_name') or ''}",
+            f"名称：{item.get('title') or item.get('name') or ''}",
+            f"版本：{item.get('version') or '（未标注）'}",
+            f"传输：{'远程 HTTP' if transport == 'http' else '本地子进程（stdio）'}",
+            f"是否需密钥：{'需要（' + '、'.join(required) + '）' if required else '不需要'}",
+            "风险等级：high（本地子进程 = 任意代码执行，运行时逐次审批）",
+        ]
+        ans = QMessageBox.question(
+            self._dialog_parent(), "从在线来源安装 MCP",
+            "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return ans == QMessageBox.StandardButton.Yes
+
+    def _mount_selected_skill(self) -> None:
+        item = self._skill_list.currentItem() if self._skill_list is not None else None
+        slug = item.data(Qt.UserRole) if item is not None else None
+        if slug:
+            self._add_skill(str(slug))
+
+    def _on_skill_selected(self, item) -> None:
+        """选中技能 → 右侧详情面板纯文本渲染（不做 Markdown 预览）。"""
+        det = getattr(self, "_skill_detail", None)
+        if det is None:
+            return
+        slug = item.data(Qt.UserRole) if item is not None else None
+        if not slug or not isinstance(slug, str) or slug.startswith("（"):
+            det.setPlainText("")
+            return
+        cached = getattr(self, "_skill_bodies", {}).get(slug)
+        if cached is not None:
+            det.setPlainText(cached)
+            return
+        det.setPlainText("正在加载…")
+        w = Worker(self._assist.skill, slug)
+        w.result.connect(lambda data, s=slug: self._apply_skill_detail(s, data))
+        w.error.connect(lambda m: det.setPlainText(f"加载失败：{m}"))
+        w.start()
+
+    def _apply_skill_detail(self, slug: str, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        meta = data.get("meta") or {}
+        src = (self._state.get("skill_sources") or {}).get(slug) or {}
+        files = data.get("files") or []
+        lines = [
+            str(meta.get("name") or slug),
+            "─" * 24,
+            f"标识：{slug}",
+            f"版本：{meta.get('version') or '1.0.0'}",
+            f"来源：{'内置' if src.get('builtin') else (src.get('repo') or '本地')}",
+            f"允许工具：{'、'.join(meta.get('tools') or []) or '（未限制）'}",
+            f"文件：{'、'.join(str(f) for f in files) or 'SKILL.md'}",
+            "",
+            "描述：",
+            str(meta.get("description") or "（无）"),
+            "",
+            "正文预览（前 400 字）：",
+            str(data.get("body") or "")[:400],
+        ]
+        text = "\n".join(lines)
+        if not hasattr(self, "_skill_bodies"):
+            self._skill_bodies: Dict[str, str] = {}
+        self._skill_bodies[slug] = text
+        det = getattr(self, "_skill_detail", None)
+        if det is not None and (self._skill_list.currentItem() is not None) and \
+                self._skill_list.currentItem().data(Qt.UserRole) == slug:
+            det.setPlainText(text)
+
     def _build_tools_tab(self) -> QWidget:
+        """工具 Tab（P0-5）：顶部常驻「当前下发 N / 上限 M」+ 行内 QCheckBox 开关。
+
+        行内开关用 `setItemWidget(item, QCheckBox)`，勾选变化即 PUT /tools/prefs；
+        关闭高危 / 技能类工具要二次确认（`_tool_needs_confirm`）。
+        `_tool_list` 属性名保持不变（既有测试 `:609` 依赖 `count()`）。
+        """
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self._tool_count_lbl = QLabel("当前下发 0 / 上限 24")
+        self._tool_count_lbl.setObjectName("HubHeadCount")
+        head.addWidget(self._tool_count_lbl)
+        head.addStretch(1)
+        b_refresh = QPushButton("⟳ 刷新")
+        b_refresh.setObjectName("MiniBtn")
+        b_refresh.clicked.connect(lambda _c=False: self._load_tool_prefs())
+        head.addWidget(b_refresh)
+        lay.addLayout(head)
+
+        lay.addWidget(self._hint(
+            "只读工具自动执行；写入 / 高危按底栏的审批策略处理。"
+            "超出上限的工具会标灰不下发给模型。"))
+
         self._tool_list = QListWidget()
+        self._tool_list.setObjectName("HubList")
         lay.addWidget(self._tool_list, 1)
-        lay.addWidget(self._hint("只读工具自动执行；写入 / 高危按底栏的审批策略处理"))
+
+        #: 行内开关：工具名 → QCheckBox（`_fill_tools` 重建，测试断言用）
+        self._tool_checks: Dict[str, Any] = {}
         return w
 
+    def _load_tool_prefs(self) -> None:
+        """GET /tools/prefs → 更新顶部计数与列表开关态。"""
+        w = Worker(self._assist.tool_prefs)
+        w.result.connect(self._apply_tool_prefs)
+        w.error.connect(lambda m: self._set_status(f"读取工具偏好失败：{m}"))
+        w.start()
+
+    def _apply_tool_prefs(self, data: Any) -> None:
+        if isinstance(data, dict) and data:
+            self._tool_prefs = dict(data)
+        self._fill_tools(self._state.get("tools") or [])
+
+    def _load_profiles(self) -> None:
+        """GET /profiles → `_profiles`（auto_load 开关 + 3 个内置 profile）。"""
+        w = Worker(self._assist.profiles)
+        w.result.connect(self._apply_profiles)
+        w.error.connect(lambda m: None)      # 非关键路径：失败就按默认「开」处理
+        w.start()
+
+    def _apply_profiles(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        self._profiles = dict(data)
+        if self._profiles.get("auto_load") is False:
+            self._auto_off = True
+
     def _build_mcp_tab(self) -> QWidget:
+        """MCP Tab（P0-3）：在线清单安装入口 + 手动添加 + 连接/断开 + 删除。
+
+        `_mcp_list` 属性名保持不变（既有测试依赖）。
+        """
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
         lay.addWidget(self._hint(
             "连接成功后，MCP 工具自动以 mcp__<标识>__<工具> 进白名单，审批规则同上。"))
+
+        head = QHBoxLayout()
+        head.setSpacing(4)
+        self._mcp_count_lbl = QLabel("已配置 0 台 · 已连接 0 台")
+        self._mcp_count_lbl.setObjectName("HubHeadCount")
+        head.addWidget(self._mcp_count_lbl)
+        head.addStretch(1)
+        lay.addLayout(head)
+
         self._mcp_list = QListWidget()
+        self._mcp_list.setObjectName("HubList")
         lay.addWidget(self._mcp_list, 1)
+
+        # ---- 在线区（默认收起，点「从在线清单安装」展开）----
+        self._mcp_online_banner = QLabel("")
+        self._mcp_online_banner.setObjectName("PageSubtitle")
+        self._mcp_online_banner.setWordWrap(True)
+        self._mcp_online_banner.setVisible(False)
+        lay.addWidget(self._mcp_online_banner)
+        self._mcp_online_list = QListWidget()
+        self._mcp_online_list.setObjectName("HubList")
+        self._mcp_online_list.setWordWrap(False)
+        self._mcp_online_list.setMaximumHeight(180)
+        self._mcp_online_list.itemDoubleClicked.connect(
+            lambda it: self._install_online_mcp(it))
+        self._mcp_online_list.setVisible(False)
+        lay.addWidget(self._mcp_online_list)
+        self._mcp_online_btn = QPushButton("🔍 从在线清单安装 MCP…")
+        self._mcp_online_btn.setObjectName("MiniBtn")
+        self._mcp_online_btn.setToolTip(
+            "官方 MCP Registry：搜索并自动生成 npx / http 配置（风险默认 high）")
+        self._mcp_online_btn.clicked.connect(
+            lambda _c=False: self._toggle_online_mcp())
+        lay.addWidget(self._mcp_online_btn)
+
         row = QHBoxLayout()
-        b_add = QPushButton("添加")
+        row.setSpacing(4)
+        b_add = QPushButton("手动添加")
+        b_add.setToolTip("手填命令 / 参数 / URL / 风险（stdio / http）")
         b_add.clicked.connect(self._add_mcp)
+        b_json = QPushButton("粘贴 JSON")
+        b_json.setToolTip("粘贴 Claude Desktop 的 mcpServers 片段")
+        b_json.clicked.connect(lambda _c=False: self._paste_mcp_json())
         b_conn = QPushButton("连接/断开")
         b_conn.clicked.connect(self._toggle_mcp)
         b_rm = QPushButton("删除")
         b_rm.clicked.connect(self._delete_mcp)
-        for b in (b_add, b_conn, b_rm):
+        for b in (b_add, b_json, b_conn, b_rm):
             row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
         return w
+
+    def _toggle_online_mcp(self) -> None:
+        """展开/收起在线 MCP 列表（展开时拉缓存 + 后台刷新）。"""
+        lst = getattr(self, "_mcp_online_list", None)
+        if lst is None:
+            return
+        show = not lst.isVisibleTo(self)
+        lst.setVisible(show)
+        btn = getattr(self, "_mcp_online_btn", None)
+        if btn is not None:
+            btn.setText("⇱ 收起在线目录" if show else "🔍 从在线清单安装 MCP…")
+        if show:
+            self._load_online_catalog(force=False)
+
+    def _install_online_mcp(self, item) -> None:
+        """双击在线 MCP 条目 → 确认框 → POST /catalog/mcp/install。"""
+        it = (item.data(Qt.UserRole) if item is not None else None) or {}
+        suggest = it.get("suggest") or {}
+        if not isinstance(suggest, dict):
+            suggest = {}
+        if str(it.get("free_class") or "") == "unknown":
+            QMessageBox.information(
+                self._dialog_parent(), "无法安装",
+                "该条目在 Registry 里只登记了元数据（没有 packages / remotes），"
+                "无法自动生成配置。可点「查看源」到上游看手动配置。")
+            return
+        required = [e for e in (suggest.get("required_env") or [])
+                    if isinstance(e, dict) and e.get("name")]
+        env: Dict[str, str] = {}
+        if required:
+            # 必填环境变量逐项收集；缺一项不允许安装（2024 的客户端前置）
+            for e in required:
+                name = str(e.get("name"))
+                val, ok = QInputDialog.getText(
+                    self._dialog_parent(), "填写环境变量",
+                    f"{name}（{e.get('description') or '必填'}）：",
+                    QLineEdit.EchoMode.Normal, "")
+                if not ok or not (val or "").strip():
+                    QMessageBox.warning(self._dialog_parent(), "缺少必填变量",
+                                        f"该服务器需要 {name}，请填写后再安装。")
+                    return
+                env[name] = str(val).strip()
+        if not self._confirm_install_mcp(it, suggest):
+            return
+        reg = str(it.get("registry_name") or "")
+        self._set_status(f"正在安装 MCP：{it.get('title') or reg}…")
+        w = Worker(self._assist.catalog_install_mcp, reg, "", "", env, "",
+                   True)
+        w.result.connect(self._on_installed_online_mcp)
+        w.error.connect(lambda m, r=reg: self._on_install_failed(m, r))
+        w.start()
+
+    def _on_installed_online_mcp(self, res: Any) -> None:
+        res = res if isinstance(res, dict) else {}
+        err = res.get("error")
+        self.refresh()
+        self._auto_refresh_manager_lists()
+        if err:
+            self._set_status(f"已保存配置但连接失败：{str(err)[:120]}")
+            QMessageBox.warning(
+                self._dialog_parent(), "MCP 连接失败",
+                f"已保存配置但连接失败：\n{err}\n\n"
+                "可检查 npx 是否可用、环境变量是否完整；配置已保留，可在列表里改。")
+        else:
+            self._set_status(
+                f"已安装 MCP：{(res.get('server') or {}).get('name') or ''}")
+        if isinstance(self._tool_prefs, dict):
+            self._apply_tool_prefs(self._tool_prefs)
 
     def _build_audit_tab(self) -> QWidget:
         w = QWidget()
@@ -1396,6 +2161,12 @@ class AssistantPage(QWidget):
         self._fill_tools(st.get("tools") or [])
         self._fill_mcp(st.get("mcp") or [])
         self._fill_sessions()
+        # 1.0.8：工具偏好与 profile（后端可能已回填在 state，也可能要走专端点）。
+        # 走专端点是为了拿到 `active` / `over` 这类只有后端能算准的字段。
+        if not self._tool_prefs:
+            self._load_tool_prefs()
+        if not self._profiles:
+            self._load_profiles()
 
         # 首次进入不要无脑新建：先复用最近一个「0 条消息」的任务。
         # 否则每启动一次就多一个空任务，左栏「任务 / 空间」两区很快被刷满。
@@ -1415,22 +2186,31 @@ class AssistantPage(QWidget):
         self._status.setVisible(bool((text or "").strip()))
 
     # ---------------- 底栏按钮文本 ----------------
+    WS_LABEL_MAX = 4            # 宽度压缩规则 ①：12 → 4 字（完整路径进 tooltip）
+
     def _refresh_ws_btn(self, ws: str = "") -> None:
-        """工作区按钮显示目录名（WorkBuddy 的「分支 master」位：当前上下文根）。"""
+        """工作区按钮显示目录名（WorkBuddy 的「分支 master」位：当前上下文根）。
+
+        宽度压缩规则 ①：逻辑 720 宽下底栏只有 504px 可用，目录名按 12 字显示
+        会把整条底栏顶出屏幕（架构 §5.4 求和：`_ws_btn` 107 → 58）。
+        文案压到 ≤4 字，完整路径与目录全名都放 tooltip，信息不丢。
+        """
         path = (ws or str(self._state.get("workspace") or "")
                 or str(getattr(self.config, "assistant_workspace", "") or ""))
         name = os.path.basename(path.rstrip("\\/")) if path else ""
-        if len(name) > 12:
-            name = name[:11] + "…"
-        self._ws_btn.setText(name or "工作区")
+        full = name or "工作区"
+        self._ws_btn.setText(_ellipsis(name, self.WS_LABEL_MAX) if name else "工作区")
         self._ws_btn.setToolTip(
-            f"文件工具可访问的工作区：\n{path or '（未设置）'}\n（点击切换）")
+            f"文件工具可访问的工作区：{full}\n{path or '（未设置）'}\n（点击切换）")
 
     def _refresh_policy_btn(self) -> None:
         pid = str(self._state.get("policy") or "readonly_auto")
         label = next((lb for p, lb, _t in POLICY_ITEMS if p == pid), pid)
         tip = next((t for p, _lb, t in POLICY_ITEMS if p == pid), "")
-        self._policy_btn.setText(f"{POLICY_ICON.get(pid, '⊘')} {label}")
+        # 宽度压缩：底栏只有 504px，「⊘ 只读自动」(80px) 太宽。
+        # 按钮上只显示策略短名（≤2 字），完整说明留在 tooltip。
+        short = POLICY_SHORT.get(pid, label)
+        self._policy_btn.setText(f"{POLICY_ICON.get(pid, '⊘')} {short}")
         self._policy_btn.setToolTip(f"审批策略：{label}\n{tip}\n（点击切换）")
 
     def _skill_icon(self) -> QIcon:
@@ -1459,18 +2239,26 @@ class AssistantPage(QWidget):
         p.end()
         return QIcon(pm)
 
+    MODEL_LABEL_MAX = 8         # 宽度压缩规则 ②：26 → 8 字（全名进 tooltip）
+    #: 规则②的硬上限：8 字 + 「 ▾」在 200% 缩放下实测 ≤96px，留到 100px。
+    #: 不能再大：忙碌态底栏 439 + 56 = 495 ≤ 504 是架构 §4 的定案。
+    MODEL_BTN_MAX = 100
+
     def _refresh_model_btn(self) -> None:
+        """模型按钮只显短名（宽度压缩规则 ②：90 → 66px），全名进 tooltip。"""
         names = self._model_cache.get(self._active_provider) or []
         model = self._active_model or (names[0] if names else "")
         provider = next((p for p in (self._state.get("providers") or [])
                          if p.get("id") == self._active_provider), {})
         plabel = provider.get("label") or self._active_provider or "模型"
-        text = model or "选择模型"
-        if len(text) > 26:
-            text = text[:25] + "…"
-        self._model_btn.setText(f"{text}   ▾")
+        text = _ellipsis(model, self.MODEL_LABEL_MAX) if model else "选择模型"
+        self._model_btn.setText(f"{text} ▾")
+        # 规则②的硬保障：不同平台 fontMetrics + 全局 QSS padding 会把按钮撑到
+        # 130px+，直接顶爆底栏 504px 门禁。钉死上限，超出部分进 tooltip。
+        self._model_btn.setMaximumWidth(self.MODEL_BTN_MAX)
         self._model_btn.setToolTip(
             f"当前：{plabel} · {model or '（默认）'}\n"
+            f"端点：{provider.get('base_url') or '（本机）'}\n"
             "点击切换来源 / 模型，或配置密钥与端点")
 
     # ---------------- 模型清单 ----------------
@@ -1521,47 +2309,154 @@ class AssistantPage(QWidget):
         self._refresh_model_btn()
 
     # ---------------- 二级栏目 / 管理面板填充 ----------------
+    def _skill_source_of(self, s: Dict[str, Any]) -> str:
+        """技能来源：builtin（内置）/ online（在线装过）/ local（本地手写）。"""
+        slug = str(s.get("slug") or "")
+        if s.get("builtin") or slug in ("workspace-organizer", "repo-digest",
+                                        "web-brief"):
+            return "builtin"
+        src = (self._state.get("skill_sources") or {}).get(slug) or {}
+        if src.get("kind") in ("github", "url"):
+            return "online"
+        return "local"
+
+    def _filtered_skills(self, skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """搜索（name/description）+ 来源筛选 + 排序（PRD §5.2 三件套）。"""
+        rows = [s for s in skills if isinstance(s, dict)]
+        q = ""
+        if getattr(self, "_skill_search", None) is not None:
+            q = (self._skill_search.text() or "").strip().lower()
+        if q:
+            rows = [s for s in rows
+                    if q in str(s.get("name") or "").lower()
+                    or q in str(s.get("description") or "").lower()
+                    or q in str(s.get("slug") or "").lower()]
+        src_val = "all"
+        if getattr(self, "_skill_source", None) is not None:
+            src_val = str(self._skill_source.currentData() or "all")
+        if src_val != "all":
+            rows = [s for s in rows if self._skill_source_of(s) == src_val]
+        sort_val = "default"
+        if getattr(self, "_skill_sort", None) is not None:
+            sort_val = str(self._skill_sort.currentData() or "default")
+        if sort_val == "name":
+            rows.sort(key=lambda s: str(s.get("name") or s.get("slug") or "").lower())
+        elif sort_val == "stars":
+            def stars(s):
+                slug = str(s.get("slug") or "")
+                src = (self._state.get("skill_sources") or {}).get(slug) or {}
+                return -int(src.get("stars") or 0)
+            rows.sort(key=stars)
+        return rows
+
     def _fill_skills(self, skills: List[Dict[str, Any]]) -> None:
+        """技能列表：两行文本（`名称 · vX.Y` + 描述）+ 前置来源标识（PRD §5.2）。"""
         lst = getattr(self, "_skill_list", None)
         if lst is None:
             return
+        rows = self._filtered_skills(skills)
+        keep = ""
+        cur = lst.currentItem()
+        if cur is not None and cur.data(Qt.UserRole):
+            keep = str(cur.data(Qt.UserRole))
+        lst.blockSignals(True)
         lst.clear()
-        for s in skills:
-            item = QListWidgetItem(f"{s.get('name')}   ·  {len(s.get('tools') or [])} 工具")
-            item.setData(Qt.UserRole, s.get("slug"))
-            item.setToolTip(s.get("description") or "")
+        for s in rows:
+            slug = str(s.get("slug") or "")
+            name = s.get("name") or slug
+            ver = str(s.get("version") or "1.0.0")
+            badge = {"builtin": "[内置]", "online": "[在线]",
+                     "local": "[已装]"}.get(self._skill_source_of(s), "[已装]")
+            desc = str(s.get("description") or "").strip() or "（无描述）"
+            item = QListWidgetItem(f"{badge} {name} · v{ver}\n{desc}")
+            item.setData(Qt.UserRole, slug)
+            item.setToolTip(f"{name}\n{desc}\n来源：{badge}\n"
+                            f"工具：{'、'.join(s.get('tools') or []) or '（未限制）'}")
             lst.addItem(item)
-        if not skills:
-            lst.addItem("（暂无技能，点「新建」或「导入 zip」）")
+            if slug and slug == keep:
+                lst.setCurrentItem(item)
+        if not rows:
+            hint = ("（没有匹配的技能：清空搜索或改来源筛选）" if (skills and rows != skills)
+                    else "（暂无技能：点下面「从文件夹导入」/「粘贴 URL」，"
+                         "或展开在线技能目录）")
+            lst.addItem(QListWidgetItem(hint))
+        lst.blockSignals(False)
 
     def _fill_tools(self, tools: List[Dict[str, Any]]) -> None:
+        """工具 Tab：行内 QCheckBox 开关（读 `enabled`）+ 顶部下发计数（P0-5）。"""
         lst = getattr(self, "_tool_list", None)
         if lst is None:
             return
+        snap = self._tool_prefs_snapshot()
+        lbl = getattr(self, "_tool_count_lbl", None)
+        if lbl is not None:
+            lbl.setText(f"当前下发 {snap['active']} / 上限 {snap['max_tools']} 个"
+                        + (f"（{len(snap['over'])} 个超出上限未下发）"
+                           if snap["over"] else ""))
+        over = set(snap["over"])
+        disabled = set(snap["disabled"])
         lst.clear()
+        self._tool_checks = {}
         for t in tools:
-            risk = RISK_TEXT.get(t.get("risk"), t.get("risk"))
+            if not isinstance(t, dict):
+                continue
+            name = str(t.get("name") or "")
+            risk = RISK_TEXT.get(t.get("risk"), t.get("risk") or "")
             src = t.get("source") or "builtin"
-            item = QListWidgetItem(f"[{risk}] {t.get('name')}   · {src}")
-            item.setToolTip(t.get("description") or "")
+            enabled = name not in disabled and bool(t.get("enabled", True))
+            item = QListWidgetItem()
+            item.setToolTip(str(t.get("description") or ""))
             lst.addItem(item)
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(4, 2, 4, 2)
+            row_lay.setSpacing(6)
+            cb = QCheckBox()
+            cb.setChecked(enabled)
+            cb.setToolTip(f"启用 / 禁用「{name}」（禁用后不下发给模型）")
+            cb.toggled.connect(lambda on, n=name: self._toggle_tool(n, on))
+            row_lay.addWidget(cb)
+            text = QLabel(f"{name}   {risk}   {src}")
+            text.setObjectName("HubToolName")
+            if name in over:
+                text.setToolTip("超出上限未下发（提高上限或在工具清单里调整顺序）")
+                text.setObjectName("HubToolNameDim")
+            row_lay.addWidget(text, 1)
+            if name in over:
+                tag = QLabel("超出上限")
+                tag.setObjectName("HubToolDim")
+                row_lay.addWidget(tag)
+            lst.setItemWidget(item, row)
+            self._tool_checks[name] = cb
+            item.setSizeHint(QSize(0, 24))
+        if not tools:
+            lst.addItem(QListWidgetItem("（暂无工具）"))
 
     def _fill_mcp(self, servers: List[Dict[str, Any]]) -> None:
+        """MCP 列表：`● 名称 · 传输 · N 工具`（属性名 `_mcp_list` 保持不变）。"""
         lst = getattr(self, "_mcp_list", None)
         if lst is None:
             return
+        lbl = getattr(self, "_mcp_count_lbl", None)
+        if lbl is not None:
+            n_conn = len([s for s in servers
+                          if isinstance(s, dict) and s.get("status") == "connected"])
+            lbl.setText(f"已配置 {len(servers)} 台 · 已连接 {n_conn} 台")
         lst.clear()
         for s in servers:
-            mark = {"connected": "●", "error": "×"}.get(s.get("status"), "○")
+            if not isinstance(s, dict):
+                continue
+            mark = {"connected": "●", "error": "×"}.get(str(s.get("status")), "○")
             item = QListWidgetItem(
                 f"{mark} {s.get('name')}  · {s.get('transport')} · "
                 f"{s.get('tool_count', 0)} 工具")
             item.setData(Qt.UserRole, s.get("id"))
             if s.get("error"):
-                item.setToolTip(s["error"])
+                item.setToolTip(str(s["error"]))
             lst.addItem(item)
         if not servers:
-            lst.addItem("（未配置 MCP 服务器）")
+            lst.addItem(QListWidgetItem(
+                "（未配置 MCP 服务器：点「🔍 从在线清单安装 MCP…」或「手动添加」）"))
 
     def _fill_sessions(self) -> None:
         w = Worker(self._assist.sessions)
@@ -1703,9 +2598,10 @@ class AssistantPage(QWidget):
         text = self._input.toPlainText().strip()
         if not text:
             return
-        if self._busy:
-            # 1.0.9 修复：忙碌态不再丢弃消息，进入输入框上方队列，
-            # 本轮结束按序自动消费（不打断当前生成）
+        slots = self._available_send_slots()
+        if slots <= 0:
+            # 1.0.8：后端按队列模型串行处理（同一时刻只有 1 个活跃流），
+            # 所以忙碌态 Enter 一律走「排队」，不再丢弃消息（1.0.9 行为保持）
             self._enqueue_message(text, guided=False)
             return
         if not self._session_id:
@@ -1714,6 +2610,14 @@ class AssistantPage(QWidget):
             w.start()
             return
         self._send_with_session({"id": self._session_id}, text)
+
+    def _available_send_slots(self) -> int:
+        """当前还能并发起几条对话流：忙碌中 0，空闲 1。
+
+        抽成方法便于测试断言「忙碌态 = 0 槽 → 一定入队」，也便于将来后端
+        支持并行流时只改这一处。
+        """
+        return 0 if self._busy else 1
 
     def _on_guide_clicked(self) -> None:
         """⚡ / Shift+Enter：引导发送——立即登记进对话流，不中断当前轮。"""
@@ -1764,16 +2668,18 @@ class AssistantPage(QWidget):
         self._scroll_bottom(force=True)   # 用户刚发消息：一定回到底部
         self._begin_streaming()
 
-        # 技能 chip：挂载后每条消息自动带上「用 xx、yy 技能」，输入框本身保持干净
-        message = (f"用 {'、'.join(self._skill_slugs)} 技能：{text}"
-                   if self._skill_slugs else text)
+        # 1.0.8 A4：技能挂载改传 `mounted_skills` 字段，**不再拼进 message 正文**。
+        # 老实现拼「用 xx 技能：<text>」，落库后历史正文被污染（用户复制/回看
+        # 会看到前缀）；后端把挂载信息写进 system 段，历史干净、意图不丢。
         payload = {
             "session_id": self._session_id,
-            "message": message,
+            "message": text,
             "provider": self._active_provider or "",
             "model": self._active_model or "",
             "stream": True,
         }
+        if self._skill_slugs:
+            payload["mounted_skills"] = list(self._skill_slugs)
         self._stream = AssistantStream(
             self.config.gateway_url(), self.config.api_key, payload)
         self._stream.event.connect(self._on_event)
@@ -1861,6 +2767,10 @@ class AssistantPage(QWidget):
             return
         if kind == "session":
             self._session_id = ev.get("session_id") or self._session_id
+        elif kind == "start":
+            # 1.0.8 自动加载：start 事件新增 auto_loaded（架构 §7「start 事件扩展」）。
+            # 空 dict = 未命中 profile / auto_load=false → 什么都不显示。
+            self._on_auto_loaded(ev.get("auto_loaded") or {})
         elif kind == "model":
             self._set_status(f"模型：{ev.get('model')}")
         elif kind == "delta":
@@ -1965,6 +2875,63 @@ class AssistantPage(QWidget):
             elif not ev.get("error"):
                 self._set_status("就绪")
             self._approvals.clear()
+
+    # ---------------- 自动加载（1.0.8，P0-6） ----------------
+    def _on_auto_loaded(self, info: Dict[str, Any]) -> None:
+        """`start.auto_loaded` → 插入一条可关闭的 StepLine（同任务同 profile 一次）。
+
+        字段（架构接缝 S3，已定稿）：`profile` / `name` / `skills[]` / `tools`。
+        不参与模型上下文（纯 UI）：只在对话流里插一个 widget，不发回后端。
+        """
+        if not isinstance(info, dict) or not info.get("profile"):
+            return
+        profile = str(info.get("profile") or "")
+        if self._auto_off:
+            # 本会话已点过「关闭自动加载」：后端可能还在同一轮里回旧值，
+            # 客户端立即失效，不再提示（PRD §5.4.3 第 1 条）
+            return
+        key = (str(self._session_id or ""), profile)
+        if key in self._auto_tips:
+            return                    # 同一任务同一 profile 只提示一次
+        self._auto_tips.add(key)
+        skills = [str(s) for s in (info.get("skills") or []) if s]
+        n_tools = int(info.get("tools") or 0)
+        name = str(info.get("name") or profile)
+        parts = [f"已自动加载：{name}"]
+        if skills:
+            parts.append("技能 " + " · ".join(skills))
+        if n_tools:
+            parts.append(f"工具 {n_tools} 个")
+        # 「运行时会请求你确认」让用户在弹审批卡前有预期（架构 §7 体验缓解）
+        text = " · ".join(parts) + "（运行时会请求你确认）"
+        self._add_step_with_action(text, "关闭自动加载", self._disable_auto_load)
+
+    def _auto_load_on(self) -> bool:
+        """自动加载是否开启（本会话 _auto_off 优先，其次 GET /profiles 快照）。"""
+        if self._auto_off:
+            return False
+        if "auto_load" in (self._profiles or {}):
+            return bool(self._profiles.get("auto_load"))
+        return True                   # 默认开（PRD §5.4.2 / config 默认 true）
+
+    def _disable_auto_load(self) -> None:
+        """点「关闭自动加载」→ PUT /profiles {auto_load:false} + 本会话立即失效。"""
+        self._auto_off = True
+        self._profiles = {**(self._profiles or {}), "auto_load": False}
+        self._set_status("已关闭自动加载（可在 [技能] 菜单里重新打开）")
+        w = Worker(self._assist.save_profiles, False, None)
+        w.error.connect(lambda m: self._set_status(f"关闭自动加载失败：{m}"))
+        w.start()
+
+    def _set_auto_load(self, on: bool) -> None:
+        """[技能] 菜单里的「自动加载：开 / 关」切换（PRD §5.4.3 第 3 条）。"""
+        self._auto_off = not on
+        self._profiles = {**(self._profiles or {}), "auto_load": bool(on)}
+        self._set_status("已开启自动加载" if on
+                         else "已关闭自动加载（可在设置里重新打开）")
+        w = Worker(self._assist.save_profiles, bool(on), None)
+        w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
+        w.start()
 
     # ---------------- 引导会话队列（1.0.9） ----------------
     def _add_guided_bubble(self, ev: Dict[str, Any]) -> None:
@@ -2163,6 +3130,20 @@ class AssistantPage(QWidget):
         self._append_widget(StepLine(text, error=error))
         self._scroll_bottom()
 
+    def _add_step_with_action(self, text: str, action_label: str, on_action,
+                              error: bool = False) -> AutoLoadPrompt:
+        """带一个动作按钮的 StepLine 行（1.0.8 自动加载提示用）。
+
+        **不改造 `StepLine`**（架构 A6）：它只有一个居中 QLabel，页面侧
+        `_add_step()` 有 5 处调用，加按钮位会破坏居中并波及那 5 处签名。
+        这里用 `AutoLoadPrompt` 组合「原 `StepLine` + `#MiniBtn` 按钮」。
+        """
+        row = AutoLoadPrompt(text, action_label, error=error)
+        row.btn.clicked.connect(lambda _c=False: on_action())
+        self._append_widget(row)
+        self._scroll_bottom()
+        return row
+
     def _append_widget(self, w: QWidget) -> None:
         self._msg_layout.insertWidget(self._msg_layout.count() - 1, w)
 
@@ -2177,6 +3158,8 @@ class AssistantPage(QWidget):
         self._tool_cards = []
         self._approvals.clear()
         self._follow = True
+        # 自动加载提示的去重表跟着对话清空（换任务重新提示一次）
+        self._auto_tips.clear()
         # 队列面板跟随任务重置（新任务的快照由 _fetch_queue 拉回）
         self._apply_queue([], False)
 
@@ -2459,7 +3442,22 @@ class AssistantPage(QWidget):
     MAX_SKILLS = 5             # 单任务同时挂载上限（对标 WorkBuddy 多技能）
 
     def _build_skill_menu(self) -> QMenu:
-        """构建技能菜单（多技能同时挂载，上限 5 个）。
+        """构建技能菜单（PRD §5.1.2）。
+
+            自动加载：开 / 关                     ← PUT /profiles
+            挂载技能 N/5                          ← 原「最多同时挂载 5 个」
+            ────
+            ☑ workspace-organizer   内置          ← hover: description + 工具数
+            ────
+            🔍 更多技能（清单中心）…
+            ＋ 从在线清单安装…
+            ＋ 从本地文件夹导入…
+            ＋ 粘贴 URL 安装…
+            ⟳ 刷新在线目录
+            ────
+            清除全部（仅挂载非空时）
+            ────
+            工具 / MCP                            ← 1.0.7 起的「四个入口」不丢
 
         鼠标悬停技能项显示详细介绍（SKILL.md 的 description + 工具数）——
         QMenu 必须开 setToolTipsVisible(True)，否则 setToolTip 不显示。
@@ -2467,20 +3465,28 @@ class AssistantPage(QWidget):
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
         menu.setToolTipsVisible(True)
-        note = menu.addAction(f"最多同时挂载 {self.MAX_SKILLS} 个")
+
+        # ---- 自动加载开关（PRD §5.4.3 第 3 条）----
+        on = self._auto_load_on()
+        auto = menu.addAction(f"自动加载：{'开' if on else '关'}")
+        auto.setToolTip("按需求自动挂载常用技能并收紧工具白名单。\n"
+                        "关闭后本轮与后续都不再自动加载（可在设置里重新打开）")
+        auto.triggered.connect(lambda _c=False: self._set_auto_load(not on))
+        menu.addSeparator()
+
+        note = menu.addAction(f"挂载技能 {len(self._skill_slugs)}/{self.MAX_SKILLS}")
         note.setEnabled(False)
+
         skills = self._state.get("skills") or []
         full = len(self._skill_slugs) >= self.MAX_SKILLS
-        if not skills:
-            act = menu.addAction("（暂无技能，去底栏 [+] → 技能 里新建或导入 zip）")
-            act.setEnabled(False)
-        else:
+        if skills:
             menu.addSeparator()
             for s in skills:
                 slug = s.get("slug") or ""
                 name = s.get("name") or slug
                 mounted = slug in self._skill_slugs
-                act = menu.addAction(name)
+                badge = self._skill_badge(s)
+                act = menu.addAction(f"{name}{badge}" if badge else name)
                 tip = str(s.get("description") or "").strip()
                 ntools = len(s.get("tools") or [])
                 if ntools:
@@ -2490,7 +3496,7 @@ class AssistantPage(QWidget):
                     tip = f"{tip}\n已挂载" if tip else "已挂载"
                 elif full:
                     tip = f"{tip}\n已挂载 {self.MAX_SKILLS} 个，先移除一个" if tip \
-                        else "已挂载 5 个，先移除一个"
+                        else f"已挂载 {self.MAX_SKILLS} 个，先移除一个"
                 act.setToolTip(tip)
                 act.setCheckable(True)
                 act.setChecked(mounted)
@@ -2502,11 +3508,46 @@ class AssistantPage(QWidget):
                         act.setEnabled(False)
                     act.triggered.connect(
                         lambda _c=False, sl=slug: self._add_skill(sl))
+
+        # ---- 添加入口：**空态也必须是这三条可点项**（PRD §5.1.2 核心）----
+        menu.addSeparator()
+        hub = menu.addAction("🔍 更多技能（清单中心）…")
+        hub.setToolTip("打开清单中心技能页（左列表 + 右详情 + 在线目录）")
+        hub.triggered.connect(lambda _c=False: self.open_manager("skills"))
+        online = menu.addAction("＋ 从在线清单安装…")
+        online.setToolTip("打开清单中心并聚焦技能搜索框")
+        online.triggered.connect(
+            lambda _c=False: self.open_manager("skills", focus=True))
+        local = menu.addAction("＋ 从本地文件夹导入…")
+        local.setToolTip("选中含 SKILL.md 的文件夹，复制进技能目录")
+        local.triggered.connect(lambda _c=False: self._import_skill_from_dir())
+        url = menu.addAction("＋ 粘贴 URL 安装…")
+        url.setToolTip("GitHub / Gitee 的 SKILL.md 直链（含 /blob/ 的网页链接会自动转 raw）")
+        url.triggered.connect(lambda _c=False: self._install_skill_from_url())
+        refresh = menu.addAction("⟳ 刷新在线目录")
+        refresh.setToolTip("三源并行刷新在线目录缓存")
+        refresh.triggered.connect(lambda _c=False: self._refresh_catalog())
+
         if self._skill_slugs:
             menu.addSeparator()
             clear = menu.addAction("清除全部")
             clear.triggered.connect(self._clear_skills)
+
+        menu.addSeparator()
+        for label, key in (("工具", "tools"), ("MCP", "mcp")):
+            act = menu.addAction(label)
+            act.triggered.connect(lambda _c=False, k=key: self.open_manager(k))
         return menu
+
+    def _skill_badge(self, s: Dict[str, Any]) -> str:
+        """技能的来源徽标：内置 `[内置]` / 在线已装 `[在线]`（PRD §5.2 前置标识）。"""
+        slug = str(s.get("slug") or "")
+        if s.get("builtin"):
+            return "  [内置]"
+        src = (self._state.get("skill_sources") or {}).get(slug) or {}
+        if src and src.get("kind"):
+            return "  [在线]"
+        return ""
 
     def _show_skill_menu(self) -> None:
         self._popup_above(self._build_skill_menu(), self._skill_btn)
@@ -2561,16 +3602,594 @@ class AssistantPage(QWidget):
             cont = getattr(self, "_skill_chip_cont", None)
             if cont is not None:
                 cont.setVisible(bool(slugs))
+        # ④ 宽度压缩：chip 建好后再判断（要量真实 sizeHint）。
+        #    ≥3 个必然折行；1~2 个若内联会顶爆 504px 也提前折到输入框上方。
+        self._reparent_skill_chips(len(slugs))
         # 占位按钮：始终保持「技能」文案，挂载数变化时切换高亮与 tooltip
         self._skill_btn.setText("技能")
         has = bool(slugs)
         tip = (f"已挂载 {len(slugs)} 个技能：" + "、".join(slugs) + "\n点击增删"
-               if slugs else "挂载技能：之后每条消息自动带上「用 xx 技能」")
+               if slugs else "挂载技能 / 添加技能（本地文件夹 · zip · URL · 在线清单）")
         self._skill_btn.setToolTip(tip)
         if bool(self._skill_btn.property("active")) != has:
             self._skill_btn.setProperty("active", has)
             self._skill_btn.style().unpolish(self._skill_btn)
             self._skill_btn.style().polish(self._skill_btn)
+
+    # ------------------------------------------------------------------ #
+    # 底栏 [工具] / [MCP] 入口（1.0.8，PRD §5.1.3 / §5.1.4）
+    # ------------------------------------------------------------------ #
+    TOOL_PRIORITY = ("fs_list", "fs_read", "fs_glob", "fs_grep", "fs_info",
+                     "skill_list", "web_fetch", "skill_run", "fs_write",
+                     "fs_edit", "fs_mkdir", "fs_move", "fs_delete", "shell_run")
+
+    def _tool_prefs_snapshot(self) -> Dict[str, Any]:
+        """当前工具下发快照：{disabled[], max_tools, total, active, over[]}。
+
+        优先用后端 GET /tools/prefs（字段最全）；没拉到时从 `/state.tools`
+        的 `enabled` 字段本地推算，保证首屏菜单不空（架构 §7「首屏先渲染」）。
+        """
+        prefs = dict(self._tool_prefs or {})
+        tools = [t for t in (self._state.get("tools") or []) if isinstance(t, dict)]
+        max_tools = int(prefs.get("max_tools") or 24)
+        disabled = prefs.get("disabled")
+        if disabled is None:
+            # 后端未回 tool_prefs：用 /state 的 enabled 反推（后端 to_dict 增了
+            # enabled 字段，架构 §3.2 tools.py list() 一节）
+            disabled = [str(t.get("name")) for t in tools if not t.get("enabled", True)]
+        total = int(prefs.get("total") or len(tools))
+        active = prefs.get("active")
+        if active is None:
+            active = max(0, min(len([t for t in tools
+                                     if str(t.get("name")) not in disabled]),
+                                max_tools))
+        over = prefs.get("over")
+        if over is None:
+            over = self._tools_over_limit(tools, disabled, max_tools)
+        return {"disabled": list(disabled), "max_tools": max_tools,
+                "total": total, "active": int(active), "over": list(over)}
+
+    def _tools_over_limit(self, tools: List[Dict[str, Any]],
+                          disabled: List[str], max_tools: int) -> List[str]:
+        """按架构 §6.2 优先级排序后，被 max_tools 裁掉（超出上限未下发）的工具名。"""
+        enabled = [t for t in tools if str(t.get("name")) not in disabled]
+
+        def rank(t: Dict[str, Any]):
+            name = str(t.get("name") or "")
+            src = str(t.get("source") or "builtin")
+            try:
+                return (0 if src == "builtin" else 1,
+                        self.TOOL_PRIORITY.index(name)
+                        if name in self.TOOL_PRIORITY else len(self.TOOL_PRIORITY),
+                        name)
+            except ValueError:      # pragma: no cover - index 已带 in 判断
+                return (1, len(self.TOOL_PRIORITY), name)
+
+        enabled.sort(key=rank)
+        return [str(t.get("name")) for t in enabled[max(0, max_tools):]]
+
+    def _tool_group_of(self, name: str) -> str:
+        """工具的归属组：`mcp__<id>__<tool>` → MCP 服务器名，否则 `builtin`。"""
+        if name.startswith("mcp__"):
+            parts = name.split("__")
+            return parts[1] if len(parts) > 1 else "mcp"
+        return "builtin"
+
+    def _build_tool_menu(self) -> QMenu:
+        """[工具] 菜单（PRD §5.1.3）。
+
+            当前下发 18 / 上限 24                 （禁用行，实时算）
+            ────
+            ☑ fs_list   只读   内置
+            ☐ shell_run 高危   内置             ← 关闭需二次确认
+            ☑ 文件系统 · 12 个工具             ← MCP 按 server 折叠，整组开关
+            ────
+            工具清单与开关…                    → open_manager("tools")
+            ⟳ 重连已启用 MCP                   → 逐台 connect
+        """
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")
+        menu.setToolTipsVisible(True)
+        snap = self._tool_prefs_snapshot()
+        head = menu.addAction(
+            f"当前下发 {snap['active']} / 上限 {snap['max_tools']}")
+        head.setEnabled(False)
+        if snap["over"]:
+            head.setToolTip("超出上限未下发：" + "、".join(snap["over"]))
+        menu.addSeparator()
+
+        disabled = set(snap["disabled"])
+        tools = [t for t in (self._state.get("tools") or []) if isinstance(t, dict)]
+        builtin = [t for t in tools if self._tool_group_of(str(t.get("name"))) == "builtin"]
+        mcp = [t for t in tools if self._tool_group_of(str(t.get("name"))) != "builtin"]
+
+        for t in builtin:
+            name = str(t.get("name") or "")
+            risk = RISK_TEXT.get(t.get("risk"), t.get("risk") or "")
+            act = menu.addAction(f"{'☑' if name not in disabled else '☐'} "
+                                 f"{name}   {risk}   内置")
+            act.setCheckable(True)
+            act.setChecked(name not in disabled)
+            act.setToolTip(str(t.get("description") or ""))
+            if name in snap["over"]:
+                act.setToolTip(
+                    (act.toolTip() + "\n" if act.toolTip() else "")
+                    + "超出上限未下发（提高上限或在工具清单里调整）")
+            act.triggered.connect(
+                lambda checked, n=name: self._toggle_tool(n, checked))
+
+        if mcp:
+            menu.addSeparator()
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            for t in mcp:
+                groups.setdefault(self._tool_group_of(str(t.get("name"))), []).append(t)
+            for gid, items in groups.items():
+                names = [str(i.get("name") or "") for i in items]
+                on = [n for n in names if n not in disabled]
+                grp = menu.addMenu(
+                    f"{'☑' if len(on) == len(names) else ('☐' if not on else '◪')} "
+                    f"{gid} · {len(names)} 个工具")
+                grp.setToolTipsVisible(True)
+                all_act = grp.addAction("整组开启" if len(on) < len(names) else "整组关闭")
+                all_act.triggered.connect(
+                    lambda _c=False, ns=list(names),
+                    turn_on=len(on) < len(names): self._toggle_tool_group(ns, turn_on))
+                grp.addSeparator()
+                for n in names:
+                    act = grp.addAction(f"{'☑' if n not in disabled else '☐'} {n}")
+                    act.setCheckable(True)
+                    act.setChecked(n not in disabled)
+                    act.triggered.connect(
+                        lambda checked, nm=n: self._toggle_tool(nm, checked))
+
+        if not tools:
+            act = menu.addAction("（暂无工具，先在 [MCP] 里加服务器）")
+            act.setEnabled(False)
+
+        menu.addSeparator()
+        act = menu.addAction("工具清单与开关…")
+        act.setToolTip("打开清单中心的工具页：逐条开关 + 下发计数")
+        act.triggered.connect(lambda _c=False: self.open_manager("tools"))
+        act = menu.addAction("⟳ 重连已启用 MCP")
+        act.setToolTip("逐台连接已启用的 MCP 服务器，失败逐条报错不中断")
+        act.triggered.connect(lambda _c=False: self._reconnect_mcp())
+        return menu
+
+    def _show_tool_menu(self) -> None:
+        self._popup_above(self._build_tool_menu(), self._tool_btn)
+
+    # 高危工具：关闭时必须二次确认（PRD §5.1.3 / P0-5）
+    HIGH_RISK_TOOLS = ("shell_run", "fs_delete")
+    # 关掉后技能就调不动了：也要二次确认（P0-5 验收第 4 条）
+    SKILL_TOOLS = ("skill_run", "skill_list")
+
+    def _tool_needs_confirm(self, name: str) -> bool:
+        if name in self.HIGH_RISK_TOOLS:
+            return True
+        if name in self.SKILL_TOOLS:
+            return True
+        risk = next((t.get("risk") for t in (self._state.get("tools") or [])
+                     if isinstance(t, dict) and t.get("name") == name), "")
+        return risk == "high"
+
+    def _toggle_tool(self, name: str, enabled: bool) -> None:
+        """开关单个工具：禁用高危 / 技能类工具要二次确认，然后 PUT /tools/prefs。"""
+        if not name:
+            return
+        if not enabled and self._tool_needs_confirm(name):
+            if name in self.SKILL_TOOLS:
+                warn = (f"关掉「{name}」后技能无法被调用（技能正文只能作为提示词，"
+                        "无法执行技能里的步骤）。确定关闭？")
+            else:
+                warn = f"「{name}」是高危工具（可修改/删除文件或执行命令）。确定关闭？"
+            ans = QMessageBox.question(
+                self._dialog_parent(), "关闭工具", warn,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        snap = self._tool_prefs_snapshot()
+        disabled = [n for n in snap["disabled"] if n != name]
+        if not enabled:
+            disabled.append(name)
+        self._save_tool_prefs(disabled, snap["max_tools"])
+
+    def _toggle_tool_group(self, names: List[str], enabled: bool) -> None:
+        """整组开关（MCP 服务器一组）——不逐个弹确认，整组一次提交。"""
+        if not names:
+            return
+        snap = self._tool_prefs_snapshot()
+        keep = [n for n in snap["disabled"] if n not in names]
+        disabled = keep if enabled else keep + [n for n in names if n not in keep]
+        self._save_tool_prefs(disabled, snap["max_tools"])
+
+    def _save_tool_prefs(self, disabled: List[str],
+                         max_tools: Optional[int] = None) -> None:
+        """PUT /tools/prefs：先本地乐观更新（菜单立刻反映），后端异步跟进。"""
+        mt = int(max_tools or self._tool_prefs_snapshot()["max_tools"])
+        dropped = set(disabled)
+        self._tool_prefs = {**(self._tool_prefs or {}),
+                            "disabled": list(disabled), "max_tools": mt}
+        # /state 的 tools 也要跟着变，否则下次 _fill_tools 会把开关弹回旧值
+        for t in (self._state.get("tools") or []):
+            if isinstance(t, dict):
+                t["enabled"] = str(t.get("name")) not in dropped
+        w = Worker(self._assist.save_tool_prefs, list(disabled), mt)
+        w.result.connect(lambda _r: self._set_status(
+            f"工具开关已保存（当前下发 {self._tool_prefs_snapshot()['active']} 个）"))
+        w.error.connect(lambda m: self._set_status(f"保存工具开关失败：{m}"))
+        w.start()
+        if self._tool_list is not None:
+            self._fill_tools(self._state.get("tools") or [])
+
+    def _build_mcp_menu(self) -> QMenu:
+        """[MCP] 菜单（PRD §5.1.4）。
+
+            已配置 2 台 · 已连接 1 台             （禁用行）
+            ────
+            ● 文件系统  本地 · 12 工具  [断开]
+            ○ github    远程 · 未连接   [连接]
+            ────
+            🔍 从在线清单安装 MCP…
+            ＋ 手动添加（stdio / http）…
+            ＋ 粘贴 JSON 添加…
+            ────
+            管理 MCP 服务器…
+        """
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")
+        menu.setToolTipsVisible(True)
+        servers = [s for s in (self._state.get("mcp") or []) if isinstance(s, dict)]
+        n_conn = len([s for s in servers if s.get("status") == "connected"])
+        head = menu.addAction(f"已配置 {len(servers)} 台 · 已连接 {n_conn} 台")
+        head.setEnabled(False)
+        menu.addSeparator()
+
+        for s in servers:
+            sid = str(s.get("id") or "")
+            mark = {"connected": "●", "error": "×"}.get(str(s.get("status")), "○")
+            where = "远程" if s.get("transport") == "http" else "本地"
+            state = ("已连接" if s.get("status") == "connected"
+                     else ("连接失败" if s.get("status") == "error" else "未连接"))
+            sub = menu.addMenu(f"{mark} {s.get('name') or sid}  {where} · "
+                               f"{s.get('tool_count', 0)} 工具")
+            sub.addAction(state).setEnabled(False)
+            if s.get("error"):
+                err = sub.addAction(f"错误：{str(s.get('error'))[:60]}")
+                err.setEnabled(False)
+            sub.addAction("断开" if s.get("status") == "connected" else "连接",
+                          lambda _c=False, x=sid: self._toggle_mcp_by_id(x))
+            sub.addAction("删除…", lambda _c=False, x=sid: self._delete_mcp_by_id(x))
+        if not servers:
+            act = menu.addAction("（未配置 MCP 服务器）")
+            act.setEnabled(False)
+
+        menu.addSeparator()
+        act = menu.addAction("🔍 从在线清单安装 MCP…")
+        act.setToolTip("打开清单中心的 MCP 页：搜索官方 Registry 并一键生成配置")
+        act.triggered.connect(lambda _c=False: self.open_manager("mcp", focus=True))
+        act = menu.addAction("＋ 手动添加（stdio / http）…")
+        act.setToolTip("手填命令 / 参数 / URL / 风险等级")
+        act.triggered.connect(lambda _c=False: self._add_mcp())
+        act = menu.addAction("＋ 粘贴 JSON 添加…")
+        act.setToolTip("粘贴 Claude Desktop 的 mcpServers 配置片段即可添加")
+        act.triggered.connect(lambda _c=False: self._paste_mcp_json())
+        menu.addSeparator()
+        act = menu.addAction("管理 MCP 服务器…")
+        act.triggered.connect(lambda _c=False: self.open_manager("mcp"))
+        return menu
+
+    def _show_mcp_menu(self) -> None:
+        self._popup_above(self._build_mcp_menu(), self._mcp_btn)
+
+    def _toggle_mcp_by_id(self, sid: str) -> None:
+        """按 id 连接/断开 MCP（菜单行用，不依赖列表选中项）。"""
+        if not sid:
+            return
+        srv = next((s for s in (self._state.get("mcp") or [])
+                    if isinstance(s, dict) and s.get("id") == sid), {})
+        fn = (self._assist.disconnect_mcp if srv.get("status") == "connected"
+              else self._assist.connect_mcp)
+        self._set_status(f"正在{'断开' if srv.get('status') == 'connected' else '连接'}"
+                         f"{srv.get('name') or sid}…")
+        w = Worker(fn, sid)
+        w.result.connect(lambda _r: self.refresh())
+        w.error.connect(lambda m: self._set_status(f"操作失败：{m}"))
+        w.start()
+
+    def _delete_mcp_by_id(self, sid: str) -> None:
+        if not sid:
+            return
+        if QMessageBox.question(self._dialog_parent(), "删除 MCP",
+                                f"确定删除 {sid}？") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        w = Worker(self._assist.delete_mcp, sid)
+        w.result.connect(lambda _r: self.refresh())
+        w.error.connect(lambda m: QMessageBox.warning(
+            self._dialog_parent(), "删除失败", m))
+        w.start()
+
+    def _reconnect_mcp(self) -> None:
+        """⟳ 重连已启用 MCP：逐台 connect，失败逐条报错不中断（PRD §5.1.3）。"""
+        servers = [s for s in (self._state.get("mcp") or [])
+                   if isinstance(s, dict) and s.get("enabled", True)]
+        if not servers:
+            self._set_status("没有启用中的 MCP 服务器")
+            return
+        self._set_status(f"正在重连 {len(servers)} 台 MCP 服务器…")
+        errors: List[str] = []
+        remaining = {"n": len(servers)}
+
+        def done() -> None:
+            remaining["n"] -= 1
+            if remaining["n"] > 0:
+                return
+            self.refresh()
+            if errors:
+                QMessageBox.warning(
+                    self._dialog_parent(), "部分 MCP 重连失败",
+                    f"{len(errors)} 台连接失败：\n" + "\n".join(errors[:8]))
+                self._set_status(f"重连完成，{len(errors)} 台失败")
+            else:
+                self._set_status(f"已重连 {len(servers)} 台 MCP")
+
+        for s in servers:
+            sid = str(s.get("id") or "")
+            w = Worker(self._assist.connect_mcp, sid)
+            w.result.connect(lambda _r: done())
+            w.error.connect(
+                lambda m, x=sid: (errors.append(f"{x}: {m}"), done()))
+            w.start()
+
+    # ------------------------------------------------------------------ #
+    # 添加类动作（本地文件夹 / URL / JSON）
+    # ------------------------------------------------------------------ #
+    def _import_skill_from_dir(self) -> None:
+        """从本地文件夹导入技能（目录里必须有 SKILL.md）。
+
+        **D5 硬约束**：必须复用 `_pick_file(directory=True)`；**禁止**直接调用
+        QFileDialog 的原生目录选择静态方法——冻结包里一调原生目录框就以
+        `0x8001010E` 崩。回归测试 `test_no_native_file_dialog_static_calls`
+        会扫源码禁止那三个静态调用（本文档刻意不写出它们的字面量）。
+        """
+        start = (self._state.get("workspace")
+                 or str(getattr(self.config, "assistant_workspace", "") or "")
+                 or os.path.expanduser("~"))
+        src = self._pick_file("选择技能文件夹（需含 SKILL.md）", start,
+                              "所有文件 (*.*)", directory=True,
+                              accept_text="选择此文件夹")
+        if not src:
+            return
+        if not os.path.isdir(src):
+            QMessageBox.warning(self._dialog_parent(), "目录不可用",
+                                f"这个路径不是一个可用目录：\n{src}")
+            return
+        self._set_status(f"正在从本地文件夹导入技能：{src}")
+        w = Worker(self._assist.catalog_from_dir, src, False)
+        w.result.connect(self._on_installed_local_skill)
+        w.error.connect(lambda m: self._on_install_failed(m, src))
+        w.start()
+
+    def _on_installed_local_skill(self, res: Any) -> None:
+        slug = (res or {}).get("slug") if isinstance(res, dict) else ""
+        files = (res or {}).get("files") if isinstance(res, dict) else None
+        self.refresh()
+        self._set_status(
+            f"已从本地文件夹导入技能：{slug or '（未知）'}"
+            + (f"（{files} 个文件）" if files else ""))
+        self._auto_refresh_manager_lists()
+
+    def _install_skill_from_url(self) -> None:
+        """粘贴 URL 安装技能（raw 直链 / 含 /blob/ 的网页链接）。"""
+        url, ok = QInputDialog.getText(
+            self._dialog_parent(), "粘贴 URL 安装技能",
+            "SKILL.md 链接（GitHub / Gitee 均可，网页链接会自动转 raw）：",
+            QLineEdit.EchoMode.Normal, "")
+        url = (url or "").strip()
+        if not ok or not url:
+            return
+        self._set_status("正在从 URL 安装技能…")
+        w = Worker(self._assist.catalog_from_url, url, False)
+        w.result.connect(self._on_installed_url_skill)
+        w.error.connect(lambda m: self._on_install_failed(m, url))
+        w.start()
+
+    def _on_installed_url_skill(self, res: Any) -> None:
+        slug = (res or {}).get("slug") if isinstance(res, dict) else ""
+        self.refresh()
+        self._set_status(f"已从 URL 安装技能：{slug or '（未知）'}")
+        self._auto_refresh_manager_lists()
+
+    def _on_install_failed(self, msg: str, target: str) -> None:
+        self._set_status(f"安装失败：{msg}")
+        QMessageBox.warning(self._dialog_parent(), "安装失败",
+                            f"{msg}\n\n目标：{target}")
+
+    def _paste_mcp_json(self) -> None:
+        """粘贴 JSON 添加 MCP（兼容 Claude Desktop 的 `{"mcpServers": {...}}`）。
+
+        Claude Desktop 配置片段形如：
+            {"mcpServers": {"filesystem": {"command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-filesystem", "E:\\\\work"]}}}
+        也接受单个服务器对象（`{"command":..., "args":[...]}`）与远程写法
+        （`{"url": "http://..."}` / `{"type":"http","url":...}`）。
+        """
+        text, ok = QInputDialog.getMultiLineText(
+            self._dialog_parent(), "粘贴 JSON 添加 MCP",
+            '粘贴配置片段（Claude Desktop 的 {"mcpServers": {...}} 直接可用）：',
+            '{\n  "mcpServers": {\n    "filesystem": {\n'
+            '      "command": "npx",\n      "args": ["-y", '
+            '"@modelcontextprotocol/server-filesystem", "."]\n'
+            '    }\n  }\n}')
+        if not ok:
+            return
+        try:
+            servers = parse_mcp_json(text or "")
+        except ValueError as e:
+            QMessageBox.warning(self._dialog_parent(), "JSON 无法解析", str(e))
+            return
+        if not servers:
+            QMessageBox.warning(self._dialog_parent(), "JSON 无法解析",
+                                "没有找到任何 MCP 服务器配置（需要一个 command 或 url）。")
+            return
+        self._set_status(f"正在添加 {len(servers)} 台 MCP 服务器…")
+        added = {"n": 0}
+        errs: List[str] = []
+
+        def done() -> None:
+            if added["n"] > 0:
+                return
+            self.refresh()
+            self._set_status(
+                f"已添加 {len(servers) - len(errs)} 台 MCP"
+                + (f"，{len(errs)} 台失败" if errs else ""))
+            if errs:
+                QMessageBox.warning(self._dialog_parent(), "部分 MCP 添加失败",
+                                    "\n".join(errs[:8]))
+            self._auto_refresh_manager_lists()
+
+        for cfg in servers:
+            w = Worker(self._assist.add_mcp, cfg)
+            w.result.connect(lambda _r: (added.update(n=added["n"] + 1), done()))
+            w.error.connect(
+                lambda m, i=cfg.get("id"): (errs.append(f"{i}: {m}"), done()))
+            w.start()
+
+    def _refresh_catalog(self) -> None:
+        """⟳ 刷新在线目录：三源并行刷新缓存，状态栏单行文字（不做进度条）。"""
+        self._set_status("正在刷新在线目录（三源并行）…")
+        w = Worker(self._assist.catalog_refresh)
+        w.result.connect(self._on_catalog_refreshed)
+        w.error.connect(lambda m: self._set_status(f"刷新在线目录失败：{m}"))
+        w.start()
+
+    def _on_catalog_refreshed(self, res: Any) -> None:
+        counts = (res or {}).get("counts") if isinstance(res, dict) else {}
+        errors = (res or {}).get("errors") if isinstance(res, dict) else None
+        n_mcp = int((counts or {}).get("mcp") or 0)
+        n_repo = int((counts or {}).get("gh_repos") or 0)
+        txt = f"已刷新（{n_repo} 个技能仓库 / {n_mcp} 个 MCP）"
+        if errors:
+            txt += f"，{len(errors)} 个源失败"
+        self._set_status(txt)
+        if self._manager is not None and self._manager.isVisible():
+            self._load_online_catalog(force=False)
+
+    # ------------------------------------------------------------------ #
+    # 在线目录（清单中心在线区）
+    # ------------------------------------------------------------------ #
+    def _load_online_catalog(self, force: bool = False) -> None:
+        """拉在线目录（先渲染缓存，不阻塞）：MCP Registry + GitHub 仓库。"""
+        w1 = Worker(self._assist.catalog_mcp, "", "", bool(force))
+        w1.result.connect(self._apply_catalog_mcp)
+        w1.error.connect(self._on_catalog_mcp_failed)
+        w1.start()
+        w2 = Worker(self._assist.catalog_repos, "", bool(force))
+        w2.result.connect(self._apply_catalog_repos)
+        w2.error.connect(self._on_catalog_repos_failed)
+        w2.start()
+
+    def _apply_catalog_mcp(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        self._catalog_mcp = data
+        lst = getattr(self, "_mcp_online_list", None)
+        if lst is not None:
+            lst.clear()
+            for it in (data.get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                badge = CATALOG_CLASS_BADGE.get(
+                    str(it.get("free_class") or "unknown"), "未知")
+                title = it.get("title") or it.get("registry_name") or ""
+                item = QListWidgetItem(
+                    f"{badge} {title}\n{it.get('description') or ''}")
+                item.setData(Qt.UserRole, it)
+                item.setToolTip(f"{it.get('registry_name') or ''}\n"
+                                f"传输：{it.get('transport') or ''} · "
+                                f"版本：{it.get('version') or ''}")
+                lst.addItem(item)
+            if not data.get("items"):
+                lst.addItem("（在线目录为空：点「⟳ 刷新」或检查网络/代理）")
+        self._update_catalog_banner("mcp", data)
+
+    def _on_catalog_mcp_failed(self, msg: str) -> None:
+        lst = getattr(self, "_mcp_online_list", None)
+        self._update_catalog_banner(
+            "mcp", self._catalog_mcp,
+            error=str(msg), empty_hint="（还没有在线目录缓存。请检查网络/代理后点"
+                                       "「⟳ 刷新」，或先用「手动添加」加 MCP）")
+
+    def _apply_catalog_repos(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        self._catalog_repos = data
+        lst = getattr(self, "_skill_online_list", None)
+        if lst is not None:
+            lst.clear()
+            for it in (data.get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                item = QListWidgetItem(
+                    f"⭐{it.get('stars') or 0}  {it.get('full_name') or ''}\n"
+                    f"{it.get('description') or ''}")
+                item.setData(Qt.UserRole, it)
+                item.setToolTip(f"{it.get('full_name') or ''}\n"
+                                f"默认分支：{it.get('default_branch') or 'main'}")
+                lst.addItem(item)
+            if not data.get("items"):
+                lst.addItem("（在线目录为空：点「⟳ 刷新」或检查网络/代理）")
+        self._update_catalog_banner("gh_repos", data)
+
+    def _on_catalog_repos_failed(self, msg: str) -> None:
+        self._update_catalog_banner(
+            "gh_repos", self._catalog_repos, error=str(msg),
+            empty_hint="（还没有在线目录缓存。请检查网络/代理后点「⟳ 刷新」，"
+                       "或先用「导入 zip / 本地文件夹」添加技能）")
+
+    def _update_catalog_banner(self, kind: str, data: Any,
+                               error: str = "", empty_hint: str = "") -> None:
+        """顶部提示条：离线退化时显示缓存时间 + 原因，绝不出现空白页（P0-8）。"""
+        lbl = (self._skill_online_banner if kind == "gh_repos"
+               else self._mcp_online_banner)
+        if lbl is None:
+            return
+        data = data if isinstance(data, dict) else {}
+        fetched = float(data.get("fetched_at") or 0)
+        when = (time.strftime("%m-%d %H:%M", time.localtime(fetched))
+                if fetched else "")
+        stale = bool(data.get("stale"))
+        err = error or str(data.get("error") or "")
+        if err:
+            txt = f"在线目录刷新失败：{err}"
+            if when:
+                txt += f" · 正在显示 {when} 的缓存"
+            elif empty_hint:
+                txt = empty_hint
+            txt += " · 点右侧「⟳ 刷新」重试"
+            lbl.setText(txt)
+            lbl.setObjectName("CatalogWarn")
+        elif stale and when:
+            lbl.setText(f"正在显示 {when} 的缓存（点「⟳ 刷新」同步最新）")
+            lbl.setObjectName("CatalogNote")
+        else:
+            lbl.setText("")
+            lbl.setObjectName("PageSubtitle")
+        lbl.setVisible(bool(lbl.text().strip()))
+        try:
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
+        except Exception:               # 样式表未加载时不影响功能
+            pass
+
+    def _auto_refresh_manager_lists(self) -> None:
+        """安装/添加成功后重填清单中心三张列表（面板没开时是空操作）。"""
+        if self._manager is None:
+            return
+        self._fill_skills(self._state.get("skills") or [])
+        self._fill_tools(self._state.get("tools") or [])
+        self._fill_mcp(self._state.get("mcp") or [])
 
     # ------------------------------------------------------------------ #
     # 技能
@@ -2729,20 +4348,33 @@ class AssistantPage(QWidget):
 # 对话框
 # ----------------------------------------------------------------------------
 class ManagerDialog(QDialog):
-    """智能助理管理面板（原右侧 tab 面板整块搬到这里）。
+    """能力清单中心（原「管理面板」升级，PRD §5.2）。
 
-    左栏只做「任务 / 空间两区 + 四个入口」，真正需要空间的列表操作
-    （全部任务、技能包导入导出、工具清单、MCP 增删、审计明细）在面板里。
+    **不新建独立页面**（PRD §5.2 结论）：左栏 1.0.8 起已无二级管理入口，
+    新建页面要么改左栏（挤占 680px 高）要么做页面切换（波及 QStackedWidget）。
+    用户原话要的是「打开清单 → 添加 → 回到对话」，QDialog 天然满足。
+
+    窗口尺寸（架构 A7，**既有缺陷一并修掉**）：
+      - 原 `setMinimumSize(760, 560)` 在逻辑屏宽 **720** 下放不下（760 > 720），
+        200% 缩放的 1366×768 笔记本上窗口会超出屏幕右缘。改为 **700×520**。
+      - 打开时 `resize(主窗口 86% × 84%)` 并封顶到屏幕可用区。
+    右侧详情面板在宽度 < 720 时自动折叠（`_auto_fold_detail`）。
     """
 
     TABS = [("sessions", "任务"), ("skills", "技能"), ("tools", "工具"),
             ("mcp", "MCP"), ("audit", "审计")]
+    #: 架构 A7 定案：必须 ≤700 才放得进逻辑 720 屏宽
+    MIN_W, MIN_H = 700, 520
+    #: 详情面板折叠阈值（= 主窗口最小逻辑宽）
+    FOLD_W = 720
 
     def __init__(self, page):
         super().__init__(page)
         self.page = page
-        self.setWindowTitle("智能助理 · 管理")
-        self.setMinimumSize(760, 560)
+        self.setWindowTitle("智能助理 · 能力清单中心")
+        self.setMinimumSize(self.MIN_W, self.MIN_H)
+        #: 在线区是否已展开（open_manager 据此决定是否预拉目录）
+        self._online_visible = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -2763,10 +4395,51 @@ class ManagerDialog(QDialog):
             close_btn.setText("关闭")
         lay.addWidget(box)
 
+    def fit_to_parent(self) -> None:
+        """按主窗口 86% × 84% 定尺寸，并封顶到屏幕可用区（架构 A7）。"""
+        try:
+            host = self.parentWidget()
+            base_w = max(self.MIN_W, int((host.width() if host is not None else 720)))
+            base_h = max(self.MIN_H, int((host.height() if host is not None else 680)))
+            w = max(self.MIN_W, int(base_w * 0.86))
+            h = max(self.MIN_H, int(base_h * 0.84))
+            scr = self.screen()
+            if scr is not None:
+                avail = scr.availableGeometry()
+                w = min(w, max(self.MIN_W, avail.width() - 24))
+                h = min(h, max(self.MIN_H, avail.height() - 24))
+            self.resize(w, h)
+        except Exception:                     # 无头环境 / 尺寸异常：保持最小尺寸
+            self.resize(self.MIN_W, self.MIN_H)
+        self._auto_fold_detail()
+
+    def _auto_fold_detail(self) -> None:
+        """宽度 < 720 时把技能详情面板折叠（PRD §5.2「详情自动折叠」）。"""
+        split = getattr(self.page, "_skill_split", None)
+        if split is None:
+            return
+        narrow = self.width() < self.FOLD_W
+        try:
+            split.setSizes([1, 0] if narrow else [620, 380])
+        except Exception:
+            pass
+
+    def focus_search(self) -> None:
+        """聚焦技能搜索框（`[技能]` 菜单「从在线清单安装…」用）。"""
+        box = getattr(self.page, "_skill_search", None)
+        if box is not None:
+            self.tabs.setCurrentIndex(1)
+            box.setFocus()
+
     def show_tab(self, key: str) -> None:
+        """切到指定 Tab；key 不在表里时静默忽略（兼容旧调用）。"""
         keys = [k for k, _ in self.TABS]
         if key in keys:
             self.tabs.setCurrentIndex(keys.index(key))
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt 命名
+        super().resizeEvent(event)
+        self._auto_fold_detail()
 
 
 _SKILL_TEMPLATE = """---
