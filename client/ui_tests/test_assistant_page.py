@@ -453,6 +453,72 @@ def test_local_models_filtered_by_downloaded(page, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 思考过程呈现（WorkBuddy 形态：平铺不折叠）+ 流式防闪
+# ---------------------------------------------------------------------------
+def test_thinking_block_is_flat_not_collapsible(page):
+    """思考过程按 WorkBuddy 方式平铺：小标题「深度思考」+ 正文一直可见，不折叠。"""
+    from ui.widgets.assistant_cards import ThinkingBlock
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "reasoning", "text": "先看看工作区里有什么"})
+    assert isinstance(p._thinking, ThinkingBlock)
+    assert p._thinking.head.text().startswith("深度思考")
+    # 不是 _Collapsible：没有「展开/收起」按钮，正文直接可见
+    assert not hasattr(p._thinking, "toggle_btn")
+    assert p._thinking.body.isVisibleTo(p)
+    p._end_streaming()
+
+
+def test_reasoning_text_accumulates_and_flushes(page):
+    """多段思考内容按节流窗口合并刷新，结束后全部可见。"""
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "reasoning", "text": "第一段思考"})
+    p._on_event({"type": "reasoning", "text": "，第二段思考"})
+    p._thinking.finish()
+    body = p._thinking.body.text()
+    assert "第一段思考" in body
+    assert "第二段思考" in body
+    assert "深度思考" in p._thinking.head.text()
+    p._end_streaming()
+
+
+def test_bubble_width_fixed_during_stream(page):
+    """流式输出时气泡宽度固定：宽度不变才不会反复折行闪屏。"""
+    p, _fake = page
+    p._begin_streaming()
+    bubble = p._ensure_bubble()
+    w0 = bubble.label.width()
+    for i in range(20):
+        bubble.append_text(f"增量{i} ")
+    assert bubble.label.width() == w0        # 宽度不随内容变化
+    bubble.end_stream()
+    p._end_streaming()
+
+
+def test_scroll_requests_coalesced(page):
+    """滚动请求被合并：连续调用只滚一次（防整屏闪动）。"""
+    p, _fake = page
+    p._scroll_bottom()
+    p._scroll_bottom()
+    p._scroll_bottom()
+    assert p._scroll_timer.isActive() is True
+    assert _pump(lambda: not p._scroll_timer.isActive())
+
+
+def test_scrolled_up_user_not_forced_to_bottom(page):
+    """用户自己往上翻之后，流式输出不再硬拽回底部。"""
+    p, _fake = page
+    p._scroll_timer.stop()          # 清掉之前遗留的滚动请求
+    p._follow = False
+    p._scroll_bottom()
+    assert p._scroll_timer.isActive() is False
+    p._follow = True
+    p._scroll_bottom(force=True)
+    assert p._scroll_timer.isActive() is True
+
+
+# ---------------------------------------------------------------------------
 # 管理面板（原右侧 tab 面板）
 # ---------------------------------------------------------------------------
 def test_manager_dialog_has_five_tabs(page):

@@ -250,6 +250,8 @@ QTabBar::tab:selected { color: #1b3a8f; border-bottom: 2px solid #4a6cf7; }
 #ToolCard[risk="low"] { border-left: 3px solid #3f9bd9; }
 #CardHead { color: #3b4354; }
 #CardBody { color: #5a6275; }
+#ThinkingHead { color: #5a6275; }
+#ThinkingBody { color: #4d5566; }
 #ApprovalCard { background-color: #fff5f7; border: 1px solid #f0c9d3;
                 border-left: 3px solid #d9536f; }
 #ApprovalTitle { color: #a12744; }

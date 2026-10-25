@@ -50,7 +50,7 @@ from core.assistant_client import AssistantApi, AssistantStream
 from core.task_runner import Worker
 from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, ChatBubble, StepLine,
-                                       ThinkingCard, ToolCard)
+                                       ThinkingBlock, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
 
 POLICY_ITEMS = [
@@ -127,6 +127,9 @@ SPIN_FRAMES = "◐◓◑◒"
 class AssistantPage(QWidget):
     """智能助理主页面。"""
 
+    #: 滚动合并窗口（毫秒）：流式输出时合并滚动请求，避免整屏闪动
+    SCROLL_MS = 40
+
     def __init__(self, api, launcher, config, parent=None):
         super().__init__(parent)
         self.api = api
@@ -139,13 +142,20 @@ class AssistantPage(QWidget):
         self._stream: Optional[AssistantStream] = None
         self._state: Dict[str, Any] = {}
         self._bubble: Optional[ChatBubble] = None
-        self._thinking: Optional[ThinkingCard] = None
+        self._thinking: Optional[ThinkingBlock] = None
         self._tool_cards: List[ToolCard] = []
         self._approvals: Dict[str, ApprovalCard] = {}
         self._busy = False
         self._loading = False
+        # 流式输出时不要频繁重绘/滚动（用户反馈「思考时屏幕闪得厉害」）：
+        #   _follow    用户是否还贴着底部（往上翻过就别再硬拽回去）
+        #   _scroll_timer 合并滚动请求，SCROLL_MS 内只滚一次
+        self._follow = True
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._do_scroll_bottom)
 
-        # 底栏状态（1.0.8 界面提审）：模型来源 / 模型名 / 挂载的技能
+        #: 底栏状态（1.0.8 界面提审）：模型来源 / 模型名 / 挂载的技能
         self._active_provider = "local"
         self._active_model = ""
         self._skill_slugs: List[str] = []
@@ -227,6 +237,7 @@ class AssistantPage(QWidget):
 
         self._scroll = AutoHideScrollArea()
         self._scroll.setObjectName("ChatScroll")
+        self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
         self._container = QWidget()
         row = QHBoxLayout(self._container)
         row.setContentsMargins(0, 0, 0, 0)
@@ -1615,6 +1626,7 @@ class AssistantPage(QWidget):
         self._session_id = session["id"]
         self._input.clear()
         self._add_bubble("user", text)
+        self._scroll_bottom(force=True)   # 用户刚发消息：一定回到底部
         self._begin_streaming()
 
         # 技能 chip：挂载后每条消息自动带上「用 xx、yy 技能」，输入框本身保持干净
@@ -1654,6 +1666,9 @@ class AssistantPage(QWidget):
         self._stop_spin()
         if self._thinking is not None:
             self._thinking.finish()
+        if self._bubble is not None:
+            self._bubble.end_stream()      # 收尾贴合宽度
+        self._scroll_bottom(force=True)    # 答完了，回到底部看全文
 
     def _stop(self) -> None:
         if self._stream is not None:
@@ -1687,7 +1702,8 @@ class AssistantPage(QWidget):
             self._scroll_bottom()
         elif kind == "reasoning":
             if self._thinking is None:
-                self._thinking = ThinkingCard()
+                # WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠
+                self._thinking = ThinkingBlock()
                 self._append_widget(self._thinking)
             self._thinking.append(ev.get("text") or "")
             self._scroll_bottom()
@@ -1762,8 +1778,17 @@ class AssistantPage(QWidget):
     def _ensure_bubble(self) -> ChatBubble:
         if self._bubble is None:
             self._bubble = ChatBubble("assistant", "")
+            # 流式开始就定死宽度：宽度不变 → 文字只往下长，不会反复折行闪屏
+            self._bubble.begin_stream(self._stream_bubble_width())
             self._append_widget(self._bubble)
         return self._bubble
+
+    def _stream_bubble_width(self) -> int:
+        """流式气泡的稳定宽度（受内容列宽度约束，最小 260）。"""
+        col_w = self._col.width() if self._col is not None else 0
+        if col_w <= 0:
+            return ChatBubble.MAX_WIDTH
+        return max(260, min(ChatBubble.MAX_WIDTH, col_w - 28))
 
     def _finish_bubble(self, final: str = "") -> None:
         # 注意：工具调用后 _bubble 已被定稿置空，此时 done 事件可能才带最终答复
@@ -1775,6 +1800,7 @@ class AssistantPage(QWidget):
             self._append_widget(self._bubble)
         text = final or self._bubble.label.text()
         self._bubble.set_text(text, markdown=True)
+        self._bubble.end_stream()      # 收尾：贴合内容宽度
         self._bubble = None
 
     def _add_bubble(self, role: str, text: str) -> ChatBubble:
@@ -1800,10 +1826,28 @@ class AssistantPage(QWidget):
         self._thinking = None
         self._tool_cards = []
         self._approvals.clear()
+        self._follow = True
 
-    def _scroll_bottom(self) -> None:
+    def _scroll_bottom(self, force: bool = False) -> None:
+        """滚到底部（合并请求，避免流式输出时画面狂跳）。
+
+        - 40ms 内多次调用只滚一次：每个 token 都 setValue 会让整屏闪动
+        - 用户自己往上翻看过（_follow 为 False）时不再硬拽回底部
+        """
+        if not force and not self._follow:
+            return
+        if not self._scroll_timer.isActive():
+            self._scroll_timer.start(self.SCROLL_MS)
+
+    def _do_scroll_bottom(self) -> None:
         bar = self._scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
+        self._follow = True
+
+    def _on_scroll_value(self, value: int) -> None:
+        """记录用户是否还贴着底部：往上翻就别再自动拽回去。"""
+        bar = self._scroll.verticalScrollBar()
+        self._follow = value >= bar.maximum() - 8
 
     # ------------------------------------------------------------------ #
     # 底栏：模型 / 审批策略 / 工作区 / 技能

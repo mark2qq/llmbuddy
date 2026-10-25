@@ -9,6 +9,10 @@
 /build/
 /client/build/installer/
 /client/build/pyi/
+# PyInstaller 的工作目录与产物（client/build/build、client/build/dist）
+# 不加这两条会被 `git add -A` 误提交 900+ 个二进制文件
+/client/build/build/
+/client/build/dist/
 *.bak-*
 
 # ---- 推理引擎运行时（llama.cpp 二进制，按需下载，约 2.8GB）----

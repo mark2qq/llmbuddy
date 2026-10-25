@@ -577,6 +577,26 @@ QTabBar::tab:hover { color: #d6dbe8; }
     font-family: "Consolas", "Cascadia Mono", monospace;
 }
 
+/* 思考过程（WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠） */
+#ThinkingBlock {
+    background: transparent;
+    border: none;
+}
+#ThinkingHead {
+    color: #8f98ab;
+    font-size: 11px;
+    background: transparent;
+    border: none;
+    padding: 1px 0;
+}
+#ThinkingBody {
+    color: #97a1b5;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+    font-family: "Consolas", "Cascadia Mono", "Microsoft YaHei", monospace;
+}
+
 #ApprovalCard {
     background-color: #241a22;
     border: 1px solid #5a2f44;

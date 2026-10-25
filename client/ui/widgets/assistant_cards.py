@@ -6,13 +6,13 @@
     ToolCard       工具调用卡片（可展开看参数与结果）
     ApprovalCard   高危动作审批卡片（允许 / 本任务允许 / 拒绝）
     StepLine       技能阶段提示（plan/act/review 的细线文字）
-    ThinkingCard   模型思考过程（可折叠）
+    ThinkingBlock  模型思考过程（WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠）
 
 全部控件只用 objectName + QSS，不写死颜色，浅色主题由 theme.py 覆盖。
 """
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
                                QSizePolicy, QVBoxLayout, QWidget)
 
@@ -27,11 +27,15 @@ class ChatBubble(QWidget):
     MAX_WIDTH = 660
     #: 估宽时预留的内边距（QSS 里 padding 8~12px + 边框）
     PAD = 30
+    #: 流式刷新节流（毫秒）：每个 token 都重排整段文本会闪得厉害
+    FLUSH_MS = 40
 
     def __init__(self, role: str, text: str = "", parent=None):
         super().__init__(parent)
         self.role = role
         self._fit_w = -1
+        self._buf = ""
+        self._shown = ""
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 2)
         lay.setSpacing(0)
@@ -43,7 +47,15 @@ class ChatBubble(QWidget):
         self.label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         if text:
             self._apply_format(markdown=(role == "assistant"))
-        self._fit_width()
+            self._fit_width()
+        else:
+            # 空气泡（流式起点）：先不定宽，等 begin_stream 给一个稳定宽度
+            self._buf = ""
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.FLUSH_MS)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._flush)
 
         if role == "user":
             lay.addStretch(1)
@@ -52,14 +64,44 @@ class ChatBubble(QWidget):
             lay.addWidget(self.label, 1)
             lay.addStretch(0)
 
-    def set_text(self, text: str, markdown: bool = True) -> None:
-        self.label.setText(text or "")
-        self._apply_format(markdown=markdown)
-        self._fit_width()
+    # ------------------------------------------------------------------ #
+    # 流式输出
+    # ------------------------------------------------------------------ #
+    def begin_stream(self, width: int = 0) -> None:
+        """开始流式输出：把气泡宽度**固定**下来。
+
+        宽度每来一个 token 就变 → 文字反复重新折行 → 屏幕闪得厉害。
+        固定宽度后文字只往下长，结束时再一次性贴合内容。
+        """
+        w = int(width or 0) or self.MAX_WIDTH
+        w = max(260, min(w, self.MAX_WIDTH))
+        self._fit_w = w
+        self.label.setFixedWidth(w)
 
     def append_text(self, piece: str) -> None:
-        """流式追加（期间用纯文本，避免半截 Markdown 抖动）。"""
-        self.label.setText(self.label.text() + piece)
+        """流式追加：节流刷新，避免每个 token 都触发整段重排。"""
+        if not piece:
+            return
+        self._buf += piece
+        if not self._timer.isActive():
+            self._flush()          # 首段立即显示，之后按节流窗口合并
+
+    def _flush(self) -> None:
+        self._timer.stop()
+        if self._buf == self._shown:
+            return
+        self._shown = self._buf
+        self.label.setText(self._shown)
+
+    def end_stream(self) -> None:
+        """流式结束：把剩余文本刷出来，并把宽度贴合到实际内容。"""
+        self._flush()
+        self._fit_width()
+
+    def set_text(self, text: str, markdown: bool = True) -> None:
+        self._buf = text or ""
+        self._flush()
+        self._apply_format(markdown=markdown)
         self._fit_width()
 
     def _fit_width(self) -> None:
@@ -243,22 +285,62 @@ class ApprovalCard(QFrame):
         self.layout().addWidget(note)
 
 
-class ThinkingCard(_Collapsible):
-    """模型思考过程（默认折叠）。"""
+class ThinkingBlock(QWidget):
+    """模型思考过程（WorkBuddy 形态）。
+
+    与旧版「思考过程（可折叠）」的差别：
+        - **不折叠**：灰色小标题「深度思考」+ 灰色正文一直平铺可见
+        - **流式节流**：正文按 60ms 窗口合并刷新，不再每个 token 重排整段
+    """
+
+    FLUSH_MS = 60
 
     def __init__(self, parent=None):
-        super().__init__("思考过程", parent)
+        super().__init__(parent)
+        self.setObjectName("ThinkingBlock")
         self._buf = ""
+        self._shown = ""
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(2)
+
+        self.head = QLabel("深度思考")
+        self.head.setObjectName("ThinkingHead")
+        lay.addWidget(self.head)
+
+        self.body = QLabel("")
+        self.body.setObjectName("ThinkingBody")
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        lay.addWidget(self.body)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.FLUSH_MS)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._flush)
 
     def append(self, piece: str) -> None:
+        if not piece:
+            return
         self._buf += piece
-        self.body.setText(self._buf[-4000:])
+        if not self._timer.isActive():
+            self._flush()          # 首段立即出现，之后按节流窗口合并
+
+    def _flush(self) -> None:
+        self._timer.stop()
+        if self._buf == self._shown:
+            return
+        self._shown = self._buf
+        self.body.setText(self._shown)
 
     def finish(self) -> None:
+        """收尾：把剩余内容刷出来；一个字都没有就整块隐藏。"""
+        self._flush()
         if not self._buf.strip():
             self.setVisible(False)
             return
-        self.head_label.setText(f"思考过程（{len(self._buf)} 字，点击展开）")
+        self.head.setText(f"深度思考（{len(self._buf)} 字）")
 
 
 def _short_json(obj: Any, limit: int = 400) -> str:
