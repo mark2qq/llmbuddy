@@ -149,13 +149,15 @@ class ToolCard(_Collapsible):
     """一次工具调用：标题 + 参数 + 结果。"""
 
     def __init__(self, name: str, summary: str, risk: str = "low",
-                 args: Optional[Dict[str, Any]] = None, parent=None):
+                 args: Optional[Dict[str, Any]] = None, parent=None,
+                 index: Optional[int] = None):
         super().__init__(f"工具 · {name}", parent)
         self.setProperty("risk", risk)
         self._name = name
         self._summary = summary
         self._risk = risk
         self._args = args or {}
+        self._index = index
         self._result: Optional[tuple] = None
         self._render()
 

@@ -31,7 +31,7 @@ import time  # noqa: E402
 import pytest  # noqa: E402
 from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
-                               QInputDialog, QLabel, QMessageBox)
+                               QInputDialog, QLabel, QPushButton, QMessageBox)
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -232,16 +232,13 @@ def test_approval_card_uses_task_wording():
     assert "本任务允许同类" in texts
 
 
-def test_nav_panel_lists_tasks_directly(page):
-    """任务直接铺在左栏，管理入口带数量。"""
+def test_left_nav_no_manager_entries(page):
+    """左栏只保留「任务 / 空间」两区，管理入口（技能/工具/MCP/审计）已迁到 [+]。"""
     p, _fake = page
+    assert not hasattr(p, "_nav_entries"), "左栏不应再有二级管理入口"
     btn = p._nav_task_btns.get("s1")
     assert btn is not None
     assert "历史任务" in btn.text()
-    assert p._nav_entries["skills"].text() == "技能 · 1"
-    assert p._nav_entries["tools"].text() == "工具 · 2"
-    assert p._nav_entries["mcp"].text() == "MCP · 1"
-    assert p._nav_entries["audit"].text() == "审计"
 
 
 def test_nav_panel_empty_state(page):
@@ -297,31 +294,63 @@ def test_switch_model_persists_provider(page):
     assert p._active_provider == "siliconflow"
 
 
-def test_skill_chip_mounts_without_touching_input(page):
-    """技能按钮变成 chip：挂载后不改写输入框，只记状态。"""
+def test_multi_skill_mount_renders_chips_without_touching_input(page):
+    """多技能挂载：每个技能一个可移除 chip，且不改写输入框。"""
     p, _fake = page
-    p._use_skill("repo-digest")
-    assert p._skill_slug == "repo-digest"
-    assert p._skill_btn.text() == "✕ repo-digest"
+    p._add_skill("repo-digest")
+    p._add_skill("code-review")
+    assert p._skill_slugs == ["repo-digest", "code-review"]
+    chips = [b for b in p._skill_chip_cont.findChildren(QPushButton)]
+    assert len(chips) == 2
+    assert p._skill_chip_cont.isVisibleTo(p)         # 显式可见（头less 下父链未 show）
+    assert p._input.toPlainText() == ""              # 输入框保持干净
     assert bool(p._skill_btn.property("active")) is True
-    assert p._input.toPlainText() == ""
-    p._clear_skill()
+    p._remove_skill("repo-digest")
+    assert p._skill_slugs == ["code-review"]
+    chips = [b for b in p._skill_chip_cont.findChildren(QPushButton)]
+    assert len(chips) == 1
+    p._clear_skills()
+    assert p._skill_slugs == []
+    assert not p._skill_chip_cont.isVisibleTo(p)
     assert p._skill_btn.text() == "技能"
     assert bool(p._skill_btn.property("active")) is False
 
 
-def test_skill_prefix_injected_in_payload(page, monkeypatch):
-    """挂载技能后，每条消息自动带「用 xx 技能」前缀（用户看不到，模型看得到）。"""
+def test_multi_skill_prefix_injected_in_payload(page, monkeypatch):
+    """多技能挂载后，每条消息自动带「用 xx、yy 技能」前缀（用户看不到，模型看得到）。"""
     from ui.pages import assistant_page as mod
     monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
     p, _fake = page
-    p._use_skill("repo-digest")
+    p._add_skill("repo-digest")
+    p._add_skill("code-review")
     p._send_with_session({"id": p._session_id}, "看看这个项目")
     payload = _FakeStream.instances[-1].payload
-    assert payload["message"] == "用 repo-digest 技能：看看这个项目"
+    assert payload["message"] == "用 repo-digest、code-review 技能：看看这个项目"
     assert payload["provider"] == "local"
     assert payload["stream"] is True
     p._end_streaming()
+
+
+def test_attach_plus_menu_has_five_entries(page):
+    """底栏 [+]：第一项添加附件，分隔线后四个管理入口（技能/工具/MCP/审计）。"""
+    p, _fake = page
+    menu = p._build_attach_menu()
+    texts = [a.text() for a in menu.actions() if a.text()]
+    seps = sum(1 for a in menu.actions() if a.isSeparator())
+    assert texts[0] == "添加附件…"
+    assert texts[1:] == ["技能", "工具", "MCP", "审计"]
+    assert seps == 1
+
+
+def test_sixth_skill_rejected(page):
+    """已挂载 5 个时，第 6 个技能被拒（上限 5，对标 WorkBuddy 多技能）。"""
+    p, _fake = page
+    for i in range(5):
+        p._add_skill(f"skill-{i}")
+    assert len(p._skill_slugs) == 5
+    p._add_skill("skill-5")          # 第 6 个应被拒
+    assert len(p._skill_slugs) == 5
+    assert "skill-5" not in p._skill_slugs
 
 
 # ---------------------------------------------------------------------------

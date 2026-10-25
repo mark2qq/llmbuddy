@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from core.assistant import mcp as mcp_mod
@@ -65,7 +66,7 @@ SYSTEM_PROMPT = """你是 llmBuddy 的本地智能助理，直接运行在用户
 ## 行为准则
 1. 需要事实（目录结构、文件内容、网页信息）必须先调用工具，禁止凭印象编造。
 2. 写入/删除/执行命令类动作会触发人工审批，可能被拒绝；被拒后换方案，不要重复同一动作。
-3. 一次最多发起 3 个工具调用，拿到结果再决定下一步；任务完成就直接回答，不要再调工具。
+3. 一次可并行发起多个工具调用（建议不超过 8 个），拿到全部结果再决定下一步；任务完成就直接回答，不要再调工具。
 4. 回答使用简体中文，结论先行，必要时用列表或表格；不要叙述工具调用过程。
 5. 用户问「你能做什么」时，用一段话说明能力，并主动提议一个具体动作。
 
@@ -254,8 +255,13 @@ class Assistant:
             emit({"type": "reasoning" if channel == "reasoning" else "delta",
                   "text": piece})
 
-        def exec_tool(name: str, arguments: Any, source: str = "agent"):
-            """审批 + 执行，返回 (ok, text)。供本模块与 orchestrator 共用。"""
+        def exec_tool(name: str, arguments: Any, source: str = "agent",
+                      index: Optional[int] = None):
+            """审批 + 执行，返回 (ok, text)。供本模块与 orchestrator 共用。
+
+            index 用于并行执行时给事件带上调用序号，前端据此把 tool_result
+            精确回填到对应的工具卡片，避免同名/乱序时串卡。
+            """
             args = arguments
             if isinstance(args, str):
                 try:
@@ -267,7 +273,8 @@ class Assistant:
             risk = registry.risk_of(name, args)
             summary = registry.describe_call(name, args)
             emit({"type": "tool_call", "name": name, "args": args,
-                  "risk": risk, "summary": summary, "source": source})
+                  "risk": risk, "summary": summary, "source": source,
+                  "index": index})
             # 审批（按 policy；readonly_auto 下 low 直接过）
             pending = self._approval.request(
                 session_id, name, args, risk,
@@ -275,15 +282,16 @@ class Assistant:
                 timeout=int(cfg.get("approval_timeout") or 300))
             if pending.status != "approved":
                 emit({"type": "approval_result", "id": pending.id,
-                      "approve": False, "status": pending.status})
+                      "approve": False, "status": pending.status, "index": index})
                 return False, (f"用户未批准该操作（{pending.status}），"
                                f"请换一种方式或询问用户。")
             emit({"type": "approval_result", "id": pending.id, "approve": True,
-                  "status": "approved"})
+                  "status": "approved", "index": index})
             res = registry.call(name, args, {**self._ctx(session_id, cfg, provider,
                                                          model_name, emit, exec_tool)})
             emit({"type": "tool_result", "name": name, "ok": res.ok,
-                  "content": (res.content or res.error)[:4000], "error": res.error})
+                  "content": (res.content or res.error)[:4000], "error": res.error,
+                  "index": index})
             audit("tool_called", session_id=session_id, tool=name, risk=risk,
                   ok=res.ok, args=args)
             return res.ok, (res.content if res.ok else f"错误：{res.error}")
@@ -357,15 +365,40 @@ class Assistant:
                                       "function": {"name": c["name"],
                                                    "arguments": self._args_json(c)}}
                                      for i, c in enumerate(calls)]})
+
+                # 并行执行多个工具（WorkBuddy 对标：单轮最多 8 个同时跑，超出分批）。
+                # 结果按调用顺序回填 messages，保证上下文不乱序；取消语义保持
+                # 「本轮完成后停止」：提交前查一次、全部完成后查一次。
+                MAX_PARALLEL = 8
+                if self._cancelled(session_id):
+                    emit({"type": "stopped"})
+                    break
+                results: List[Optional[tuple]] = [None] * len(calls)
                 aborted = False
-                for i, c in enumerate(calls):
+                for start in range(0, len(calls), MAX_PARALLEL):
                     if self._cancelled(session_id):
                         aborted = True
                         break
-                    ok, result_text = exec_tool(c["name"], c.get("arguments"), "agent")
-                    messages.append({"role": "tool",
-                                     "tool_call_id": c.get("id") or f"call_{i}",
-                                     "content": result_text})
+                    batch = calls[start:start + MAX_PARALLEL]
+                    with ThreadPoolExecutor(
+                            max_workers=min(MAX_PARALLEL, len(batch))) as ex:
+                        fut_to_idx = {
+                            ex.submit(exec_tool, c["name"], c.get("arguments"),
+                                      "agent", start + j): start + j
+                            for j, c in enumerate(batch)}
+                        for fut in fut_to_idx:
+                            # 等本批全部完成；异常向上抛到外层 try（与串行一致）
+                            results[fut_to_idx[fut]] = fut.result()
+                    # 本批全部完成后再统一按调用顺序回填工具结果（保序）
+                    for j, c in enumerate(batch):
+                        idx = start + j
+                        ok, result_text = results[idx] or (False, "（工具未返回结果）")
+                        messages.append({"role": "tool",
+                                         "tool_call_id": c.get("id") or f"call_{idx}",
+                                         "content": result_text})
+                    if self._cancelled(session_id):
+                        aborted = True
+                        break
                 if aborted:
                     emit({"type": "stopped"})
                     break
@@ -439,7 +472,7 @@ class Assistant:
         cleaned = text
         for start, end in sorted(spans, reverse=True):
             cleaned = cleaned[:start] + cleaned[end:]
-        return found[:3], cleaned
+        return found[:8], cleaned
 
     def _build_messages(self, session: Dict[str, Any], registry: ToolRegistry,
                         cfg: Dict[str, Any]) -> List[Dict[str, Any]]:

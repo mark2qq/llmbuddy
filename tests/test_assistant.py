@@ -359,6 +359,46 @@ def test_agent_approval_denied_path(env, monkeypatch):
     assert any(e["type"] == "approval_request" for e in events)
 
 
+def test_agent_runs_multiple_tool_calls_in_parallel(env, monkeypatch):
+    """一轮返回多个 tool_calls 时全部执行，tool 消息按调用顺序回填。"""
+    from core.assistant import agent as agent_mod
+    provider = FakeProvider([
+        ChatReply(content="", tool_calls=[
+            {"id": "c1", "name": "fs_write",
+             "arguments": {"path": "a.txt", "content": "A"}},
+            {"id": "c2", "name": "fs_write",
+             "arguments": {"path": "b.txt", "content": "B"}},
+            {"id": "c3", "name": "fs_write",
+             "arguments": {"path": "c.txt", "content": "C"}},
+        ]),
+        ChatReply(content="已写完三个文件"),
+    ])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "写三个文件", emit=events.append)
+    assert res["ok"], res
+    # 三个工具都真正落地
+    for name in ("a.txt", "b.txt", "c.txt"):
+        p = os.path.join(str(env["workspace"]), name)
+        assert os.path.isfile(p), p
+    # tool_call / tool_result 事件齐全，且各一次、带正确序号
+    tcalls = [e for e in events if e["type"] == "tool_call"]
+    tresults = [e for e in events if e["type"] == "tool_result"]
+    assert len(tcalls) == 3 and len(tresults) == 3
+    # 三个调用都发出，且各自带正确序号（并行下事件顺序不保证，用集合比对）
+    assert {e.get("index") for e in tcalls} == {0, 1, 2}
+    assert all(e["ok"] for e in tresults)
+    # tool 消息按调用顺序回填到下一轮模型上下文（call_0/1/2），不乱序
+    ctx = provider.calls[-1]["messages"]
+    tool_msgs = [m for m in ctx if m.get("role") == "tool"]
+    assert len(tool_msgs) == 3
+    assert [m["tool_call_id"] for m in tool_msgs] == ["c1", "c2", "c3"]
+
+
 def test_text_tool_call_fallback(env):
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()

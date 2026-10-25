@@ -66,7 +66,6 @@ NAV_TASK_MAX = 4            # 「任务」区直接显示几条（WorkBuddy 的�
 NAV_SPACE_MAX = 4           # 「空间」区最多显示几个空间
 NAV_SPACE_TASK_MAX = 5      # 空间展开后最多显示几条任务
 NAV_ROW = 26                # 单行高度
-NAV_ENTRY_H = 30            # 技能/工具/MCP/审计 四个二级入口的固定行高
 NAV_SCROLL_MAX = 420        # 任务+空间滚动区最高多少（超出内部滚动）
 # 兼容旧命名（管理面板文案里还引用着）
 NAV_MAX_SESSIONS = NAV_TASK_MAX
@@ -147,7 +146,7 @@ class AssistantPage(QWidget):
         # 底栏状态（1.0.8 界面提审）：模型来源 / 模型名 / 挂载的技能
         self._active_provider = "local"
         self._active_model = ""
-        self._skill_slug = ""
+        self._skill_slugs: List[str] = []
         self._model_cache: Dict[str, List[str]] = {}
         # 管理面板 / 任务列表：记住用户选中的任务与最近一次列表快照
         # （列表会被 refresh 重建，重建瞬间 currentItem 为 None，必须靠 _sel_sid 兜底）
@@ -173,7 +172,6 @@ class AssistantPage(QWidget):
         self._nav_spaces: List[Dict[str, Any]] = []
         self._nav_rows: Optional[List[Dict[str, Any]]] = None   # 左栏用的任务快照
         self._open_space = ""
-        self._nav_entries: Dict[str, QPushButton] = {}
 
         self._build_ui()
         # 注意：不在这里调 refresh()。构造函数运行在 QApplication.exec() 之前，
@@ -318,8 +316,8 @@ class AssistantPage(QWidget):
         self._attach_btn.setObjectName("BarBtn")
         self._attach_btn.setFixedSize(26, 26)
         self._attach_btn.setCursor(Qt.PointingHandCursor)
-        self._attach_btn.setToolTip("把本机文件加进本次提问（插入 @路径）")
-        self._attach_btn.clicked.connect(self._attach_file)
+        self._attach_btn.setToolTip("添加附件，或打开管理面板（技能 / 工具 / MCP / 审计）")
+        self._attach_btn.clicked.connect(self._show_attach_menu)
         bar.addWidget(self._attach_btn)
 
         self._ws_btn = QPushButton("工作区")
@@ -342,6 +340,16 @@ class AssistantPage(QWidget):
         self._skill_btn.setToolTip("挂载技能：之后每条消息自动带上「用 xx 技能」")
         self._skill_btn.clicked.connect(self._show_skill_menu)
         bar.addWidget(self._skill_btn)
+
+        # 多技能挂载区：每个已挂载技能一个可移除 chip（最多 5 个）
+        self._skill_chip_cont = QWidget()
+        self._skill_chip_cont.setObjectName("SkillChips")
+        chip_lay = QHBoxLayout(self._skill_chip_cont)
+        chip_lay.setContentsMargins(0, 0, 0, 0)
+        chip_lay.setSpacing(2)
+        self._skill_chip_lay = chip_lay
+        self._skill_chip_cont.setVisible(False)
+        bar.addWidget(self._skill_chip_cont)
 
         bar.addStretch(1)
 
@@ -456,6 +464,24 @@ class AssistantPage(QWidget):
         self._input.moveCursor(QTextCursor.End)
         self._input.setFocus()
 
+    # ---------------- 底栏 [+] 菜单：附件 + 四个管理入口 ----------------
+    def _build_attach_menu(self) -> "QMenu":
+        """[+] 弹出菜单：第一项「添加附件」走原逻辑，分隔线后四个管理入口。"""
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")  # 复用深浅样式
+        add = menu.addAction("添加附件…")
+        add.setToolTip("把本机文件加进本次提问（插入 @路径）")
+        add.triggered.connect(self._attach_file)
+        menu.addSeparator()
+        for label, key in (("技能", "skills"), ("工具", "tools"),
+                           ("MCP", "mcp"), ("审计", "audit")):
+            act = menu.addAction(label)
+            act.triggered.connect(lambda _c=False, k=key: self.open_manager(k))
+        return menu
+
+    def _show_attach_menu(self) -> None:
+        self._popup_above(self._build_attach_menu(), self._attach_btn)
+
     # ---------------- 左栏二级栏目：任务 / 空间（挂到主窗口 NavPanel） ----------------
     def build_nav_panel(self) -> QWidget:
         """一级「智能助理」下面的二级栏目，语义与 WorkBuddy 一致：
@@ -465,7 +491,6 @@ class AssistantPage(QWidget):
             空间 (M)                任务按所属工作区目录分组，点空间展开 / 收起
               ▸ 📁 llm-service  2
                   · 任务标题
-            技能 · 3 / 工具 · 14 / MCP · 0 / 审计
 
         「任务」= 一次对话（后端仍叫 session，数据格式不变），
         「空间」= 任务所属的工作区目录，等价于 WorkBuddy 里挂在某个文件夹下的任务。
@@ -511,37 +536,8 @@ class AssistantPage(QWidget):
         # stretch=1：让滚动区吃掉面板剩余高度（内容少时由 maxHeight 限制，不留白）
         lay.addWidget(self._nav_scroll, 1)
 
-        self._nav_entries: Dict[str, QPushButton] = {}
-        for key, label in (("skills", "技能"), ("tools", "工具"),
-                           ("mcp", "MCP"), ("audit", "审计")):
-            btn = QPushButton(label)
-            btn.setObjectName("NavSubItem")
-            # 固定 30：QSS 只给了 min-height:26，按钮自带内边距把它撑到 40，
-            # 4 个入口白吃 160px。高 DPI（本机 200%，窗口逻辑高只有 680）下，
-            # 这 40px 正好是「空间」那一行被挤出视口的原因。
-            btn.setFixedHeight(NAV_ENTRY_H)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _c=False, k=key: self.open_manager(k))
-            lay.addWidget(btn)
-            self._nav_entries[key] = btn
-        self._sync_nav_entries()
         self._rebuild_nav_tasks()
         return panel
-
-    def _sync_nav_entries(self) -> None:
-        """二级管理入口带数量（技能 3 / 工具 14 / MCP 0）。"""
-        entries = getattr(self, "_nav_entries", None) or {}
-        counts = {
-            "skills": len(self._state.get("skills") or []),
-            "tools": len(self._state.get("tools") or []),
-            "mcp": len(self._state.get("mcp") or []),
-        }
-        for key, label in (("skills", "技能"), ("tools", "工具"),
-                           ("mcp", "MCP"), ("audit", "审计")):
-            btn = entries.get(key)
-            if btn is None:
-                continue
-            btn.setText(f"{label} · {counts[key]}" if key in counts else label)
 
     # ---------------- 左栏：任务 / 空间 渲染 ----------------
     def _clear_nav_body(self) -> None:
@@ -1295,6 +1291,7 @@ class AssistantPage(QWidget):
         self._fill_models(pid)
 
         self._fill_skills(st.get("skills") or [])
+        self._refresh_skill_chips()
         self._fill_tools(st.get("tools") or [])
         self._fill_mcp(st.get("mcp") or [])
         self._fill_sessions()
@@ -1391,7 +1388,6 @@ class AssistantPage(QWidget):
 
     # ---------------- 二级栏目 / 管理面板填充 ----------------
     def _fill_skills(self, skills: List[Dict[str, Any]]) -> None:
-        self._sync_nav_entries()
         lst = getattr(self, "_skill_list", None)
         if lst is None:
             return
@@ -1405,7 +1401,6 @@ class AssistantPage(QWidget):
             lst.addItem("（暂无技能，点「新建」或「导入 zip」）")
 
     def _fill_tools(self, tools: List[Dict[str, Any]]) -> None:
-        self._sync_nav_entries()
         lst = getattr(self, "_tool_list", None)
         if lst is None:
             return
@@ -1418,7 +1413,6 @@ class AssistantPage(QWidget):
             lst.addItem(item)
 
     def _fill_mcp(self, servers: List[Dict[str, Any]]) -> None:
-        self._sync_nav_entries()
         lst = getattr(self, "_mcp_list", None)
         if lst is None:
             return
@@ -1587,8 +1581,9 @@ class AssistantPage(QWidget):
         self._add_bubble("user", text)
         self._begin_streaming()
 
-        # 技能 chip：挂载后每条消息自动带上「用 xx 技能」，输入框本身保持干净
-        message = f"用 {self._skill_slug} 技能：{text}" if self._skill_slug else text
+        # 技能 chip：挂载后每条消息自动带上「用 xx、yy 技能」，输入框本身保持干净
+        message = (f"用 {'、'.join(self._skill_slugs)} 技能：{text}"
+                   if self._skill_slugs else text)
         payload = {
             "session_id": self._session_id,
             "message": message,
@@ -1666,15 +1661,28 @@ class AssistantPage(QWidget):
         elif kind == "tool_call":
             self._finish_bubble()
             card = ToolCard(ev.get("name") or "", ev.get("summary") or "",
-                            ev.get("risk") or "low", ev.get("args") or {})
+                            ev.get("risk") or "low", ev.get("args") or {},
+                            index=ev.get("index"))
             self._tool_cards.append(card)
             self._append_widget(card)
             self._scroll_bottom()
         elif kind == "tool_result":
-            for card in reversed(self._tool_cards):
-                if card._name == ev.get("name") and card._result is None:
-                    card.set_result(bool(ev.get("ok")), ev.get("content") or "")
-                    break
+            # 优先按并行执行的调用序号（index）精确回填，避免同名/乱序串卡；
+            # 旧事件不带 index 时回退到按名称匹配。
+            idx = ev.get("index")
+            target = None
+            if idx is not None:
+                for card in self._tool_cards:
+                    if card._index == idx and card._result is None:
+                        target = card
+                        break
+            if target is None:
+                for card in reversed(self._tool_cards):
+                    if card._name == ev.get("name") and card._result is None:
+                        target = card
+                        break
+            if target is not None:
+                target.set_result(bool(ev.get("ok")), ev.get("content") or "")
             self._scroll_bottom()
         elif kind == "approval_request":
             card = ApprovalCard(ev.get("id") or "", ev.get("tool") or "",
@@ -1958,48 +1966,106 @@ class AssistantPage(QWidget):
         w.result.connect(lambda _r: self.refresh())
         w.start()
 
+    MAX_SKILLS = 5             # 单任务同时挂载上限（对标 WorkBuddy 多技能）
+
     def _show_skill_menu(self) -> None:
-        """技能 chip（WorkBuddy 的「× 团队」位）：挂载 / 更换 / 清除。"""
+        """技能 chip（WorkBuddy 的「× 团队」位）：多技能同时挂载，上限 5 个。"""
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
-        if self._skill_slug:
-            act = menu.addAction(f"✕ 清除 {self._skill_slug}")
-            act.triggered.connect(self._clear_skill)
-            menu.addSeparator()
+        note = menu.addAction(f"最多同时挂载 {self.MAX_SKILLS} 个")
+        note.setEnabled(False)
         skills = self._state.get("skills") or []
+        full = len(self._skill_slugs) >= self.MAX_SKILLS
         if not skills:
-            act = menu.addAction("（暂无技能，去左栏「技能」里新建或导入 zip）")
+            act = menu.addAction("（暂无技能，去底栏 [+] → 技能 里新建或导入 zip）")
             act.setEnabled(False)
-        for s in skills:
-            act = menu.addAction(s.get("name") or s.get("slug"))
-            act.setToolTip(s.get("description") or "")
-            act.setCheckable(True)
-            act.setChecked(s.get("slug") == self._skill_slug)
-            act.triggered.connect(
-                lambda _c=False, slug=s.get("slug") or "": self._use_skill(slug))
+        else:
+            menu.addSeparator()
+            for s in skills:
+                slug = s.get("slug") or ""
+                name = s.get("name") or slug
+                mounted = slug in self._skill_slugs
+                act = menu.addAction(name)
+                tip = s.get("description") or ""
+                if mounted:
+                    tip += "（已挂载）"
+                elif full:
+                    tip += "（已挂载 5 个，先移除一个）"
+                act.setToolTip(tip)
+                act.setCheckable(True)
+                act.setChecked(mounted)
+                if mounted:
+                    act.triggered.connect(
+                        lambda _c=False, sl=slug: self._remove_skill(sl))
+                else:
+                    if full:
+                        act.setEnabled(False)
+                    act.triggered.connect(
+                        lambda _c=False, sl=slug: self._add_skill(sl))
+        if self._skill_slugs:
+            menu.addSeparator()
+            clear = menu.addAction("清除全部")
+            clear.triggered.connect(self._clear_skills)
         self._popup_above(menu, self._skill_btn)
 
-    def _use_skill(self, slug: str) -> None:
-        """挂载技能：之后每条消息自动带上「用 xx 技能」，输入框本身保持干净。"""
-        if not slug:
+    def _add_skill(self, slug: str) -> None:
+        """挂载技能（最多 5 个）：之后每条消息自动带上「用 xx 技能」，输入框保持干净。"""
+        if not slug or slug in self._skill_slugs:
             return
-        self._skill_slug = slug
-        self._refresh_skill_btn()
-        self._set_status(f"已挂载技能：{slug}（发送时自动带上，再点可清除）")
+        if len(self._skill_slugs) >= self.MAX_SKILLS:
+            self._set_status(
+                f"最多同时挂载 {self.MAX_SKILLS} 个技能（先移除一个再挂）")
+            return
+        self._skill_slugs.append(slug)
+        self._refresh_skill_chips()
+        self._set_status(
+            f"已挂载技能：{slug}（当前 {len(self._skill_slugs)}/{self.MAX_SKILLS}）")
 
-    def _clear_skill(self) -> None:
-        self._skill_slug = ""
-        self._refresh_skill_btn()
-        self._set_status("已清除技能")
+    def _remove_skill(self, slug: str) -> None:
+        if slug in self._skill_slugs:
+            self._skill_slugs.remove(slug)
+            self._refresh_skill_chips()
+            self._set_status(f"已移除技能：{slug}")
 
-    def _refresh_skill_btn(self) -> None:
-        slug = self._skill_slug
-        self._skill_btn.setText(f"✕ {slug}" if slug else "技能")
-        self._skill_btn.setToolTip(
-            f"已挂载技能：{slug}\n点击更换或清除" if slug
-            else "挂载技能：之后每条消息自动带上「用 xx 技能」")
-        if bool(self._skill_btn.property("active")) != bool(slug):
-            self._skill_btn.setProperty("active", bool(slug))
+    def _clear_skills(self) -> None:
+        if not self._skill_slugs:
+            return
+        n = len(self._skill_slugs)
+        self._skill_slugs = []
+        self._refresh_skill_chips()
+        self._set_status(f"已清除 {n} 个挂载技能")
+
+    def _refresh_skill_chips(self) -> None:
+        """重绘挂载区：每个技能一个可移除 chip；占位按钮保持「技能」文案。"""
+        slugs = list(self._skill_slugs or [])
+        lay = getattr(self, "_skill_chip_lay", None)
+        if lay is not None:
+            while lay.count():
+                item = lay.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+            for slug in slugs:
+                chip = QPushButton(f"✕ {slug}")
+                chip.setObjectName("BarChip")
+                chip.setProperty("active", True)
+                chip.setCursor(Qt.PointingHandCursor)
+                chip.setToolTip(f"已挂载技能：{slug}\n点击移除")
+                chip.clicked.connect(
+                    lambda _c=False, s=slug: self._remove_skill(s))
+                lay.addWidget(chip)
+            cont = getattr(self, "_skill_chip_cont", None)
+            if cont is not None:
+                cont.setVisible(bool(slugs))
+        # 占位按钮：始终保持「技能」文案，挂载数变化时切换高亮与 tooltip
+        self._skill_btn.setText("技能")
+        has = bool(slugs)
+        tip = (f"已挂载 {len(slugs)} 个技能：" + "、".join(slugs) + "\n点击增删"
+               if slugs else "挂载技能：之后每条消息自动带上「用 xx 技能」")
+        self._skill_btn.setToolTip(tip)
+        if bool(self._skill_btn.property("active")) != has:
+            self._skill_btn.setProperty("active", has)
             self._skill_btn.style().unpolish(self._skill_btn)
             self._skill_btn.style().polish(self._skill_btn)
 

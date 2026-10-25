@@ -777,8 +777,8 @@ QTabBar::tab:hover { color: #d6dbe8; }
     border: none;
     border-radius: 6px;
     text-align: left;
-    /* 行高由代码 setFixedHeight(NAV_ENTRY_H) 定死：QSS 的 min-height 会和
-       按钮内边距叠加，把 4 个入口撑到 40px，高 DPI 下正好挤掉「空间」那一行 */
+    /* 注：1.0.8 起左栏已无「技能/工具/MCP/审计」二级入口（迁到底栏 [+] 菜单），
+       此处样式保留以兼容历史主题，新代码不再使用 #NavSubItem 对象名 */
     padding: 0 0 0 26px;
     font-size: 12px;
 }
