@@ -37,7 +37,8 @@ import tempfile
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import (QColor, QIcon, QPainter, QPainterPath, QPixmap,
+                           QTextCursor)
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QFrame, QHBoxLayout, QInputDialog,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog
 
 from core.assistant_client import AssistantApi, AssistantStream
 from core.task_runner import Worker
+from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, ChatBubble, StepLine,
                                        ThinkingCard, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
@@ -1290,6 +1292,7 @@ class AssistantPage(QWidget):
             self._active_model = str(provider.get("model") or "")
         self._fill_models(pid)
 
+        self._skill_btn.setIcon(self._skill_icon())
         self._fill_skills(st.get("skills") or [])
         self._refresh_skill_chips()
         self._fill_tools(st.get("tools") or [])
@@ -1332,6 +1335,32 @@ class AssistantPage(QWidget):
         self._policy_btn.setText(f"{POLICY_ICON.get(pid, '⊘')} {label}")
         self._policy_btn.setToolTip(f"审批策略：{label}\n{tip}\n（点击切换）")
 
+    def _skill_icon(self) -> QIcon:
+        """WorkBuddy 风格的技能图标：四角星芒 + 伴星，颜色随深浅主题切换。"""
+        bg = str(getattr(self.config, "background_color", "") or "#0f1117")
+        color = QColor("#e8ecf5" if not is_light(bg) else "#232a38")
+        s = 32                      # 2x 绘制抗锯齿，显示时缩到 14~16px
+        pm = QPixmap(s, s)
+        pm.fill(Qt.GlobalColor.transparent)
+
+        def star(cx: float, cy: float, r: float) -> QPainterPath:
+            path = QPainterPath()
+            path.moveTo(cx, cy - r)
+            path.quadTo(cx, cy, cx + r, cy)
+            path.quadTo(cx, cy, cx, cy + r)
+            path.quadTo(cx, cy, cx - r, cy)
+            path.quadTo(cx, cy, cx, cy - r)
+            return path
+
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawPath(star(s * 0.42, s * 0.58, s * 0.34))   # 主星（左下）
+        p.drawPath(star(s * 0.78, s * 0.22, s * 0.15))   # 伴星（右上）
+        p.end()
+        return QIcon(pm)
+
     def _refresh_model_btn(self) -> None:
         names = self._model_cache.get(self._active_provider) or []
         model = self._active_model or (names[0] if names else "")
@@ -1362,10 +1391,17 @@ class AssistantPage(QWidget):
         def collect() -> List[str]:
             if provider_id == "local":
                 try:
+                    # 只列「真的在模型目录里」的模型：downloaded 由网关按 gguf
+                    # 是否存在标记；loaded（运行中）必然存在。
                     return [m.get("id") for m in self.api.list_models()
-                            if isinstance(m, dict) and m.get("id")]
+                            if isinstance(m, dict) and m.get("id")
+                            and (m.get("downloaded") or m.get("loaded"))]
                 except Exception:
                     return []
+            if provider_id != "siliconflow":
+                # 自定义（OpenAI 兼容）提供商：模型名来自提供商配置本身
+                m = str(provider.get("model") or "").strip()
+                return [m] if m else []
             try:
                 items = json.loads(self._settings.value("chat/cloud_models", "") or "[]")
             except Exception:
@@ -1772,8 +1808,11 @@ class AssistantPage(QWidget):
     # ------------------------------------------------------------------ #
     # 底栏：模型 / 审批策略 / 工作区 / 技能
     # ------------------------------------------------------------------ #
-    def _show_model_menu(self) -> None:
-        """模型下拉（WorkBuddy 的「模型 ⌄」位）：来源 + 模型 + 密钥一屏搞定。"""
+    def _build_model_menu(self) -> QMenu:
+        """构建模型下拉（WorkBuddy 的「模型 ⌄」位）：来源 + 模型 + 配置入口。
+
+        拆出构建段便于无头测试（_show_model_menu 只负责弹出，exec 会阻塞）。
+        """
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
 
@@ -1797,8 +1836,13 @@ class AssistantPage(QWidget):
                 act.setChecked(n == self._active_model)
                 act.triggered.connect(lambda _c=False, m=n: self._set_model(m))
             if len(names) > 20:
-                more = menu.addAction(f"（还有 {len(names) - 20} 个，去「管理」里选）")
-                more.setEnabled(False)
+                # 超出部分收进可点开的子菜单（之前是禁用的一行字，用户找不到入口）
+                more = menu.addMenu(f"还有 {len(names) - 20} 个模型 ▸")
+                for n in names[20:]:
+                    act = more.addAction(n)
+                    act.setCheckable(True)
+                    act.setChecked(n == self._active_model)
+                    act.triggered.connect(lambda _c=False, m=n: self._set_model(m))
         else:
             act = menu.addAction("（暂无可用模型，点下面刷新）")
             act.setEnabled(False)
@@ -1809,7 +1853,56 @@ class AssistantPage(QWidget):
         if self._active_provider != "local":
             act = menu.addAction("配置密钥与端点…")
             act.triggered.connect(self._edit_provider)
-        self._popup_above(menu, self._model_btn)
+        custom = next((p for p in (self._state.get("providers") or [])
+                       if p.get("id") == "custom"), {})
+        label = ("自定义模型配置…" if custom.get("enabled")
+                 else "添加自定义模型…")
+        act = menu.addAction(label)
+        act.triggered.connect(self._configure_custom_provider)
+        return menu
+
+    def _show_model_menu(self) -> None:
+        self._popup_above(self._build_model_menu(), self._model_btn)
+
+    def _configure_custom_provider(self) -> None:
+        """添加/编辑「自定义（OpenAI 兼容）」提供商：填端点 + Key + 模型即可用。
+
+        一次保存同时写 providers 与 active_provider，避免两个异步 Worker
+        竞态导致「启用了但没切过去」。要求必须填模型名（非本地提供商
+        resolve_model 需要显式模型）。
+        """
+        providers = [dict(p) for p in (self._state.get("providers") or [])]
+        custom = next((p for p in providers if p.get("id") == "custom"), None)
+        if custom is None:      # 老配置没有内置 custom 条目，现场补一个
+            custom = {"id": "custom", "label": "自定义（OpenAI 兼容）",
+                      "kind": "openai", "enabled": False, "base_url": "",
+                      "api_key": "", "model": ""}
+            providers.append(custom)
+        dlg = ProviderDialog(self, custom)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        patch = dlg.payload() or {}
+        base = str(patch.get("base_url") or "").strip()
+        model = str(patch.get("model") or custom.get("model") or "").strip()
+        if not base:
+            self._set_status("Base URL 不能为空，自定义模型未保存")
+            return
+        if not model:
+            self._set_status("请填写默认模型名（如 Qwen/Qwen3-8B），自定义模型未保存")
+            return
+        custom.update(patch)
+        custom["enabled"] = True
+        # 本地状态先更新，界面立即切过去；后端保存异步跟进
+        self._state["providers"] = providers
+        self._active_provider = "custom"
+        self._active_model = model
+        self._refresh_model_btn()
+        self._fill_models("custom")
+        w = Worker(self._assist.save_settings,
+                   {"providers": providers, "active_provider": "custom"})
+        w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
+        w.start()
+        self._set_status(f"自定义模型已启用：{base}")
 
     def _set_provider(self, pid: str) -> None:
         if not pid or pid == self._active_provider:
@@ -1868,6 +1961,7 @@ class AssistantPage(QWidget):
     def _show_policy_menu(self) -> None:
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
+        menu.setToolTipsVisible(True)
         cur = str(self._state.get("policy") or "readonly_auto")
         for pid, label, tip in POLICY_ITEMS:
             act = menu.addAction(f"{POLICY_ICON.get(pid, '')} {label}".strip())
@@ -1968,10 +2062,15 @@ class AssistantPage(QWidget):
 
     MAX_SKILLS = 5             # 单任务同时挂载上限（对标 WorkBuddy 多技能）
 
-    def _show_skill_menu(self) -> None:
-        """技能 chip（WorkBuddy 的「× 团队」位）：多技能同时挂载，上限 5 个。"""
+    def _build_skill_menu(self) -> QMenu:
+        """构建技能菜单（多技能同时挂载，上限 5 个）。
+
+        鼠标悬停技能项显示详细介绍（SKILL.md 的 description + 工具数）——
+        QMenu 必须开 setToolTipsVisible(True)，否则 setToolTip 不显示。
+        """
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
+        menu.setToolTipsVisible(True)
         note = menu.addAction(f"最多同时挂载 {self.MAX_SKILLS} 个")
         note.setEnabled(False)
         skills = self._state.get("skills") or []
@@ -1986,11 +2085,16 @@ class AssistantPage(QWidget):
                 name = s.get("name") or slug
                 mounted = slug in self._skill_slugs
                 act = menu.addAction(name)
-                tip = s.get("description") or ""
+                tip = str(s.get("description") or "").strip()
+                ntools = len(s.get("tools") or [])
+                if ntools:
+                    tip = f"{tip}\n包含 {ntools} 个工具" if tip \
+                        else f"包含 {ntools} 个工具"
                 if mounted:
-                    tip += "（已挂载）"
+                    tip = f"{tip}\n已挂载" if tip else "已挂载"
                 elif full:
-                    tip += "（已挂载 5 个，先移除一个）"
+                    tip = f"{tip}\n已挂载 {self.MAX_SKILLS} 个，先移除一个" if tip \
+                        else "已挂载 5 个，先移除一个"
                 act.setToolTip(tip)
                 act.setCheckable(True)
                 act.setChecked(mounted)
@@ -2006,7 +2110,10 @@ class AssistantPage(QWidget):
             menu.addSeparator()
             clear = menu.addAction("清除全部")
             clear.triggered.connect(self._clear_skills)
-        self._popup_above(menu, self._skill_btn)
+        return menu
+
+    def _show_skill_menu(self) -> None:
+        self._popup_above(self._build_skill_menu(), self._skill_btn)
 
     def _add_skill(self, slug: str) -> None:
         """挂载技能（最多 5 个）：之后每条消息自动带上「用 xx 技能」，输入框保持干净。"""

@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import HTTPException
 
 from core.pool import get_model_pool, ModelPoolError
-from core.config import load_registry, list_keys
+from core.config import load_registry, list_keys, MODELS_DIR
 from core.system import detect_system
 
 logger = logging.getLogger("llm-service")
@@ -367,17 +367,35 @@ def health():
     }
 
 
+def _gguf_downloaded(name: str, info: Dict[str, Any]) -> bool:
+    """该模型注册的 gguf 文件是否真的落在当前模型目录（MODELS_DIR）里。
+
+    注册表里有大量「内置目录 + 历史下载记录」的条目，gguf 并不在用户当前
+    配置的模型目录里——对话页/智能助理的本地模型清单只应显示真正可加载的
+    模型，靠这个标记过滤（客户端拿 downloaded / loaded 任一为真即可用）。
+    """
+    gguf = str(info.get("gguf") or f"{name}.gguf")
+    path = gguf if os.path.isabs(gguf) else os.path.join(MODELS_DIR, gguf)
+    try:
+        return os.path.exists(path)
+    except OSError:
+        return False
+
+
 @router.get("/v1/models", dependencies=[Depends(require_key)])
 def list_models():
-    """模型列表：来自注册表，loaded 标记来自 ModelPool。"""
+    """模型列表：来自注册表，loaded 标记来自 ModelPool，downloaded 标记
+    表示 gguf 文件确实存在于当前模型目录（智能助理/对话页据此只列已下载模型）。"""
     pool = get_model_pool()
     loaded_names = {e["name"] for e in pool.list_loaded()}
+    reg = load_registry()
     data = [{
         "id": name,
         "object": "model",
         "owned_by": "local",
         "loaded": name in loaded_names,
-    } for name in load_registry().keys()]
+        "downloaded": _gguf_downloaded(name, reg.get(name) or {}),
+    } for name in reg.keys()]
     return {"object": "list", "data": data}
 
 

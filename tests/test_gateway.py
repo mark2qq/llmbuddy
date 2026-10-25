@@ -51,6 +51,21 @@ def test_v1_models(client):
     for it in items:
         assert "loaded" in it, "每个模型应有 loaded 标记"
         assert isinstance(it["loaded"], bool)
+        assert "downloaded" in it, "每个模型应有 downloaded 标记"
+        assert isinstance(it["downloaded"], bool)
+
+
+def test_gguf_downloaded_flag(tmp_path, monkeypatch):
+    """downloaded 标记：gguf 真在模型目录里才算已下载（含绝对路径写法）。"""
+    from routers import gateway as gw
+    (tmp_path / "present.gguf").write_bytes(b"x")
+    monkeypatch.setattr(gw, "MODELS_DIR", str(tmp_path))
+    assert gw._gguf_downloaded("present", {"gguf": "present.gguf"}) is True
+    assert gw._gguf_downloaded("absent", {"gguf": "absent.gguf"}) is False
+    assert gw._gguf_downloaded(
+        "abs", {"gguf": str(tmp_path / "present.gguf")}) is True
+    # 注册表条目缺 gguf 字段时按 name.gguf 兜底，文件不存在 → False
+    assert gw._gguf_downloaded("ghost", {}) is False
 
 
 # ---------------------------------------------------------------------------

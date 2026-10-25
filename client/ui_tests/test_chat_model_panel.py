@@ -80,9 +80,9 @@ class _FakeApi:
     def list_models(self):
         # 与 api_client.list_models() 解包后一致：返回列表
         return [
-            {"id": "qwen3-4b"},
-            {"id": "llama-3.1-8b"},
-            {"id": "deepseek-7b"},
+            {"id": "qwen3-4b", "downloaded": True},
+            {"id": "llama-3.1-8b", "downloaded": True},
+            {"id": "deepseek-7b", "downloaded": True},
         ]
 
     def chat_stream(self, *a, **k):  # pragma: no cover

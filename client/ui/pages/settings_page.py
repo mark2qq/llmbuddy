@@ -248,9 +248,8 @@ class SettingsPage(QWidget):
             else:
                 files = self._count_gguf(path)
                 if files:
-                    self._models_hint.setText(
-                        f"该目录已有 {len(files)} 个模型：" + "、".join(files[:3])
-                        + ("…" if len(files) > 3 else ""))
+                    # 只提示数量，不列模型名（模型清单在「模型库」页看）
+                    self._models_hint.setText(f"该目录已有 {len(files)} 个模型")
                 else:
                     self._models_hint.setText("该目录下还没有 .gguf 模型文件")
         except Exception:  # noqa: BLE001

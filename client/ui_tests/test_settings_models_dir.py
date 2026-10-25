@@ -196,7 +196,9 @@ def test_models_hint_counts_gguf(tmp_path, monkeypatch):
     page._refresh_models_hint()
     text = page._models_hint.text()
     assert "2 个模型" in text
-    assert "a.gguf" in text
+    # 只显示数量，不显示已下载模型名（模型清单在「模型库」页看）
+    assert "a.gguf" not in text
+    assert "b.gguf" not in text
 
 
 def test_models_hint_empty_dir(tmp_path, monkeypatch):

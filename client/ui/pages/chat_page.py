@@ -453,7 +453,11 @@ class ChatPage(QWidget):
             dl = self.api.list_models() or []
         except Exception:
             dl = []
-        downloaded = [m.get("id") for m in dl if m.get("id")]
+        # 只认「真的在模型目录里」的模型：downloaded 由网关按 gguf 是否存在标记，
+        # loaded（运行中）必然已存在。注册表里的内置/历史条目不再混进来。
+        downloaded = [m.get("id") for m in dl
+                      if isinstance(m, dict) and m.get("id")
+                      and (m.get("downloaded") or m.get("loaded"))]
         all_local = sorted(set(loaded_names) | set(downloaded))
         not_running = [n for n in all_local if n not in running]
         return {"running": running, "not_running": not_running}

@@ -353,6 +353,105 @@ def test_sixth_skill_rejected(page):
     assert "skill-5" not in p._skill_slugs
 
 
+def test_skill_menu_hover_shows_detail(page):
+    """技能菜单悬停显示详细介绍：description + 工具数（setToolTipsVisible）。"""
+    p, _fake = page
+    menu = p._build_skill_menu()
+    assert menu.toolTipsVisible() is True
+    act = next(a for a in menu.actions() if a.text() == "repo-digest")
+    tip = act.toolTip()
+    assert "代码摘要" in tip              # SKILL.md description
+    assert "1 个工具" in tip              # 工具数
+
+
+def test_skill_btn_has_sparkle_icon(page):
+    """「技能」按钮带 WorkBuddy 风格星芒图标（随状态回填生成，非空图标）。"""
+    p, _fake = page
+    assert not p._skill_btn.icon().isNull()
+    icon = p._skill_icon()
+    assert not icon.isNull()
+    assert not icon.pixmap(32, 32).isNull()
+
+
+def test_model_menu_overflow_into_submenu(page):
+    """超过 20 个模型收进「还有 N 个模型 ▸」可点开的子菜单（不再是禁用的一行字）。"""
+    p, _fake = page
+    p._model_cache["local"] = [f"model-{i:02d}" for i in range(25)]
+    menu = p._build_model_menu()
+    texts = [a.text() for a in menu.actions() if a.text()]
+    more_text = next(t for t in texts if t.startswith("还有"))
+    assert more_text == "还有 5 个模型 ▸"
+    more_action = next(a for a in menu.actions() if a.text() == more_text)
+    assert more_action.isEnabled()       # 可点开（之前 setEnabled(False) 找不到入口）
+    sub = more_action.menu()
+    assert sub is not None
+    sub_names = [a.text() for a in sub.actions()]
+    assert sub_names == [f"model-{i:02d}" for i in range(20, 25)]
+
+
+def test_model_menu_has_custom_model_entry(page):
+    """模型菜单带「添加自定义模型…」入口；custom 启用后变为「自定义模型配置…」。"""
+    p, fake = page
+    menu = p._build_model_menu()
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "添加自定义模型…" in texts
+
+    # 走一遍配置流程：填端点 + 模型 → 启用 custom 并切换
+    from ui.pages.assistant_page import ProviderDialog
+
+    class _Dlg:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def payload(self):
+            return {"base_url": "https://api.deepseek.com/v1",
+                    "model": "deepseek-chat", "api_key": "sk-test"}
+
+    orig = ProviderDialog
+    try:
+        import ui.pages.assistant_page as mod
+        mod.ProviderDialog = _Dlg
+        p._configure_custom_provider()
+    finally:
+        mod.ProviderDialog = orig
+    assert p._active_provider == "custom"
+    assert p._active_model == "deepseek-chat"
+    prov = next(x for x in p._state["providers"] if x.get("id") == "custom")
+    assert prov["enabled"] is True
+    assert prov["base_url"] == "https://api.deepseek.com/v1"
+    assert _pump(lambda: fake.saved.get("active_provider") == "custom")
+    assert _pump(lambda: bool(fake.saved.get("providers")))
+    saved = {x["id"]: x for x in fake.saved["providers"]}
+    assert saved["custom"]["enabled"] is True
+
+    # 菜单文案切换为「自定义模型配置…」，且模型列表来自提供商配置本身
+    assert _pump(lambda: p._model_cache.get("custom") == ["deepseek-chat"])
+    menu2 = p._build_model_menu()
+    texts2 = [a.text() for a in menu2.actions() if a.text()]
+    assert "自定义模型配置…" in texts2
+    assert "deepseek-chat" in texts2
+
+
+def test_local_models_filtered_by_downloaded(page, monkeypatch):
+    """本地模型清单只认真的在模型目录里的模型（downloaded/loaded 任一为真）。"""
+    p, _fake = page
+
+    class _Api2:
+        def list_models(self):
+            return [
+                {"id": "in-dir", "loaded": False, "downloaded": True},
+                {"id": "running", "loaded": True, "downloaded": True},
+                {"id": "ghost-builtin", "loaded": False, "downloaded": False},
+            ]
+
+    p.api = _Api2()
+    p._fill_models("local")
+    assert _pump(lambda: p._model_cache.get("local") == ["in-dir", "running"])
+
+
 # ---------------------------------------------------------------------------
 # 管理面板（原右侧 tab 面板）
 # ---------------------------------------------------------------------------

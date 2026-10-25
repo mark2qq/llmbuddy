@@ -35,8 +35,8 @@ class _FakeApi:
         return {"loaded": [{"name": "qwen3-4b", "status": "ready"}]}
 
     def list_models(self):
-        return [{"id": "qwen3-4b", "loaded": True},
-                {"id": "deepseek-7b", "loaded": False}]
+        return [{"id": "qwen3-4b", "loaded": True, "downloaded": True},
+                {"id": "deepseek-7b", "loaded": False, "downloaded": True}]
 
     def list_keys(self):
         return []
