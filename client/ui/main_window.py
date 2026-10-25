@@ -169,6 +169,14 @@ class MainWindow(QMainWindow):
         # 二级栏目属于「智能助理」页：切到别的页就收起，不占用导航高度
         if getattr(self, "_assistant_nav_host", None) is not None:
             self._assistant_nav_host.setVisible(idx == 0)
+        # 面包屑：切页是排查崩溃最常见的关键动作
+        try:
+            from core import ui_trace
+            btn = self._nav_buttons[idx] if 0 <= idx < len(self._nav_buttons) else None
+            ui_trace.trace("[page] %s -> %s" % (
+                idx, btn.text() if btn is not None else "?"))
+        except Exception:  # noqa: BLE001
+            pass
         if refresh:
             w = self._stack.currentWidget()
             if w is not None:

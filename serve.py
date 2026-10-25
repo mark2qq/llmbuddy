@@ -11,9 +11,8 @@
     对外端口 LLM_PORT（默认 8000）：OpenAI 兼容接口 + 管理接口，供其它智能体调用
     引擎内部端口 LLM_ENGINE_PORT（默认 7999）：仅本机 127.0.0.1，不对外
 
-启动：
-    C:\Program Files\Python311\python.exe E:\llm-service\serve.py
-或双击 E:\llm-service\start.bat
+启动（或用 start.bat）：
+    <python.exe> serve.py
 """
 
 import os
@@ -92,6 +91,17 @@ def run() -> None:
     import uvicorn
 
     logger.info("Local LLM Service on %s:%d (engine_base=%d)", HOST, PORT, ENGINE_BASE_PORT)
+    # 把实际生效的模型目录打出来：用户「改了设置里的模型目录但模型库没变」时，
+    # 第一眼要看的就是这里——后端只在启动时读 LLM_MODELS_DIR，改配置不重启无效。
+    try:
+        from core import config as _cfg
+        logger.info("models_dir = %s (exists=%s, gguf=%d)",
+                    _cfg.MODELS_DIR, os.path.isdir(_cfg.MODELS_DIR),
+                    len([f for f in os.listdir(_cfg.MODELS_DIR)
+                         if f.lower().endswith(".gguf")])
+                    if os.path.isdir(_cfg.MODELS_DIR) else 0)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("log models_dir failed: %s", _e)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

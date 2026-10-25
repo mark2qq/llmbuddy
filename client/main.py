@@ -14,6 +14,7 @@
 import os
 import sys
 import time
+import atexit
 
 from app_config import DATA_DIRNAME  # 用户数据目录名（llmBuddy；旧名 LLMDesktop 已迁移）
 
@@ -44,6 +45,18 @@ def _install_crash_handler() -> None:
                 f.write("\n=== crash %s ===\n"
                         % time.strftime("%Y-%m-%d %H:%M:%S"))
                 traceback.print_exception(etype, exc, tb, file=f)
+                # 附上崩溃前最后的 UI 动作：光有栈往往不够，
+                # 「用户刚才点了什么」才是定位入口
+                try:
+                    ap = os.path.join(log_dir, "logs", "actions.log")
+                    if os.path.exists(ap):
+                        with open(ap, "r", encoding="utf-8",
+                                  errors="replace") as af:
+                            tail = af.readlines()[-25:]
+                        f.write("--- 崩溃前最后动作 ---\n")
+                        f.writelines(tail)
+                except Exception:  # noqa: BLE001
+                    pass
             detail = "程序启动失败，错误已记录到：\n%s\n\n%s: %s" % (
                 log_path, getattr(etype, "__name__", "Error"), exc)
         except Exception as e:  # noqa: BLE001
@@ -110,6 +123,21 @@ def _startup_log(msg: str) -> None:
         with open(os.path.join(d, "startup.log"), "a", encoding="utf-8") as f:
             f.write("%s  %s\n" % (time.strftime("%H:%M:%S"), msg))
     except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# UI 动作面包屑：原生崩溃（0xC0000409 / 0x8001010E）不会被 excepthook 捕获，
+# 记下「最后一次点了什么」才能在崩溃后推断现场。日志见
+# %LOCALAPPDATA%/llmBuddy/logs/actions.log（末尾没有 normal exit 即表示崩溃）。
+# ---------------------------------------------------------------------------
+def _install_action_trace(app) -> None:
+    try:
+        from core import ui_trace
+        ui_trace.mark_session_start()
+        ui_trace.install(app)
+        atexit.register(ui_trace.mark_normal_exit)
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -263,6 +291,7 @@ def main() -> None:
     # 托盘应用：关闭/隐藏窗口不退出进程（仅托盘“退出”才真正退出）
     app.setQuitOnLastWindowClosed(False)
     _startup_log("QApplication created")
+    _install_action_trace(app)
     install_translations(app)
     _startup_log("translations installed=%s" % bool(_TRANSLATORS))
 

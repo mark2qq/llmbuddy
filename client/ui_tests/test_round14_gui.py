@@ -84,10 +84,15 @@ def test_global_key_item_exists_and_generates_unbound(monkeypatch):
     """第 0 项为全局 Key 入口；选中后「生成」创建不绑定模型的 Key。"""
     import ui.pages.api_page as api_page_mod
 
-    # 生成成功后弹的是模态 ApiKeyDialog（exec 会阻塞无头测试），替换为空壳
+    # 生成成功后弹的是模态 ApiKeyDialog（exec 会阻塞无头测试），替换为空壳。
+    # 注意必须等 exec 真正返回再结束测试：Worker 的 result 信号是**异步**派发
+    # 的，若 monkeypatch 还原后信号才到，_show_key 就会弹出真模态框，把整个
+    # pytest 进程永久挂住（整目录跑时稳定复现，单文件跑看时序）。
+    dialog_calls = []
+
     class _NoDialog:
         def __init__(self, *a, **k):
-            pass
+            dialog_calls.append(1)
 
         def exec(self):
             return 0
@@ -114,7 +119,10 @@ def test_global_key_item_exists_and_generates_unbound(monkeypatch):
     assert "全局 Key" in p._key_model_label.text()
 
     p._on_generate()
-    _spin(until=lambda: api.generated)
+    # 等 _show_key 完整跑完（含 dialog.exec 返回），而不是只等 generated——
+    # generated 在 Worker 线程里先满足，_ok 弹框那一步还在主线程队列里排着。
+    ok = _spin(until=lambda: dialog_calls and p._key_label.text() == "f" * 64)
+    assert ok, "生成回调未在限时内完成"
     assert api.generated == [None], "全局项应生成不绑定模型的 Key"
 
 
