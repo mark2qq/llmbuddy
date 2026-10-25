@@ -1,0 +1,118 @@
+%% 智能助理 · 引导会话（消息排队）—— 时序图集（增量 v1）
+%% 关联：docs/智能助理-引导会话-架构设计.md
+%% 注意：本文件为「引导会话」增量专属；基础项目的时序图见 docs/sequence-diagram.mermaid，勿覆盖。
+
+%% 时序图 1：排队路径（忙碌态 Enter / ↑）
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant P as AssistantPage
+    participant API as AssistantApi(REST)
+    participant R as routers/assistant.py
+    participant Q as AssistantQueue
+    participant G as SSE gen()（活跃流）
+    participant A as Assistant（agent 线程，本轮继续）
+
+    U->>P: Enter 或点 ↑（_busy=True）
+    P->>P: _on_send_clicked → _enqueue_message(text, guided=False)
+    P->>API: enqueue(sid, text, guided=False)
+    API->>R: POST /chat {session_id, message, mode:"queue", stream:false}
+    R->>R: 命中 _STREAM_SINKS[sid]（有活跃流）→ 入队
+    R->>Q: enqueue(sid, text, guided=False)
+    Q-->>R: QueueItem(id, text, guided=False)
+    R->>G: _broadcast queued(id, text, time, index)
+    R->>G: _broadcast queue(全量快照 + paused)
+    R-->>API: ok({queued: item, paused})
+    API-->>P: result
+    P->>P: 清空输入框 / 状态栏「已排队」
+    G-->>P: SSE queued → StepLine「已排队」
+    G-->>P: SSE queue → _apply_queue 重渲染面板（新行出现）
+    Note over A: 当前轮 start_turn 不受任何影响，持续输出
+
+%% 时序图 2：引导路径（Shift+Enter / ⚡）
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant P as AssistantPage
+    participant API as AssistantApi(REST)
+    participant R as routers/assistant.py
+    participant Q as AssistantQueue
+    participant G as SSE gen()（活跃流）
+    participant A as Assistant（agent 线程）
+
+    U->>P: Shift+Enter 或点 ⚡（_busy=True）
+    P->>P: _on_guide_clicked → _enqueue_message(text, guided=True)
+    P->>API: enqueue(sid, text, guided=True)
+    API->>R: POST /chat {mode:"guided", stream:false}
+    R->>Q: enqueue(sid, text, guided=True)
+    Q-->>R: QueueItem(guided=True)
+    R->>G: _broadcast guided(id, text, time)
+    R->>G: _broadcast queue(快照：引导行只读)
+    R-->>API: ok({queued: item})
+    API-->>P: result（清输入框）
+    G-->>P: SSE guided → 用户气泡(带 HH:MM) + StepLine「已引导发出」
+    G-->>P: SSE queue → 面板增只读行（⚡，无编辑/删除）
+    Note over P,A: 引导消息未写入 session messages；<br/>出队时由 start_turn 落库；当前轮输出不中断
+
+%% 时序图 3：本轮结束自动消费（FIFO 续跑，同一条 SSE 连接）
+sequenceDiagram
+    autonumber
+    participant G as SSE gen()
+    participant T as agent 线程（start_turn）
+    participant Q as AssistantQueue
+    participant P as AssistantPage
+
+    Note over G: gen() 主循环：text_now = 首条消息
+    G->>T: 起 daemon 线程 start_turn(session, text_now, emit)
+    loop 单轮内（工具循环 ≤12 轮）
+        T-->>G: delta / tool_call / tool_result / approval_* …
+        G-->>P: 原样转发
+    end
+    T-->>G: end(content, error)（agent 单轮收尾）
+    Note over G: 吞掉单轮 end，只记录 last={content,error}
+    G->>Q: is_paused(session)？
+    Q-->>G: False
+    G->>Q: pop_next(session)
+    Q-->>G: QueueItem（FIFO 下一条）
+    G-->>P: dequeued(id, text, mode, time)
+    G-->>P: queue(快照：该行消失)
+    P->>P: mode=queue → 补用户气泡；mode=guided → 仅 StepLine
+    G->>T: 起新线程 start_turn(..., 该条 text)
+    Note over T: …下一轮（工具循环同前述）…
+    T-->>G: end
+    G->>Q: pop_next → None（队列耗尽）
+    G-->>P: end(content, error, paused)（整条流唯一一次）
+    G-->>P: data: [DONE]
+    P->>P: _end_streaming()（忙碌态解除）
+
+%% 时序图 4：停止 + 暂停 + 继续
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant P as AssistantPage
+    participant R as routers/assistant.py
+    participant A as Assistant（agent 线程）
+    participant Q as AssistantQueue
+    participant G as SSE gen()
+
+    U->>P: 点 ■ 停止
+    P->>P: _stop()：stream.cancel()（本地断开）
+    P->>R: POST /stop {session_id}
+    R->>A: stop(session)（取消标志）
+    R->>Q: set_paused(session, True)
+    R->>R: _broadcast queue_state(paused=true) + queue 快照（其他在线端）
+    R-->>P: ok({stopped:true})
+    A-->>G: stopped（线程下一检查点退出）
+    G->>Q: is_paused → True
+    Note over G: 发出 queue_state(paused=true) + end + [DONE]，sink 注销<br/>（本地流已断，这些事件到不了本客户端，故主动拉快照）
+    P->>R: GET /queue?session_id=（stop 成功回调里串行发起）
+    R-->>P: {items:[...], paused:true}
+    P->>P: _apply_queue：面板保留 + 「继续」按钮可见
+    U->>P: 点「继续」
+    P->>R: POST /chat {session_id, mode:"resume", stream:true}
+    R->>Q: set_paused(False) + pop_next()
+    Q-->>R: QueueItem（队头条）
+    R-->>P: 新 SSE 流（session → queue_state(paused=false) → queue 快照）
+    P->>P: _begin_streaming()（重新进入忙碌态）
+    R->>A: gen 内起线程 start_turn(..., 队头条 text)
+    Note over R,A: 之后回到「自动消费」路径（时序图 3）

@@ -12,6 +12,16 @@
     - SSE 事件渲染：delta → 气泡；tool_call → 工具卡片；approval_request → 审批卡
     - 技能 chip：挂载后发消息自动带「用 xx 技能」前缀，输入框不被改写
     - 浅色主题覆盖新增的选择器
+
+1.0.9 引导会话（消息排队）增量验证点：
+    - 忙碌态 ↑=排队入队（不再丢弃消息）、⚡=引导发送、状态机 tooltip/placeholder
+    - 入队失败保留输入框文本；入队不新建 SSE 流
+    - queue 快照驱动面板显隐 / 行数 / 序号；引导行只读（无操作按钮）
+    - 行内编辑 / 删除 / 排序 / 全部清除的 REST 参数；首行禁 ↑、末行禁 ↓
+    - guided → 用户气泡 + HH:MM；dequeued(queue) 补气泡、guided 不重复
+    - done 不结束忙碌、end 才结束；end(paused) 显示「继续」
+    - 停止 → 拉快照保留暂停态 → 「继续」发 mode=resume 新流
+    - 切换任务重置队列并按新 sid 拉快照
 """
 import os
 import sys
@@ -32,6 +42,7 @@ import pytest  # noqa: E402
 from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
                                QInputDialog, QLabel, QPushButton, QMessageBox)
+from ui.widgets.assistant_cards import ChatBubble  # noqa: E402
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -82,6 +93,16 @@ class _FakeAssistApi:
         self.created_ws = ""
         self.patches = []         # (sid, patch)：置顶/重命名/归档走这里
         self.tasks = [dict(self.TASK)]
+        # 引导会话队列（1.0.9）
+        self.enqueued = []        # (sid, text, guided)：入队/引导记账
+        self.queue_error = ""     # 非空则 enqueue 抛错（模拟后端拒绝）
+        self.q_items = []         # 队列快照条目（各变更方法同步维护）
+        self.q_paused = False     # 队列暂停态（/stop 置 True）
+        self.queue_calls = []     # GET /queue 拉过哪些 sid
+        self.updated = []         # (sid, item_id, text)
+        self.deleted_items = []   # (sid, item_id)
+        self.moved = []           # (sid, item_id, delta)
+        self.cleared = []         # sid
 
     def spaces(self):
         return [{"path": r"E://tmp//ws", "name": "ws", "count": len(self.tasks),
@@ -151,6 +172,55 @@ class _FakeAssistApi:
     def stop(self, sid):
         return {"stopped": True}
 
+    # ---------------- 引导会话队列（1.0.9） ----------------
+    def queue(self, sid):
+        """GET /queue：返回内部维护的快照（页面变更后自动拉取会用）。"""
+        self.queue_calls.append(sid)
+        return {"items": [dict(i) for i in self.q_items],
+                "paused": self.q_paused}
+
+    def enqueue(self, sid, text, guided=False):
+        if self.queue_error:
+            raise RuntimeError(self.queue_error)
+        self.enqueued.append((sid, text, guided))
+        item = {"id": f"q{len(self.q_items) + 1}", "text": text,
+                "guided": guided, "time": "12:00", "created_at": 1.0,
+                "edited_at": None}
+        self.q_items.append(item)
+        return dict(item)
+
+    def queue_update(self, sid, item_id, text):
+        self.updated.append((sid, item_id, text))
+        for it in self.q_items:
+            if it["id"] == item_id:
+                it["text"] = text
+                it["edited_at"] = 2.0
+                return dict(it)
+        return {"id": item_id, "text": text, "guided": False, "time": "12:01",
+                "created_at": 1.0, "edited_at": 2.0}
+
+    def queue_delete(self, sid, item_id):
+        self.deleted_items.append((sid, item_id))
+        self.q_items = [i for i in self.q_items if i["id"] != item_id]
+        return {"deleted": item_id}
+
+    def queue_move(self, sid, item_id, delta):
+        self.moved.append((sid, item_id, delta))
+        ids = [i["id"] for i in self.q_items]
+        if item_id in ids:
+            i = ids.index(item_id)
+            j = max(0, min(len(ids) - 1, i + int(delta)))
+            if i != j:
+                self.q_items[i], self.q_items[j] = \
+                    self.q_items[j], self.q_items[i]
+        return {"items": [dict(i) for i in self.q_items]}
+
+    def queue_clear(self, sid):
+        self.cleared.append(sid)
+        n = len([i for i in self.q_items if not i.get("guided")])
+        self.q_items = [i for i in self.q_items if i.get("guided")]
+        return {"cleared": n}
+
     def resolve_approval(self, aid, approve, remember=False):
         self.approvals.append((aid, approve, remember))
         return {"id": aid, "status": "approved" if approve else "denied"}
@@ -204,6 +274,9 @@ def page(monkeypatch):
     assert _pump(lambda: bool(p._session_id))
     assert _pump(lambda: "s1" in p._nav_task_btns)
     assert p._nav_spaces
+    # 等初始队列快照拉回再交出场：否则这个空快照的 Worker 可能晚到，
+    # 在用例中途把面板清成空（全量跑时线程调度更慢，必现）
+    assert _pump(lambda: p._session_id in fake.queue_calls)
     return p, fake
 
 
@@ -1261,18 +1334,26 @@ def test_done_after_tool_call_still_renders_answer(page):
 
 
 def test_send_stop_swap_while_streaming(page):
+    """流式中止按钮就地出现。
+
+    1.0.9 起忙碌态 ↑ 不再隐藏——语义变为「排队入队」（Enter/↑ 插话不
+    打断当前轮），同时新增 ⚡ 引导按钮（仅忙碌可见）。
+    """
     p, _fake = page
     assert not p._send_btn.isHidden()
     assert p._stop_btn.isHidden()
     assert p._busy_lbl.isHidden()
+    assert p._guide_btn.isHidden()
     p._begin_streaming()
-    assert p._send_btn.isHidden()
+    assert not p._send_btn.isHidden()        # ↑ 变成排队入队（不再隐藏）
     assert not p._stop_btn.isHidden()
     assert not p._busy_lbl.isHidden()       # 运行中显示旋转指示
+    assert not p._guide_btn.isHidden()      # ⚡ 引导发送（仅忙碌可见）
     p._end_streaming()
     assert not p._send_btn.isHidden()
     assert p._stop_btn.isHidden()
     assert p._busy_lbl.isHidden()
+    assert p._guide_btn.isHidden()
 
 
 # ---------------------------------------------------------------------------
@@ -1282,8 +1363,320 @@ def test_light_theme_covers_bottom_bar_and_nav(page):
     from core.theme import build_stylesheet
     css = build_stylesheet("#ffffff")
     for sel in ("#BarChip", "#ModelChip", "#BarBtn", "#BusyDot", "#SendBtn",
-                "#NavSubItem", "#NavSessList", "#ApprovalCard"):
+                "#NavSubItem", "#NavSessList", "#ApprovalCard",
+                "#QueuePanel", "#QueueRow", "#QueueOp", "#GuideBtn",
+                "#BubbleTime", "#QueueResumeBtn"):
         assert sel in css, sel
     dark = build_stylesheet("")
-    for sel in ("#BarChip", "#ModelChip", "#NavSubItem", "#NavSessList"):
+    for sel in ("#BarChip", "#ModelChip", "#NavSubItem", "#NavSessList",
+                "#QueuePanel", "#QueueRow", "#QueueOp", "#GuideBtn",
+                "#BubbleTime"):
         assert sel in dark, sel
+
+
+# ---------------------------------------------------------------------------
+# 引导会话（1.0.9）：排队插话 / 引导发送 / 队列面板 / 自动消费 / 停止暂停
+# ---------------------------------------------------------------------------
+def _queue_items(n: int = 3):
+    """构造 n 条队列快照条目（最后一条是引导只读行）。"""
+    items = [{"id": f"q{i}", "text": f"排队消息{i}", "guided": False,
+              "time": f"09:3{i}", "created_at": float(i), "edited_at": None}
+             for i in range(n - 1)]
+    items.append({"id": f"q{n - 1}", "text": "引导消息", "guided": True,
+                  "time": "09:40", "created_at": 99.0, "edited_at": None})
+    return items
+
+
+def test_busy_send_queues_without_new_stream(page, monkeypatch):
+    """P0-1：忙碌态 Enter/↑ 入队——不新建流、不打断忙碌、消息不丢。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, fake = page
+    _FakeStream.instances.clear()
+    p._input.setPlainText("插一句话")
+    p._begin_streaming()
+    p._on_send_clicked()
+    assert _pump(lambda: fake.enqueued ==
+                 [(p._session_id, "插一句话", False)]
+                 and p._input.toPlainText() == "")
+    assert p._busy is True                       # 忙碌态不中断
+    assert _FakeStream.instances == []           # 未新建 SSE 流
+    p._end_streaming()
+
+
+def test_busy_guide_click_or_shift_enter_enqueues_guided(page):
+    """P0-4：⚡ / Shift+Enter 引导发送（立即登记进对话流，不打断当前轮）。"""
+    p, fake = page
+    p._input.setPlainText("立即引导")
+    p._begin_streaming()
+    p._on_guide_clicked()
+    assert _pump(lambda: fake.enqueued ==
+                 [(p._session_id, "立即引导", True)]
+                 and p._input.toPlainText() == "")
+    p._end_streaming()
+
+
+def test_guide_button_hidden_when_idle(page):
+    """空闲态 ⚡ 隐藏（Shift+Enter 仍是换行），忙碌态才可见。"""
+    p, _fake = page
+    assert p._guide_btn.isHidden()
+    p._begin_streaming()
+    assert not p._guide_btn.isHidden()
+    p._end_streaming()
+    assert p._guide_btn.isHidden()
+
+
+def test_enqueue_failure_keeps_input(page):
+    """入队失败（后端拒绝）：输入框文本保留、状态栏报错。"""
+    p, fake = page
+    fake.queue_error = "排队过多（上限 20 条）"
+    p._input.setPlainText("别丢了我")
+    p._begin_streaming()
+    p._on_send_clicked()
+    assert _pump(lambda: "排队失败" in p._status.text())
+    assert p._input.toPlainText() == "别丢了我"
+    p._end_streaming()
+
+
+def test_busy_controls_state_machine(page):
+    """P1-3：空闲/忙碌两套 tooltip + placeholder（↑ 排队 / ⚡ 引导语义明示）。"""
+    p, _fake = page
+    tip = p._send_btn.toolTip()
+    assert "发送" in tip and "Enter" in tip
+    assert "今天帮你做些什么" in p._input.placeholderText()
+    assert "Shift+Enter 换行" in p._input.placeholderText()
+    p._begin_streaming()
+    assert "排队" in p._send_btn.toolTip()
+    assert "不打断当前生成" in p._send_btn.toolTip()
+    assert "引导" in p._guide_btn.toolTip()
+    assert "Shift+Enter" in p._guide_btn.toolTip()
+    ph = p._input.placeholderText()
+    assert "Enter 排队" in ph and "Shift+Enter 引导发出" in ph
+    p._end_streaming()
+    assert "发送" in p._send_btn.toolTip()
+    assert "今天帮你做些什么" in p._input.placeholderText()
+
+
+def test_queue_snapshot_drives_panel_visibility(page):
+    """P0-5/P0-6：queue 快照驱动面板显隐与行数；空快照隐藏不占布局。"""
+    from ui.widgets.queue_item import QueueItemRow
+    p, _fake = page
+    items = [
+        {"id": "q0", "text": "排队消息0", "guided": False, "time": "09:30"},
+        {"id": "g1", "text": "引导消息", "guided": True, "time": "09:35"},
+        {"id": "q2", "text": "排队消息2", "guided": False, "time": "09:40"},
+    ]
+    p._on_event({"type": "queue", "items": items, "paused": False})
+    assert p._queue_panel.isVisibleTo(p)
+    rows = p._queue_body.findChildren(QueueItemRow)
+    assert len(rows) == 3
+    assert [r._idx.text() for r in rows] == ["1", "2", "3"]
+    assert "排队中（3）" in p._queue_head_lbl.text()
+    # 首条禁 ↑、末条禁 ↓（与引导行位置无关，按快照位次）
+    assert not p._queue_rows["q0"]._up_btn.isEnabled()
+    assert p._queue_rows["q0"]._down_btn.isEnabled()
+    assert p._queue_rows["q2"]._up_btn.isEnabled()
+    assert not p._queue_rows["q2"]._down_btn.isEnabled()
+    # 引导行只读：⚡ 标记 + 文本，无任何操作按钮
+    guided = p._queue_rows["g1"]
+    assert guided._guided is True
+    assert guided.findChildren(QPushButton) == []
+    assert "引导消息" in guided._text.toolTip()
+    # 空快照 -> 面板隐藏
+    p._on_event({"type": "queue", "items": [], "paused": False})
+    assert not p._queue_panel.isVisibleTo(p)
+    assert p._queue_rows == {}
+
+
+def test_queue_row_edit_calls_rest(page):
+    """P0-3：行内 ✎ 编辑 -> 保存触发 PATCH，参数正确。"""
+    from PySide6.QtWidgets import QLineEdit
+    p, fake = page
+    fake.q_items = _queue_items(2)      # fake 与页面快照同源（保存后自动拉回）
+    p._on_event({"type": "queue", "items": _queue_items(2), "paused": False})
+    row = p._queue_rows["q0"]
+    row.begin_edit()
+    editor = row.findChild(QLineEdit)
+    assert editor is not None and editor.text() == "排队消息0"
+    editor.setText("改过的消息")
+    row._ok_btn.click()
+    assert _pump(lambda: fake.updated ==
+                 [(p._session_id, "q0", "改过的消息")])
+    # 保存后快照拉回：文本已更新（单一事实来源）
+    assert _pump(lambda: p._queue_rows["q0"]._full_text == "改过的消息")
+    # 取消编辑不发请求
+    row2 = p._queue_rows["q0"]
+    row2.begin_edit()
+    row2.cancel_edit()
+    assert fake.updated == [(p._session_id, "q0", "改过的消息")]
+
+
+def _settle_queue(p, fake):
+    """等 REST 结果 + 随后的自动快照拉回都落地（防异步竞态）。"""
+    return _pump(lambda: [i["id"] for i in p._queue_items] ==
+                 [i["id"] for i in fake.q_items])
+
+
+def test_queue_row_delete_move_and_clear_call_rest(page):
+    """P0-3/P1-1：✕/↑/↓/全部清除触发对应 REST 且参数正确。"""
+    p, fake = page
+    fake.q_items = _queue_items(3)      # [q0, q1, q2(引导只读)]
+    p._on_event({"type": "queue", "items": _queue_items(3), "paused": False})
+    # ↓：q0 下移一位（同步后顺序变为 [q1, q0, q2]）
+    p._queue_rows["q0"]._down_btn.click()
+    assert _pump(lambda: fake.moved == [(p._session_id, "q0", 1)])
+    assert _settle_queue(p, fake)
+    # ↑：此时 q0 位于索引 1，其上移可用（q1 是首条，↑ 禁用）
+    p._queue_rows["q0"]._up_btn.click()
+    assert _pump(lambda: (p._session_id, "q0", -1) in fake.moved)
+    assert _settle_queue(p, fake)
+    assert [i["id"] for i in p._queue_items] == ["q0", "q1", "q2"]
+    # 删除：引导行没有 ✕，删普通行 q1
+    del_btn = next(b for b in p._queue_rows["q1"].findChildren(QPushButton)
+                   if b.text() == "✕")
+    del_btn.click()
+    assert _pump(lambda: fake.deleted_items == [(p._session_id, "q1")])
+    assert _settle_queue(p, fake)
+    p._queue_clear_btn.click()
+    assert _pump(lambda: fake.cleared == [p._session_id])
+    assert _settle_queue(p, fake)
+
+
+def test_queue_clear_disabled_when_only_guided(page):
+    """只剩引导消息时「全部清除」禁用（引导不可清，tooltip 明示）。"""
+    p, _fake = page
+    items = [{"id": "g1", "text": "引导消息", "guided": True, "time": "09:40"}]
+    p._on_event({"type": "queue", "items": items, "paused": False})
+    assert not p._queue_clear_btn.isEnabled()
+    assert "不可清除" in p._queue_clear_btn.toolTip()
+    # 来一条普通消息就可清了
+    p._on_event({"type": "queue", "items": items + [
+        {"id": "q9", "text": "普通", "guided": False, "time": "09:41"}],
+        "paused": False})
+    assert p._queue_clear_btn.isEnabled()
+
+
+def test_guided_event_renders_bubble_with_time(page):
+    """P0-4/P1-2：guided -> 对话流末尾 user 气泡 + HH:MM 时间 + StepLine。"""
+    from PySide6.QtWidgets import QLabel
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "guided", "id": "q1", "text": "先看这个",
+                 "time": "09:47"})
+    bubbles = [w for w in p._col.findChildren(ChatBubble)
+               if w.role == "user"]
+    assert bubbles and bubbles[-1].label.text() == "先看这个"
+    assert bubbles[-1].time_text == "09:47"
+    time_lbls = bubbles[-1].findChildren(QLabel, "BubbleTime")
+    assert time_lbls and time_lbls[0].text() == "09:47"
+    # 文本可选中复制（既有 TextSelectableByMouse）
+    from PySide6.QtCore import Qt
+    assert bubbles[-1].label.textInteractionFlags() & \
+        Qt.TextSelectableByMouse
+    p._end_streaming()
+
+
+def test_dequeued_queue_adds_bubble_guided_not_repeated(page):
+    """P0-2：dequeued(mode=queue) 补用户气泡；guided 不重复气泡。"""
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "guided", "id": "q1", "text": "引导消息",
+                 "time": "09:47"})
+    n_user = len([w for w in p._col.findChildren(ChatBubble)
+                  if w.role == "user"])
+    p._on_event({"type": "dequeued", "id": "q1", "text": "引导消息",
+                 "mode": "guided", "time": "09:47"})
+    assert len([w for w in p._col.findChildren(ChatBubble)
+                if w.role == "user"]) == n_user
+    p._on_event({"type": "dequeued", "id": "q2", "text": "排队消息",
+                 "mode": "queue", "time": "09:48"})
+    bubbles = [w for w in p._col.findChildren(ChatBubble)
+               if w.role == "user"]
+    assert len(bubbles) == n_user + 1
+    assert bubbles[-1].label.text() == "排队消息"
+    assert bubbles[-1].time_text == ""       # 排队消息不带时间标签
+    p._end_streaming()
+
+
+def test_done_keeps_busy_until_end(page):
+    """P0-2 前端关键点：done 只收尾单轮气泡，end 才解除忙碌态。"""
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "done", "content": "第一轮答复"})
+    assert p._busy is True
+    assert "完成" in p._status.text()
+    p._on_event({"type": "end", "content": "第一轮答复", "error": "",
+                 "paused": False})
+    assert p._busy is False
+    assert "就绪" in p._status.text()
+
+
+def test_queue_state_paused_toggles_resume_button(page):
+    """P0-6：queue_state 暂停/恢复 -> StepLine + 「继续」按钮显隐切换。"""
+    p, _fake = page
+    p._apply_queue(_queue_items(2), False)
+    p._on_event({"type": "queue_state", "paused": True, "reason": "stopped"})
+    assert p._queue_paused is True
+    assert p._queue_resume_btn.isVisibleTo(p)
+    p._on_event({"type": "queue_state", "paused": False})
+    assert p._queue_paused is False
+    assert not p._queue_resume_btn.isVisibleTo(p)
+
+
+def test_end_with_paused_keeps_queue_and_shows_resume(page):
+    """停止后续跑被暂停：end(paused=true) 后队列保留、「继续」可见。"""
+    p, _fake = page
+    p._begin_streaming()
+    p._apply_queue(_queue_items(2), False)
+    p._on_event({"type": "end", "content": "", "error": "", "paused": True})
+    assert p._busy is False
+    assert "继续" in p._status.text()
+    assert p._queue_panel.isVisibleTo(p)
+    assert p._queue_resume_btn.isVisibleTo(p)
+
+
+def test_stop_pauses_then_resume_starts_new_stream(page, monkeypatch):
+    """时序图 4：停止 -> 拉快照保留暂停态 -> 「继续」发 mode=resume 新流。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, fake = page
+    fake.q_items = [{"id": "q9", "text": "留着", "guided": False,
+                     "time": "10:00"}]
+    fake.q_paused = True
+    p._session_id = "s1"
+    p._begin_streaming()
+    p._stop()
+    assert _pump(lambda: p._queue_resume_btn.isVisibleTo(p))
+    assert not p._busy
+    assert "已停止" in p._status.text()
+    # 点「继续」-> 新 SSE 流（mode=resume）并重新进入忙碌态
+    _FakeStream.instances.clear()
+    p._resume_queue()
+    assert _pump(lambda: _FakeStream.instances and
+                 _FakeStream.instances[-1].payload.get("mode") == "resume")
+    assert _FakeStream.instances[-1].payload["session_id"] == "s1"
+    assert p._busy is True
+    p._end_streaming()
+
+
+def test_resume_with_empty_queue_reports(page):
+    """空队列点「继续」：不新建流，状态栏说明。"""
+    p, _fake = page
+    p._session_id = "s1"
+    p._apply_queue([], False)
+    p._resume_queue()
+    assert "队列是空的" in p._status.text()
+    assert p._busy is False
+
+
+def test_switch_task_resets_and_fetches_queue(page):
+    """切换任务：队列面板先重置，再按新 sid 拉快照（不串任务）。"""
+    p, fake = page
+    p._apply_queue(_queue_items(2), True)
+    assert p._queue_panel.isVisibleTo(p)
+    p._apply_session_detail({"id": "sX", "workspace": r"E://tmp//ws",
+                             "messages": []})
+    assert _pump(lambda: p._session_id == "sX")
+    assert not p._queue_panel.isVisibleTo(p)     # 旧任务队列已清
+    assert _pump(lambda: fake.queue_calls
+                 and fake.queue_calls[-1] == "sX")

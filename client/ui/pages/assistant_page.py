@@ -6,9 +6,12 @@
     左栏（主窗口 NavPanel 内）              右栏（本页）
       智能助理                          ┌ 标题 + 管理入口 ────────────────┐
         ▸ 任务（最近 6 条，点即切换）    │ 对话流（气泡 / 工具卡 / 审批卡） │
-        ▸ 技能 / 工具 / MCP / 审计      │ ┌─ 输入框 ────────────────────┐ │
-          （点开管理面板）              │ │ [+] [工作区][审批][技能]      │ │
-                                        │ │          ◐  [模型 ▾]   [↑]  │ │
+        ▸ 技能 / 工具 / MCP / 审计      │ ┌─ 队列面板（1.0.9，非空才显）─┐ │
+          （点开管理面板）              │ │ 排队中（N）· 按序发送  [清除] │ │
+                                        │ │ ① …  [✎][↑][↓][✕]          │ │
+                                        │ ├─ 输入框 ────────────────────┤ │
+                                        │ │ [+] [工作区][审批][技能]      │ │
+                                        │ │          ◐  [模型 ▾]  [⚡][↑] │ │
                                         │ └─────────────────────────────┘ │
                                         └─────────────────────────────────┘
 
@@ -29,6 +32,8 @@
     - 高危动作审批卡片（允许 / 本任务允许同类 / 拒绝）
     - 本地模型 / 硅基流动 / 自定义 OpenAI 兼容端点切换
     - 任务历史保存与回看（左栏「任务 / 空间」两区 + 管理面板）
+    - 引导会话（1.0.9）：执行中插话排队 / 立即引导发送 / 队列可改可删可排序 /
+      跨轮次自动消费 / 停止后暂停+继续（详见 docs/智能助理-引导会话-架构设计.md）
 """
 import json
 import os
@@ -52,6 +57,7 @@ from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, ChatBubble, StepLine,
                                        ThinkingBlock, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
+from ui.widgets.queue_item import QueueItemRow
 
 POLICY_ITEMS = [
     ("readonly_auto", "只读自动", "只读类工具直接执行，写入/高危仍逐次确认（推荐）"),
@@ -147,6 +153,17 @@ class AssistantPage(QWidget):
         self._approvals: Dict[str, ApprovalCard] = {}
         self._busy = False
         self._loading = False
+        # 引导会话队列（1.0.9）：_queue_items 是后端 queue 全量快照的镜像
+        # （单一事实来源，不做局部增删）；面板只在队列非空时可见、不占布局
+        self._queue_items: List[Dict[str, Any]] = []
+        self._queue_paused = False
+        self._queue_panel: Optional[QWidget] = None
+        self._queue_head_lbl: Optional[QLabel] = None
+        self._queue_clear_btn: Optional[QPushButton] = None
+        self._queue_resume_btn: Optional[QPushButton] = None
+        self._queue_body: Optional[QWidget] = None
+        self._queue_body_lay: Optional[QVBoxLayout] = None
+        self._queue_rows: Dict[str, QueueItemRow] = {}
         # 流式输出时不要频繁重绘/滚动（用户反馈「思考时屏幕闪得厉害」）：
         #   _follow    用户是否还贴着底部（往上翻过就别再硬拽回去）
         #   _scroll_timer 合并滚动请求，SCROLL_MS 内只滚一次
@@ -261,7 +278,7 @@ class AssistantPage(QWidget):
         return panel
 
     def _build_footer(self) -> QWidget:
-        """底部固定区：状态提示 / 输入框 / 合规提示（与对话列同宽居中）。"""
+        """底部固定区：状态提示 / 队列面板 / 输入框 / 合规提示（同宽居中）。"""
         foot = QWidget()
         outer = QHBoxLayout(foot)
         outer.setContentsMargins(0, 8, 0, 2)
@@ -280,6 +297,9 @@ class AssistantPage(QWidget):
         self._status.setVisible(False)
         il.addWidget(self._status)
 
+        # 引导会话队列面板：插在输入框正上方（仅队列非空时可见）
+        il.addWidget(self._build_queue_panel())
+
         il.addWidget(self._build_composer())
 
         tip = QLabel("内容由 AI 生成，请核实重要信息")
@@ -292,17 +312,70 @@ class AssistantPage(QWidget):
         outer.addStretch(1)
         return foot
 
+    # ---------------- 引导会话队列面板（1.0.9） ----------------
+    def _build_queue_panel(self) -> QWidget:
+        """队列容器：头部（计数 / 全部清除 / 继续）+ 行列表（QueueItemRow）。
+
+        位置在 composer 之上、与对话列同宽；空队列 / 空闲态隐藏，
+        setVisible(False) 不占布局空间（QVBoxLayout 跳过隐藏项）。
+        """
+        panel = QWidget()
+        panel.setObjectName("QueuePanel")
+        panel.setVisible(False)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(4)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self._queue_head_lbl = QLabel("排队中（0）· 本轮结束后按序发送")
+        self._queue_head_lbl.setObjectName("QueueTitle")
+        head.addWidget(self._queue_head_lbl)
+        head.addStretch(1)
+
+        self._queue_resume_btn = QPushButton("已暂停 · 继续")
+        self._queue_resume_btn.setObjectName("QueueResumeBtn")
+        self._queue_resume_btn.setCursor(Qt.PointingHandCursor)
+        self._queue_resume_btn.setToolTip(
+            "已停止：队列随之暂停（消息保留、不会自动跑）。\n"
+            "点「继续」按序发送排队消息，恢复执行。")
+        self._queue_resume_btn.setVisible(False)
+        self._queue_resume_btn.clicked.connect(self._resume_queue)
+        head.addWidget(self._queue_resume_btn)
+
+        self._queue_clear_btn = QPushButton("全部清除")
+        self._queue_clear_btn.setObjectName("QueueClearBtn")
+        self._queue_clear_btn.setCursor(Qt.PointingHandCursor)
+        self._queue_clear_btn.setToolTip(
+            "清除全部排队中的消息。\n引导消息已登记进对话流，不可清除。")
+        self._queue_clear_btn.clicked.connect(self._queue_clear)
+        head.addWidget(self._queue_clear_btn)
+        lay.addLayout(head)
+
+        body = QWidget()
+        body.setObjectName("QueueBody")
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(2)
+        self._queue_body = body
+        self._queue_body_lay = body_lay
+        lay.addWidget(body)
+
+        self._queue_panel = panel
+        return panel
+
     def _build_composer(self) -> QWidget:
         """
         底部输入区（对齐 WorkBuddy 输入框底部工具条）：
 
             ┌ 今天帮你做些什么？ ───────────────────────────────┐
             │                                                        │
-            │ [+] [工作区] [⊘ 只读自动] [技能]     ◐  [模型 ▾]  [↑] │
+            │ [+] [工作区] [⊘ 只读自动] [技能]     ◐  [模型 ▾]  [⚡][↑] │
             └────────────────────────────────────────────────────────┘
 
-        左侧是「动作与上下文」，右侧是「运行状态 / 模型 / 发送」；
-        发送在流式时原地变成停止。
+        左侧是「动作与上下文」，右侧是「运行状态 / 模型 / 发送」。
+        1.0.9 引导会话：忙碌态 ↑ 语义变为「排队入队」、左侧新增 ⚡
+        「引导发送」、停止 ■ 同时可见；空闲态保持现状（■/⚡ 隐藏）。
         """
         box = QFrame()
         box.setObjectName("Composer")
@@ -390,6 +463,20 @@ class AssistantPage(QWidget):
         self._stop_btn.setVisible(False)
         self._stop_btn.clicked.connect(self._stop)
         bar.addWidget(self._stop_btn)
+
+        # ⚡ 引导发送（1.0.9）：↑ 左侧的次级按钮，仅忙碌时可见。
+        # 与 ↑（排队）构成双入口：都不打断当前生成，差异在「立即登记进
+        # 对话流」vs「本轮结束后按序发送」。
+        self._guide_btn = QPushButton("⚡")
+        self._guide_btn.setObjectName("GuideBtn")
+        self._guide_btn.setFixedSize(26, 26)
+        self._guide_btn.setCursor(Qt.PointingHandCursor)
+        self._guide_btn.setToolTip(
+            "引导会话（Shift+Enter）：消息立即发出并登记进对话流，"
+            "但不会中断当前生成")
+        self._guide_btn.setVisible(False)
+        self._guide_btn.clicked.connect(self._on_guide_clicked)
+        bar.addWidget(self._guide_btn)
 
         self._send_btn = QPushButton("↑")
         self._send_btn.setObjectName("SendBtn")
@@ -1547,6 +1634,7 @@ class AssistantPage(QWidget):
         self._clear_chat()
         self._greet()
         self._fill_sessions()
+        self._fetch_queue(self._session_id)     # 新任务按 sid 同步队列快照
 
     def _greet(self) -> None:
         tools = len(self._state.get("tools") or [])
@@ -1582,6 +1670,8 @@ class AssistantPage(QWidget):
         self._add_step("已载入历史任务")
         self._sel_sid = str(self._session_id or "")
         self._fill_sessions()      # 同步左栏的选中态与「任务 / 空间」两区
+        # 队列跟着任务走：先重置（旧任务的排队不是这个任务的），再按新 sid 拉快照
+        self._fetch_queue(str(self._session_id or ""))
 
     # ------------------------------------------------------------------ #
     # 对话
@@ -1592,8 +1682,11 @@ class AssistantPage(QWidget):
             mods = event.modifiers()
             if key in (Qt.Key_Return, Qt.Key_Enter):
                 if mods & Qt.ShiftModifier:
-                    return False
-                self._on_send_clicked()
+                    if self._busy:
+                        self._on_guide_clicked()   # 忙碌：Shift+Enter 引导
+                        return True
+                    return False                   # 空闲：换行（现状）
+                self._on_send_clicked()             # Enter：空闲发送 / 忙碌排队
                 return True
         if obj is self._input and event.type() in (QEvent.Type.FocusIn,
                                                   QEvent.Type.FocusOut):
@@ -1607,10 +1700,13 @@ class AssistantPage(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_send_clicked(self) -> None:
-        if self._busy:
-            return
         text = self._input.toPlainText().strip()
         if not text:
+            return
+        if self._busy:
+            # 1.0.9 修复：忙碌态不再丢弃消息，进入输入框上方队列，
+            # 本轮结束按序自动消费（不打断当前生成）
+            self._enqueue_message(text, guided=False)
             return
         if not self._session_id:
             w = Worker(self._assist.new_session)
@@ -1618,6 +1714,45 @@ class AssistantPage(QWidget):
             w.start()
             return
         self._send_with_session({"id": self._session_id}, text)
+
+    def _on_guide_clicked(self) -> None:
+        """⚡ / Shift+Enter：引导发送——立即登记进对话流，不中断当前轮。"""
+        if not self._busy:
+            return
+        text = self._input.toPlainText().strip()
+        if not text:
+            return
+        self._enqueue_message(text, guided=True)
+
+    def _enqueue_message(self, text: str, guided: bool) -> None:
+        """REST 入队 / 引导发送（短请求，不新开 SSE 流）。
+
+        失败时输入框文本保留（不清空即不丢），状态栏说明原因；
+        成功后的面板刷新等 queue 快照（SSE 广播或主动 GET）。
+        """
+        sid = self._session_id
+        if not sid:
+            # 没有当前任务（忙碌必有流，正常走不到）：按普通发送兜底
+            w = Worker(self._assist.new_session)
+            w.result.connect(lambda s: self._send_with_session(s, text))
+            w.start()
+            return
+        self._set_status("正在引导发出…" if guided else "正在排队…")
+        w = Worker(self._assist.enqueue, sid, text, guided)
+        w.result.connect(lambda _r: self._on_enqueued(guided))
+        w.error.connect(lambda m: self._on_enqueue_failed(m, guided))
+        w.start()
+
+    def _on_enqueued(self, guided: bool) -> None:
+        # 输入框清空；队列行等快照事件出现（单一事实来源，不局部加行）
+        self._input.clear()
+        self._set_status("已引导发出，本轮结束后自动处理" if guided
+                         else "已排队，本轮结束后按序发送")
+
+    def _on_enqueue_failed(self, msg: str, guided: bool) -> None:
+        # 输入框没清过，文本自然保留；明确报错，不让用户以为发出去了
+        self._set_status(
+            f"{'引导' if guided else '排队'}失败：{msg}（消息保留在输入框）")
 
     def _send_with_session(self, session: Any, text: str) -> None:
         if not isinstance(session, dict) or not session.get("id"):
@@ -1646,11 +1781,27 @@ class AssistantPage(QWidget):
         self._stream.closed.connect(self._on_stream_closed)
         self._stream.start()
 
+    def _set_busy_controls(self) -> None:
+        """忙碌态发送区状态机（PRD 4.2 / 架构设计 3.6，P1-3）。
+
+        空闲：↑ 发送（Enter）、⚡ 隐藏、placeholder「今天帮你做些什么？」
+        忙碌：↑ 排队入队（Enter）、⚡ 引导发送（Shift+Enter）、■ 停止显示，
+              placeholder 明示两种语义差异
+        """
+        busy = bool(self._busy)
+        self._send_btn.setToolTip(
+            "排队发送（Enter）：不打断当前生成，本轮结束后按序自动发送"
+            if busy else "发送（Enter）")
+        self._guide_btn.setVisible(busy)
+        self._input.setPlaceholderText(
+            "执行中：Enter 排队 · Shift+Enter 引导发出（不打断当前生成）"
+            if busy else "今天帮你做些什么？（Enter 发送，Shift+Enter 换行）")
+
     def _begin_streaming(self) -> None:
         self._busy = True
-        self._send_btn.setVisible(False)
         self._stop_btn.setVisible(True)
         self._stop_btn.setEnabled(True)
+        self._set_busy_controls()
         self._start_spin()
         self._set_status("助理正在工作…")
         self._bubble = None
@@ -1661,8 +1812,7 @@ class AssistantPage(QWidget):
         self._busy = False
         self._stop_btn.setEnabled(False)
         self._stop_btn.setVisible(False)
-        self._send_btn.setVisible(True)
-        self._send_btn.setEnabled(True)
+        self._set_busy_controls()
         self._stop_spin()
         if self._thinking is not None:
             self._thinking.finish()
@@ -1671,14 +1821,24 @@ class AssistantPage(QWidget):
         self._scroll_bottom(force=True)    # 答完了，回到底部看全文
 
     def _stop(self) -> None:
+        """停止 = 本地断流 + 取消当前轮 + 队列暂停（1.0.9：不出队、不清空）。
+
+        串行化：stop 成功回调里再拉一次队列快照，面板保留并显示「继续」。
+        """
         if self._stream is not None:
             self._stream.cancel()
         sid = self._session_id
-        if sid:
-            Worker(lambda s=sid: self._assist.stop(s)).start()
         self._add_step("已请求停止")
+        # 界面先立刻脱离忙碌态（乐观），快照回来后补「继续」按钮
         self._end_streaming()
         self._set_status("已停止")
+        if sid:
+            def _after_stop(_res):
+                self._fetch_queue(sid)
+            w = Worker(lambda s=sid: self._assist.stop(s))
+            w.result.connect(_after_stop)
+            w.error.connect(lambda m: self._set_status(f"停止请求失败：{m}"))
+            w.start()
 
     def _on_stream_failed(self, msg: str) -> None:
         self._add_step(f"连接失败：{msg}")
@@ -1693,6 +1853,12 @@ class AssistantPage(QWidget):
     # ---------------- 事件分发 ----------------
     def _on_event(self, ev: Dict[str, Any]) -> None:  # noqa: C901
         kind = ev.get("type")
+        if kind is None and ev.get("code"):
+            # 走 SSE 的路径返回了 JSON 错误体（如 resume 撞活跃流 2017）：
+            # 不当成事件静默吞掉，明确提示可重试
+            self._add_step(f"请求被拒绝：{ev.get('message')}", error=True)
+            self._set_status(f"{ev.get('message')}（可稍后重试）")
+            return
         if kind == "session":
             self._session_id = ev.get("session_id") or self._session_id
         elif kind == "model":
@@ -1754,7 +1920,32 @@ class AssistantPage(QWidget):
             self._fill_sessions()
         elif kind == "note":
             self._add_step(str(ev.get("message") or ""))
+        elif kind == "queued":
+            # 入队确认（面板新行等 queue 快照，这里只做可视反馈）
+            idx = int(ev.get("index") or 0)
+            self._add_step(f"已排队（第 {idx + 1} 条）："
+                           f"{_ellipsis(ev.get('text') or '', 24)}")
+        elif kind == "guided":
+            # 引导消息：立即渲染用户气泡（带 HH:MM）+ StepLine；不写会话、
+            # 不打断当前轮；出队时才由 start_turn 落库
+            self._add_guided_bubble(ev)
+            self._add_step("已引导发出：本轮结束后自动处理")
+        elif kind == "dequeued":
+            # 出队：排队消息补用户气泡；引导消息的气泡在 guided 时已渲染，
+            # 这里只加 StepLine，不重复
+            if (ev.get("mode") or "queue") == "queue":
+                self._add_bubble("user", ev.get("text") or "")
+            self._add_step(f"正在处理排队消息："
+                           f"{_ellipsis(ev.get('text') or '', 24)}")
+        elif kind == "queue":
+            # 队列全量快照：单一事实来源，面板以此重渲染
+            self._apply_queue(ev.get("items") or [], bool(ev.get("paused")))
+        elif kind == "queue_state":
+            self._on_queue_state(bool(ev.get("paused")),
+                                 str(ev.get("reason") or ""))
         elif kind == "done":
+            # 单轮答复完成：收尾当前气泡，但**不结束忙碌态**——
+            # 队列还有消息时 gen() 会在同一条连接里续跑（P0-2 前端关键点）
             self._finish_bubble(ev.get("content") or "")
             self._set_status("完成")
             self._scroll_bottom()
@@ -1764,10 +1955,169 @@ class AssistantPage(QWidget):
         elif kind == "stopped":
             self._add_step("已停止生成")
         elif kind == "end":
+            # 整条流唯一一次 end：队列耗尽或暂停时才下发
             self._end_streaming()
-            if not ev.get("error"):
+            if ev.get("paused"):
+                self._set_status("已暂停：队列消息保留，点「继续」按序发送")
+                if self._queue_resume_btn is not None:
+                    self._queue_resume_btn.setVisible(
+                        bool(self._queue_items))
+            elif not ev.get("error"):
                 self._set_status("就绪")
             self._approvals.clear()
+
+    # ---------------- 引导会话队列（1.0.9） ----------------
+    def _add_guided_bubble(self, ev: Dict[str, Any]) -> None:
+        """引导消息气泡：用户侧 + HH:MM 时间标签（P1-2，只读可复制）。"""
+        text = str(ev.get("text") or "")
+        if not text:
+            return
+        bubble = ChatBubble("user", text, time_text=str(ev.get("time") or ""))
+        self._append_widget(bubble)
+        self._scroll_bottom()
+
+    def _on_queue_state(self, paused: bool, reason: str) -> None:
+        """暂停/恢复transition：切 StepLine + 「继续」按钮显隐。"""
+        self._queue_paused = bool(paused)
+        if self._queue_resume_btn is not None:
+            self._queue_resume_btn.setVisible(
+                bool(paused) and bool(self._queue_items))
+        if paused:
+            self._add_step("队列已暂停（消息保留，点「继续」按序发送）")
+        else:
+            self._add_step("已恢复，继续按序处理排队消息")
+
+    def _apply_queue(self, items: List[Dict[str, Any]], paused: bool) -> None:
+        """快照 -> 重渲染面板 + 显隐 + 「继续」按钮（不做局部增删）。"""
+        self._queue_items = [dict(it) for it in (items or [])
+                             if isinstance(it, dict)]
+        self._queue_paused = bool(paused)
+        self._rebuild_queue_rows()
+        has = bool(self._queue_items)
+        if self._queue_panel is not None:
+            self._queue_panel.setVisible(has)
+        if self._queue_head_lbl is not None:
+            self._queue_head_lbl.setText(
+                f"排队中（{len(self._queue_items)}）· 本轮结束后按序发送")
+        if self._queue_resume_btn is not None:
+            self._queue_resume_btn.setVisible(bool(self._queue_paused and has))
+        if self._queue_clear_btn is not None:
+            # 只剩引导消息时「全部清除」无可清（引导不可清）
+            self._queue_clear_btn.setEnabled(
+                any(not it.get("guided") for it in self._queue_items))
+
+    def _rebuild_queue_rows(self) -> None:
+        """按快照重建行（序号重排、首条禁 ↑、末条禁 ↓、引导行只读）。"""
+        lay = self._queue_body_lay
+        if lay is None:
+            return
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._queue_rows = {}
+        n = len(self._queue_items)
+        for i, it in enumerate(self._queue_items):
+            row = QueueItemRow(it, i)
+            row.saved.connect(self._queue_saved)
+            row.removed.connect(self._queue_removed)
+            row.moved.connect(self._queue_moved)
+            row.edit_cancelled.connect(lambda: self._set_status("已取消编辑"))
+            row.set_movable(i > 0, i < n - 1)
+            lay.addWidget(row)
+            self._queue_rows[str(it.get("id") or "")] = row
+
+    def _queue_saved(self, item_id: str, text: str) -> None:
+        """行内保存 -> PATCH /queue/{id}；已出队/引导的快照由错误提示收敛。"""
+        sid = self._session_id
+        if not sid:
+            return
+        self._set_status("正在保存排队消息…")
+        w = Worker(self._assist.queue_update, sid, item_id, text)
+        w.result.connect(lambda _r: self._after_queue_op("已保存"))
+        w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
+        w.start()
+
+    def _queue_removed(self, item_id: str) -> None:
+        sid = self._session_id
+        if not sid:
+            return
+        self._set_status("正在删除排队消息…")
+        w = Worker(self._assist.queue_delete, sid, item_id)
+        w.result.connect(lambda _r: self._after_queue_op("已删除"))
+        w.error.connect(lambda m: self._set_status(f"删除失败：{m}"))
+        w.start()
+
+    def _queue_moved(self, item_id: str, delta: int) -> None:
+        sid = self._session_id
+        if not sid:
+            return
+        w = Worker(self._assist.queue_move, sid, item_id, delta)
+        w.result.connect(lambda _r: self._after_queue_op("已调整顺序"))
+        w.error.connect(lambda m: self._set_status(f"排序失败：{m}"))
+        w.start()
+
+    def _queue_clear(self) -> None:
+        """全部清除：只清排队中的普通消息（引导消息已登记对话流，不清）。"""
+        sid = self._session_id
+        if not sid:
+            return
+        w = Worker(self._assist.queue_clear, sid)
+        w.result.connect(self._on_queue_cleared)
+        w.error.connect(lambda m: self._set_status(f"清除失败：{m}"))
+        w.start()
+
+    def _on_queue_cleared(self, res: Any) -> None:
+        n = res.get("cleared") if isinstance(res, dict) else 0
+        self._set_status(f"已清除 {n or 0} 条排队消息"
+                         "（引导消息已登记对话流，不可清除）")
+        self._after_queue_op("")
+
+    def _after_queue_op(self, note: str) -> None:
+        """REST 成功后的刷新：无活跃流时主动拉快照；有活跃流等广播。"""
+        if note:
+            self._set_status(note)
+        if not self._busy:
+            self._fetch_queue(self._session_id)
+
+    def _fetch_queue(self, sid: str) -> None:
+        """GET /queue：停止后 / 切换任务后 / 无流时的快照同步手段。"""
+        if not sid:
+            return
+        w = Worker(self._assist.queue, sid)
+        w.result.connect(self._on_queue_fetched)
+        w.error.connect(lambda m: self._set_status(f"队列同步失败：{m}"))
+        w.start()
+
+    def _on_queue_fetched(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        self._apply_queue(data.get("items") or [], bool(data.get("paused")))
+
+    def _resume_queue(self) -> None:
+        """「继续」：POST /chat mode=resume -> 新 SSE 流回到自动消费路径。"""
+        if self._busy or not self._session_id:
+            return
+        if not self._queue_items:
+            self._set_status("队列是空的，没有要发送的消息")
+            return
+        self._begin_streaming()
+        payload = {
+            "session_id": self._session_id,
+            "message": "",
+            "mode": "resume",
+            "provider": self._active_provider or "",
+            "model": self._active_model or "",
+            "stream": True,
+        }
+        self._stream = AssistantStream(
+            self.config.gateway_url(), self.config.api_key, payload)
+        self._stream.event.connect(self._on_event)
+        self._stream.failed.connect(self._on_stream_failed)
+        self._stream.closed.connect(self._on_stream_closed)
+        self._stream.start()
 
     def _resolve_approval(self, aid: str, approve: bool, remember: bool) -> None:
         w = Worker(self._assist.resolve_approval, aid, approve, remember)
@@ -1827,6 +2177,8 @@ class AssistantPage(QWidget):
         self._tool_cards = []
         self._approvals.clear()
         self._follow = True
+        # 队列面板跟随任务重置（新任务的快照由 _fetch_queue 拉回）
+        self._apply_queue([], False)
 
     def _scroll_bottom(self, force: bool = False) -> None:
         """滚到底部（合并请求，避免流式输出时画面狂跳）。

@@ -321,6 +321,30 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #NavSpaceItem:hover { background-color: #e2e7f0; color: #12161f; }
 #NavSpaceItem[open="true"] { color: #12161f; }
 #NavEmpty { color: #7b8496; }
+
+/* 引导会话队列面板（1.0.9）：浅色 */
+#QueuePanel { background-color: #ffffff; border: 1px solid #dbe0ea; }
+#QueueTitle { color: #6b7385; }
+#QueueClearBtn { background: transparent; color: #5a6275;
+                 border: 1px solid #d5dbe7; }
+#QueueClearBtn:hover { background-color: #eef1f7; color: #12161f;
+                       border-color: #c3cbdb; }
+#QueueClearBtn:disabled { color: #aab1c0; border-color: #e3e7f0; }
+#QueueResumeBtn { background-color: #4a6cf7; color: #ffffff; border: none; }
+#QueueResumeBtn:hover { background-color: #5b7bff; }
+#QueueBody { background: transparent; border: none; }
+#QueueRow { background-color: #f7f9fd; border: 1px solid #e1e6f0; }
+#QueueRow:hover { border-color: #c3cbdb; }
+#QueueIdx { color: #6f7a8f; }
+#QueueText { color: #2b3242; }
+#QueueOp { background: transparent; color: #5a6275; border: none; }
+#QueueOp:hover { background-color: #e2e7f0; color: #12161f; }
+#QueueOp:disabled { color: #a9b0bf; }
+#GuideBtn { background-color: #f2f5fa; color: #9a6a12;
+            border: 1px solid #dbe1ec; }
+#GuideBtn:hover { background-color: #e8edf6; color: #12161f;
+                  border-color: #c9d3e6; }
+#BubbleTime { color: #8b93a7; }
 """
 
 

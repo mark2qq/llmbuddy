@@ -21,7 +21,12 @@ RISK_OBJ = {"low": "RiskLow", "medium": "RiskMedium", "high": "RiskHigh"}
 
 
 class ChatBubble(QWidget):
-    """一条消息气泡。role ∈ user / assistant。"""
+    """一条消息气泡。role ∈ user / assistant。
+
+    time_text（HH:MM）非空时，气泡下方追加一枚 #BubbleTime 小标签——
+    1.0.9 起引导消息专用：进了对话流就带发送时间、可复制、不可撤回
+    （与队列内可改形成分界）。
+    """
 
     #: 气泡最大宽度：长段落到这里换行，短句按内容贴合
     MAX_WIDTH = 660
@@ -30,9 +35,11 @@ class ChatBubble(QWidget):
     #: 流式刷新节流（毫秒）：每个 token 都重排整段文本会闪得厉害
     FLUSH_MS = 40
 
-    def __init__(self, role: str, text: str = "", parent=None):
+    def __init__(self, role: str, text: str = "", parent=None,
+                 time_text: str = ""):
         super().__init__(parent)
         self.role = role
+        self.time_text = str(time_text or "")   # HH:MM；仅引导消息传（P1-2）
         self._fit_w = -1
         self._buf = ""
         self._shown = ""
@@ -57,7 +64,25 @@ class ChatBubble(QWidget):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._flush)
 
-        if role == "user":
+        if self.time_text:
+            # 时间标签挂在气泡下方、与气泡同侧对齐（用户右 / 助手左），
+            # 走 #BubbleTime QSS；复制文本沿用 label 的 TextSelectableByMouse
+            self.time_label = QLabel(self.time_text)
+            self.time_label.setObjectName("BubbleTime")
+            self.time_label.setAlignment(
+                Qt.AlignRight if role == "user" else Qt.AlignLeft)
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.addWidget(self.label, 0)
+            col.addWidget(self.time_label, 0)
+            if role == "user":
+                lay.addStretch(1)
+                lay.addLayout(col, 0)
+            else:
+                lay.addLayout(col, 1)
+                lay.addStretch(0)
+        elif role == "user":
             lay.addStretch(1)
             lay.addWidget(self.label, 0)
         else:

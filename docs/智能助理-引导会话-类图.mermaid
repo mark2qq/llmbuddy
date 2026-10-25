@@ -1,0 +1,133 @@
+%% 智能助理 · 引导会话（消息排队）—— 类图（增量 v1）
+%% 关联：docs/智能助理-引导会话-架构设计.md
+%% 注意：本文件为「引导会话」增量专属；基础项目的类图见 docs/class-diagram.mermaid，勿覆盖。
+
+classDiagram
+    direction LR
+
+    class QueueError {
+        +int code
+        +str message
+    }
+
+    class QueueItem {
+        +str id
+        +str text
+        +bool guided
+        +float created_at
+        +float edited_at
+        +to_dict() Dict
+    }
+
+    class AssistantQueue {
+        -RLock _lock
+        -Dict~str, Deque~ _items
+        -Dict~str, bool~ _paused
+        -Dict~str, OrderedDict~ _recent
+        +enqueue(session_id, text, guided) QueueItem
+        +update(session_id, item_id, text) QueueItem
+        +remove(session_id, item_id) str
+        +move(session_id, item_id, delta) List~Dict~
+        +clear(session_id) int
+        +pop_next(session_id) QueueItem
+        +is_paused(session_id) bool
+        +set_paused(session_id, paused) void
+        +snapshot(session_id) List~Dict~
+        +pending_count(session_id) int
+        +drop_session(session_id) void
+        -_find(session_id, item_id) QueueItem
+        -_remember(session_id, item) void
+    }
+
+    class get_queue {
+        <<function>>
+        +AssistantQueue get_queue()
+    }
+
+    class hhmm {
+        <<function>>
+        +str hhmm(ts)
+    }
+
+    class Assistant {
+        <<existing · 零改动>>
+        +start_turn(session_id, text, provider_id, model, emit) Dict
+        +stop(session_id) void
+    }
+
+    class AssistantAPI {
+        <<routers/assistant.py>>
+        -Dict~str, asyncio.Queue~ _STREAM_SINKS
+        +chat(body) StreamingResponse
+        +stop(body) Dict
+        +queue_snapshot(session_id) Dict
+        +queue_update(item_id, session_id, body) Dict
+        +queue_delete(item_id, session_id) Dict
+        +queue_move(item_id, session_id, body) Dict
+        +queue_clear(session_id) Dict
+        -_broadcast(session_id, event) void
+        -_queue_snapshot_event(session_id) Dict
+    }
+
+    class AssistantApi {
+        <<client/core/assistant_client.py>>
+        +queue(sid) Dict
+        +enqueue(sid, text, guided) Dict
+        +queue_update(sid, item_id, text) Dict
+        +queue_delete(sid, item_id) Dict
+        +queue_move(sid, item_id, delta) Dict
+        +queue_clear(sid) Dict
+    }
+
+    class AssistantStream {
+        <<existing>>
+        +event Signal
+        +failed Signal
+        +closed Signal
+        +cancel() void
+    }
+
+    class AssistantPage {
+        <<client/ui/pages/assistant_page.py>>
+        -bool _busy
+        -List _queue_items
+        -bool _queue_paused
+        -QWidget _queue_panel
+        -Dict~str, QueueItemRow~ _queue_rows
+        +_on_event(ev) void
+        +_on_send_clicked() void
+        +_on_guide_clicked() void
+        +_enqueue_message(text, guided) void
+        +_apply_queue(items, paused) void
+        +_set_busy_controls() void
+        +_fetch_queue(sid) void
+        +_resume_queue() void
+        +_stop() void
+    }
+
+    class QueueItemRow {
+        <<client/ui/widgets/queue_item.py>>
+        +saved Signal(str, str)
+        +removed Signal(str)
+        +moved Signal(str, int)
+        +edit_cancelled Signal()
+        +begin_edit() void
+        +set_movable(up, down) void
+    }
+
+    class ChatBubble {
+        <<existing · +time_text>>
+        +str time_text
+        +QLabel label
+    }
+
+    AssistantQueue *-- QueueItem : 持有（per-session deque）
+    AssistantQueue ..> QueueError : 抛出（2012/2014/2015/2016）
+    get_queue ..> AssistantQueue : 返回单例
+    hhmm ..> QueueItem : 格式化 time
+    AssistantAPI --> AssistantQueue : get_queue()
+    AssistantAPI --> Assistant : start_turn() / stop()
+    AssistantPage --> AssistantApi : REST（队列操作）
+    AssistantPage --> AssistantStream : SSE（事件流）
+    AssistantPage *-- QueueItemRow : 队列面板行
+    AssistantPage --> ChatBubble : 渲染用户/助手气泡

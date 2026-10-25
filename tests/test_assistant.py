@@ -9,6 +9,8 @@
     - LangGraph 编排：plan→act→review→finish 全流程（用假模型）
     - Agent 循环：工具调用→结果回填→最终回答；文本内工具调用兜底
     - HTTP 层：/api/v1/assistant/state 与 /tools 可用
+    - 引导会话队列（1.0.9）：入队/引导广播、多轮 FIFO 消费（唯一 end）、
+      停止暂停 + resume 继续、队列 REST 端点错误码、删会话清队列
 
 全部用例都在临时目录里跑，不碰用户真实数据。
 """
@@ -703,3 +705,353 @@ def test_http_state_and_tools(env):
 
     skills_body = asyncio.run(api.skill_list())
     assert skills_body["code"] == 0 and skills_body["data"]
+
+
+# ----------------------------------------------------------------------------
+# 引导会话队列（1.0.9 增量）：排队插话 / 引导发送 / 自动消费 / 停止暂停
+# ----------------------------------------------------------------------------
+def _parse_sse(chunks):
+    """把 StreamingResponse 的 data: 行解析成事件列表 + 是否见到 [DONE]。"""
+    events, done = [], False
+    for chunk in chunks:
+        for line in str(chunk).splitlines():
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if raw == "[DONE]":
+                done = True
+                continue
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(ev, dict):
+                events.append(ev)
+    return events, done
+
+
+def _fresh_sid(ass):
+    sid = ass.new_session()["id"]
+    from core.assistant.queue import get_queue
+    get_queue().drop_session(sid)
+    return sid
+
+
+def test_chat_queue_mode_enqueues_and_broadcasts(env):
+    """忙碌态入队：REST 短请求不新开流，假 sink 依次收到 queued、queue。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import get_queue
+    from routers import assistant as api
+
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    sink: "asyncio.Queue" = asyncio.Queue()
+    api._STREAM_SINKS[sid] = sink
+    try:
+        res = asyncio.run(api.chat({"session_id": sid, "message": "插一句",
+                                    "mode": "queue", "stream": False}))
+        assert res["code"] == 0
+        item = res["data"]["queued"]
+        assert item["text"] == "插一句" and item["guided"] is False
+        assert res["data"]["paused"] is False
+        ev1 = sink.get_nowait()
+        ev2 = sink.get_nowait()
+        assert ev1["type"] == "queued" and ev1["text"] == "插一句"
+        assert ev1["index"] == 0 and len(ev1["time"]) == 5
+        assert ev2["type"] == "queue"
+        assert [i["id"] for i in ev2["items"]] == [item["id"]]
+        assert q.pending_count(sid) == 1
+    finally:
+        api._STREAM_SINKS.pop(sid, None)
+        q.drop_session(sid)
+
+
+def test_chat_guided_mode_broadcasts_guided_and_queue(env):
+    """引导发送：立即以 guided 事件登记（客户端渲染气泡），不打断当前轮。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import get_queue
+    from routers import assistant as api
+
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    sink: "asyncio.Queue" = asyncio.Queue()
+    api._STREAM_SINKS[sid] = sink
+    try:
+        res = asyncio.run(api.chat({"session_id": sid, "message": "立即引导",
+                                    "mode": "guided", "stream": False}))
+        assert res["code"] == 0
+        item = res["data"]["queued"]
+        assert item["guided"] is True
+        types = [sink.get_nowait()["type"] for _ in range(3)]
+        assert types == ["queued", "guided", "queue"]
+        assert q.snapshot(sid)[0]["guided"] is True
+    finally:
+        api._STREAM_SINKS.pop(sid, None)
+        q.drop_session(sid)
+
+
+def test_chat_queue_mode_full_returns_2012(env):
+    """队列满 20 条：第 21 条入队被拒（2012），消息保留在输入框不丢。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import MAX_QUEUE_ITEMS, get_queue
+    from routers import assistant as api
+
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    try:
+        for i in range(MAX_QUEUE_ITEMS):
+            q.enqueue(sid, f"m{i}")
+        api._STREAM_SINKS[sid] = asyncio.Queue()
+        try:
+            res = asyncio.run(api.chat({"session_id": sid, "message": "挤不进去",
+                                        "mode": "queue", "stream": False}))
+            assert res["code"] == 2012
+        finally:
+            api._STREAM_SINKS.pop(sid, None)
+        assert q.pending_count(sid) == MAX_QUEUE_ITEMS
+    finally:
+        q.drop_session(sid)
+
+
+def test_chat_queue_mode_without_stream_degrades_to_normal(env, monkeypatch):
+    """无活跃流时 queue/guided 退化为普通发送：不报错、不丢消息。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import get_queue
+    from routers import assistant as api
+
+    provider = FakeProvider([ChatReply(content="直接开跑的答复")])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    try:
+        async def run():
+            resp = await api.chat({"session_id": sid, "message": "没流就正常发",
+                                   "mode": "queue", "stream": True})
+            return [c async for c in resp.body_iterator]
+
+        chunks = asyncio.run(run())
+        events, done = _parse_sse(chunks)
+        kinds = [e.get("type") for e in events]
+        assert "done" in kinds and kinds[-1] == "end" and done is True
+        assert not any(e.get("type") == "queued" for e in events)
+        assert q.pending_count(sid) == 0
+        saved = store_mod.load_session(sid)
+        assert any(m["role"] == "user" and m["content"] == "没流就正常发"
+                   for m in saved["messages"])
+    finally:
+        q.drop_session(sid)
+
+
+def test_chat_stream_consumes_queue_fifo(env, monkeypatch):
+    """本轮结束自动按 FIFO 消费队列：同一条连接续跑，唯一一次 end 在末尾。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import get_queue
+    from routers import assistant as api
+
+    provider = FakeProvider([
+        ChatReply(content="第一轮答复"),
+        ChatReply(content="第二轮答复"),
+        ChatReply(content="第三轮答复"),
+    ])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    i1 = q.enqueue(sid, "队列消息一")
+    i2 = q.enqueue(sid, "队列消息二")
+
+    async def run():
+        resp = await api.chat({"session_id": sid, "message": "首条消息",
+                               "stream": True})
+        return [c async for c in resp.body_iterator]
+
+    try:
+        chunks = asyncio.run(run())
+        events, done = _parse_sse(chunks)
+        kinds = [e.get("type") for e in events]
+        # 恰好一次 end、在末尾，终止于 [DONE]（单轮 end 被吞掉）
+        assert kinds.count("end") == 1 and kinds[-1] == "end" and done is True
+        end_ev = events[-1]
+        assert end_ev["content"] == "第三轮答复" and end_ev["error"] == ""
+        assert end_ev["paused"] is False
+        # 3 个 done（每轮一个）、2 个 dequeued（id/text/mode 正确）
+        assert kinds.count("done") == 3
+        dq = [e for e in events if e.get("type") == "dequeued"]
+        assert [e["id"] for e in dq] == [i1.id, i2.id]
+        assert [e["text"] for e in dq] == ["队列消息一", "队列消息二"]
+        assert [e["mode"] for e in dq] == ["queue", "queue"]
+        # 每个 dequeued 后跟一次快照；末尾快照为空（队列耗尽）
+        snaps = [e for e in events if e.get("type") == "queue"]
+        assert len(snaps) == 3 and snaps[-1]["items"] == []
+        # FIFO 落库：3 user + 3 assistant，顺序与到达一致
+        saved = store_mod.load_session(sid)
+        users = [m["content"] for m in saved["messages"] if m["role"] == "user"]
+        bots = [m for m in saved["messages"] if m["role"] == "assistant"]
+        assert users == ["首条消息", "队列消息一", "队列消息二"]
+        assert len(bots) == 3
+        # 流结束后 sink 注销（resume 才不撞 2017）
+        assert sid not in api._STREAM_SINKS
+    finally:
+        q.drop_session(sid)
+
+
+def test_stop_pauses_queue_and_resume_continues(env, monkeypatch):
+    """/stop = 取消 + 队列暂停（不出队不清空）；resume 解暂停并出队头条。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import get_queue
+    from routers import assistant as api
+
+    provider = FakeProvider([ChatReply(content="恢复后的答复")])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    q.enqueue(sid, "排队消息")
+
+    sink: "asyncio.Queue" = asyncio.Queue()
+    api._STREAM_SINKS[sid] = sink
+    try:
+        res = asyncio.run(api.stop({"session_id": sid}))
+        assert res["code"] == 0 and res["data"]["stopped"] is True
+        assert q.is_paused(sid) is True
+        ev1 = sink.get_nowait()
+        ev2 = sink.get_nowait()
+        assert ev1["type"] == "queue_state" and ev1["paused"] is True
+        assert ev1["reason"] == "stopped"
+        assert ev2["type"] == "queue" and len(ev2["items"]) == 1
+        assert q.pending_count(sid) == 1        # 不出队、不清空
+    finally:
+        api._STREAM_SINKS.pop(sid, None)
+
+    # resume 空队列 -> HTTP 400 + fail(2013)（唯一 HTTP 非 200）
+    sid2 = _fresh_sid(ass)
+    try:
+        resp = asyncio.run(api.chat({"session_id": sid2, "mode": "resume",
+                                     "stream": True}))
+        assert getattr(resp, "status_code", None) == 400
+        assert json.loads(resp.body)["code"] == 2013
+
+        # resume 撞活跃流 -> 2017（竞态兜底）
+        api._STREAM_SINKS[sid] = asyncio.Queue()
+        try:
+            busy = asyncio.run(api.chat({"session_id": sid, "mode": "resume"}))
+            assert busy["code"] == 2017
+        finally:
+            api._STREAM_SINKS.pop(sid, None)
+
+        # resume 非空：解暂停 + 出队头条开轮，回到自动消费路径
+        async def run():
+            r = await api.chat({"session_id": sid, "mode": "resume",
+                                "stream": True})
+            return [c async for c in r.body_iterator]
+
+        chunks = asyncio.run(run())
+        events, done = _parse_sse(chunks)
+        kinds = [e.get("type") for e in events]
+        assert kinds[0] == "session"
+        assert "queue_state" in kinds and q.is_paused(sid) is False
+        dq = [e for e in events if e.get("type") == "dequeued"]
+        assert len(dq) == 1 and dq[0]["text"] == "排队消息"
+        assert kinds[-1] == "end" and done is True
+        assert q.pending_count(sid) == 0
+    finally:
+        q.drop_session(sid)
+        q.drop_session(sid2)
+
+
+def test_queue_endpoints_crud_and_error_codes(env):
+    """队列 REST 端点：快照/编辑/排序/删除/清除 + 2002/2012/2014/2015/2016。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import MAX_QUEUE_ITEMS, get_queue
+    from routers import assistant as api
+
+    ass = agent_mod.get_assistant()
+    sid = _fresh_sid(ass)
+    q = get_queue()
+    try:
+        a = q.enqueue(sid, "甲")
+        b = q.enqueue(sid, "乙")
+        g = q.enqueue(sid, "引导", guided=True)
+
+        # GET 快照（FIFO 顺序 + paused）
+        snap = asyncio.run(api.queue_snapshot(sid))
+        assert snap["code"] == 0
+        assert [i["id"] for i in snap["data"]["items"]] == [a.id, b.id, g.id]
+        assert snap["data"]["paused"] is False
+        assert asyncio.run(api.queue_snapshot(""))["code"] == 2002
+
+        # PATCH 编辑 + 错误码
+        upd = asyncio.run(api.queue_update(a.id, sid, {"text": "甲改"}))
+        assert upd["code"] == 0 and upd["data"]["text"] == "甲改"
+        assert upd["data"]["edited_at"] is not None
+        assert asyncio.run(api.queue_update(g.id, sid, {"text": "x"}))["code"] == 2016
+        assert asyncio.run(api.queue_update("qnope", sid, {"text": "x"}))["code"] == 2014
+        assert asyncio.run(api.queue_update(a.id, sid, {"text": "  "}))["code"] == 2002
+
+        # move 排序 + 错误码（乙上移一位；首条再上移越界）
+        mv = asyncio.run(api.queue_move(b.id, sid, {"delta": -1}))
+        assert mv["code"] == 0
+        assert [i["text"] for i in mv["data"]["items"]] == ["乙", "甲改", "引导"]
+        assert asyncio.run(api.queue_move(g.id, sid, {"delta": -1}))["code"] == 2016
+        assert asyncio.run(api.queue_move(b.id, sid, {"delta": -1}))["code"] == 2002
+        assert asyncio.run(api.queue_move(b.id, sid, {"delta": 7}))["code"] == 2002
+
+        # DELETE 删除 + 错误码
+        dele = asyncio.run(api.queue_delete(a.id, sid))
+        assert dele["code"] == 0 and dele["data"]["deleted"] == a.id
+        assert asyncio.run(api.queue_delete(g.id, sid))["code"] == 2016
+        assert asyncio.run(api.queue_delete("qnope", sid))["code"] == 2014
+
+        # clear 只清非引导（此时队列：乙、引导 -> 清 1 条）
+        cl = asyncio.run(api.queue_clear(sid))
+        assert cl["code"] == 0 and cl["data"]["cleared"] == 1
+        assert [i["text"] for i in q.snapshot(sid)] == ["引导"]
+
+        # 已出队 -> 2015
+        popped = q.pop_next(sid)
+        late = asyncio.run(api.queue_update(popped.id, sid, {"text": "迟到的编辑"}))
+        assert late["code"] == 2015
+
+        # 队列满 20 的 REST 路径（再塞 20 条撞上限）
+        for i in range(MAX_QUEUE_ITEMS):
+            q.enqueue(sid, f"f{i}")
+        api._STREAM_SINKS[sid] = asyncio.Queue()
+        try:
+            full = asyncio.run(api.chat({"session_id": sid, "message": "第21条",
+                                         "mode": "queue", "stream": False}))
+            assert full["code"] == 2012
+        finally:
+            api._STREAM_SINKS.pop(sid, None)
+    finally:
+        q.drop_session(sid)
+
+
+def test_delete_session_drops_queue(env):
+    """删任务时队列状态（条目/暂停/已出队记忆）一起清掉。"""
+    import asyncio
+    from core.assistant import agent as agent_mod
+    from core.assistant.queue import get_queue
+    from routers import assistant as api
+
+    ass = agent_mod.get_assistant()
+    sid = ass.new_session()["id"]
+    q = get_queue()
+    q.drop_session(sid)
+    q.enqueue(sid, "跟着会话一起走")
+    q.set_paused(sid, True)
+    res = asyncio.run(api.session_delete(sid))
+    assert res["code"] == 0 and res["data"]["deleted"] is True
+    assert q.pending_count(sid) == 0
+    assert q.is_paused(sid) is False

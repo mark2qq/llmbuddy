@@ -50,21 +50,23 @@ class AssistantApi:
         with _client(self.base_url, self.api_key) as c:
             return self._unwrap(c.get(path, params=params))
 
-    def post(self, path: str, body: Optional[Dict] = None, timeout: float = 60.0) -> Any:
+    def post(self, path: str, body: Optional[Dict] = None,
+             timeout: float = 60.0, params: Optional[Dict] = None) -> Any:
         with _client(self.base_url, self.api_key, timeout) as c:
-            return self._unwrap(c.post(path, json=body or {}))
+            return self._unwrap(c.post(path, json=body or {}, params=params))
 
     def put(self, path: str, body: Optional[Dict] = None) -> Any:
         with _client(self.base_url, self.api_key) as c:
             return self._unwrap(c.put(path, json=body or {}))
 
-    def patch(self, path: str, body: Optional[Dict] = None) -> Any:
+    def patch(self, path: str, body: Optional[Dict] = None,
+              params: Optional[Dict] = None) -> Any:
         with _client(self.base_url, self.api_key) as c:
-            return self._unwrap(c.patch(path, json=body or {}))
+            return self._unwrap(c.patch(path, json=body or {}, params=params))
 
-    def delete(self, path: str) -> Any:
+    def delete(self, path: str, params: Optional[Dict] = None) -> Any:
         with _client(self.base_url, self.api_key) as c:
-            return self._unwrap(c.delete(path))
+            return self._unwrap(c.delete(path, params=params))
 
     def get_bytes(self, path: str) -> bytes:
         with _client(self.base_url, self.api_key, 60.0) as c:
@@ -100,6 +102,38 @@ class AssistantApi:
 
     def stop(self, sid: str) -> Dict:
         return self.post("/api/v1/assistant/stop", {"session_id": sid}) or {}
+
+    # ---------------- 引导会话队列（1.0.9：排队插话 / 引导发送） ----------------
+    def queue(self, sid: str) -> Dict:
+        """队列快照（items + paused）：重连恢复 / 停止后同步用。"""
+        return self.get("/api/v1/assistant/queue", {"session_id": sid}) or {}
+
+    def enqueue(self, sid: str, text: str, guided: bool = False) -> Dict:
+        """入队 / 引导发送（POST /chat mode=queue|guided，REST 短请求不新开流）。"""
+        return self.post("/api/v1/assistant/chat",
+                         {"session_id": sid, "message": text,
+                          "mode": "guided" if guided else "queue",
+                          "stream": False}) or {}
+
+    def queue_update(self, sid: str, item_id: str, text: str) -> Dict:
+        """编辑排队消息（仅排队中的普通消息；引导/已出队后端报错）。"""
+        return self.patch(f"/api/v1/assistant/queue/{item_id}",
+                          {"text": text}, params={"session_id": sid}) or {}
+
+    def queue_delete(self, sid: str, item_id: str) -> Dict:
+        """删除排队消息（引导消息不可删）。"""
+        return self.delete(f"/api/v1/assistant/queue/{item_id}",
+                           params={"session_id": sid}) or {}
+
+    def queue_move(self, sid: str, item_id: str, delta: int) -> Dict:
+        """排序：delta=-1 上移 / +1 下移。"""
+        return self.post(f"/api/v1/assistant/queue/{item_id}/move",
+                         {"delta": delta}, params={"session_id": sid}) or {}
+
+    def queue_clear(self, sid: str) -> Dict:
+        """全部清除（只清普通排队消息，引导消息不清）。"""
+        return self.post("/api/v1/assistant/queue/clear", {},
+                         params={"session_id": sid}) or {}
 
     def resolve_approval(self, aid: str, approve: bool, remember: bool = False) -> Dict:
         return self.post(f"/api/v1/assistant/approvals/{aid}",
