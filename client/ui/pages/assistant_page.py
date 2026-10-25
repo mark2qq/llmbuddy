@@ -33,6 +33,7 @@
 import json
 import os
 import time
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
@@ -65,6 +66,7 @@ NAV_TASK_MAX = 4            # 「任务」区直接显示几条（WorkBuddy 的�
 NAV_SPACE_MAX = 4           # 「空间」区最多显示几个空间
 NAV_SPACE_TASK_MAX = 5      # 空间展开后最多显示几条任务
 NAV_ROW = 26                # 单行高度
+NAV_ENTRY_H = 30            # 技能/工具/MCP/审计 四个二级入口的固定行高
 NAV_SCROLL_MAX = 420        # 任务+空间滚动区最高多少（超出内部滚动）
 # 兼容旧命名（管理面板文案里还引用着）
 NAV_MAX_SESSIONS = NAV_TASK_MAX
@@ -514,6 +516,10 @@ class AssistantPage(QWidget):
                            ("mcp", "MCP"), ("audit", "审计")):
             btn = QPushButton(label)
             btn.setObjectName("NavSubItem")
+            # 固定 30：QSS 只给了 min-height:26，按钮自带内边距把它撑到 40，
+            # 4 个入口白吃 160px。高 DPI（本机 200%，窗口逻辑高只有 680）下，
+            # 这 40px 正好是「空间」那一行被挤出视口的原因。
+            btn.setFixedHeight(NAV_ENTRY_H)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _c=False, k=key: self.open_manager(k))
             lay.addWidget(btn)
@@ -691,6 +697,61 @@ class AssistantPage(QWidget):
 
         lay.addStretch(1)
         self._fit_nav_scroll(lines)
+        self._dump_nav_debug(lines)
+
+    def _dump_nav_debug(self, lines: int) -> None:
+        """排查用：LLM_NAV_DBG=1 时把左栏各层高度与子控件几何写进日志。
+
+        冻结包和源码跑出来不一样时（曾经出现过「空间」整段不显示），
+        只能靠现场数据判断，所以留一个开关，默认不开。
+        """
+        if not os.environ.get("LLM_NAV_DBG"):
+            return
+        try:
+            base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+            path = os.path.join(base, "llmBuddy", "logs", "nav_dbg.log")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            body = self._nav_body
+            sc = self._nav_scroll
+            rows = []
+            lay = self._nav_body_lay
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is None:
+                    rows.append(f"  [{i}] spacer")
+                    continue
+                rows.append("  [%d] %s %r geom=%s vis=%s h=%d hint=%d min=%d"
+                            % (i, w.objectName(),
+                               (w.text()[:20] if hasattr(w, "text") else ""),
+                               w.geometry().getRect(), w.isVisible(), w.height(),
+                               w.sizeHint().height(), w.minimumHeight()))
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("=== rebuild %s\n" % time.strftime("%H:%M:%S"))
+                fh.write("lines=%d spaces=%d open=%r\n"
+                         % (lines, len(self._nav_spaces or []), self._open_space))
+                fh.write("scroll h=%d hint=%d min=%d max=%d viewport=%d\n"
+                         % (sc.height(), sc.sizeHint().height(),
+                            sc.minimumHeight(), sc.maximumHeight(),
+                            sc.viewport().height()))
+                fh.write("body h=%d hint=%d\n" % (body.height(), body.sizeHint().height()))
+                # 祖先链：谁把滚动区压小了，一眼能看出来
+                w = sc
+                depth = 0
+                while w is not None and depth < 6:
+                    lay_w = w.layout()
+                    fh.write("  ^%d %-12s h=%d hint=%d min=%d max=%d"
+                             % (depth, w.objectName() or w.__class__.__name__,
+                                w.height(), w.sizeHint().height(),
+                                w.minimumHeight(), w.maximumHeight()))
+                    if lay_w is not None:
+                        fh.write(" layhint=%d spacing=%d"
+                                 % (lay_w.sizeHint().height(), lay_w.spacing()))
+                    fh.write("\n")
+                    w = w.parentWidget()
+                    depth += 1
+                fh.write("\n".join(rows) + "\n")
+        except Exception:                       # 调试代码不许影响界面
+            pass
 
     def _fit_nav_scroll(self, rows: int = 0) -> None:
         """按行数算高，但允许被窗口压缩。
@@ -713,6 +774,27 @@ class AssistantPage(QWidget):
         sc.setMaximumHeight(h)
         if hasattr(sc, "set_hint_height"):
             sc.set_hint_height(h)
+        self._relayout_nav()
+
+    def _relayout_nav(self) -> None:
+        """改完滚动区高度后，逐级把父布局标脏并立刻重排。
+
+        打包进 exe 后出现过「hint 变了、父布局却不重算」：滚动区仍按旧高度
+        （只够任务区）分配，最后一行「空间」被裁在视口外——源码跑同样的代码
+        却正常，因为那边窗口 resize 顺带触发了重排。这里不赌事件顺序，主动
+        invalidate + activate 整条链（滚动区 → 面板 → 左栏挂载点）。
+        """
+        chain = []
+        w = self._nav_scroll
+        while w is not None and len(chain) < 4:
+            chain.append(w)
+            w = w.parentWidget()
+        for w in chain:
+            w.updateGeometry()
+            lay = w.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
 
     def _toggle_space(self, path: str) -> None:
         # 手风琴：一次只展开一个空间，避免展开多个把左栏撑爆

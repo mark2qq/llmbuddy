@@ -777,9 +777,10 @@ QTabBar::tab:hover { color: #d6dbe8; }
     border: none;
     border-radius: 6px;
     text-align: left;
-    padding-left: 26px;
+    /* 行高由代码 setFixedHeight(NAV_ENTRY_H) 定死：QSS 的 min-height 会和
+       按钮内边距叠加，把 4 个入口撑到 40px，高 DPI 下正好挤掉「空间」那一行 */
+    padding: 0 0 0 26px;
     font-size: 12px;
-    min-height: 26px;
 }
 #NavSubItem:hover { background-color: #1d2230; color: #eef1fa; }
 

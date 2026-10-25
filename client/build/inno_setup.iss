@@ -34,6 +34,8 @@
 AppId={{#MyAppGuid}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+; 只用简体中文：不弹「选择安装语言」，否则静默安装（/VERYSILENT）会卡在这个框上
+ShowLanguageDialog=no
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
@@ -211,8 +213,11 @@ function InitializeSetup(): Boolean;
 var
   Installed: String;
   Msg: String;
+  Force: Boolean;
 begin
   Result := True;
+  // /FORCE：同版本重装时跳过确认框（静默覆盖安装用；正常用户升级不受影响）
+  Force := Pos('/FORCE', Uppercase(GetCmdTail())) > 0;
   Installed := GetInstalledVersion();
   IsUpgrade := Installed <> '';
   if not IsUpgrade then
@@ -222,6 +227,12 @@ begin
   end;
 
   Log('检测到已安装版本 ' + Installed + '，当前安装包版本 ' + '{#MyAppVersion}');
+  if Force then
+  begin
+    // 静默覆盖安装：不弹任何确认框，直接覆盖（自动化打包自测用）
+    Log('已指定 /FORCE，跳过升级 / 同版本确认，直接覆盖安装');
+    Exit;
+  end;
   if VersionGreaterOrEqual(Installed, '{#MyAppVersion}') then
   begin
     Msg := '本机已安装 ' + '{#MyAppName}' + ' ' + Installed + '，版本不低于当前安装包（' + '{#MyAppVersion}' + '）。' +
