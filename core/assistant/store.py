@@ -33,6 +33,8 @@ SESSIONS_DIR = os.path.join(ASSISTANT_DIR, "sessions")
 AUDIT_DIR = os.path.join(ASSISTANT_DIR, "audit")
 CONFIG_PATH = os.path.join(ASSISTANT_DIR, "config.json")
 DEFAULT_WORKSPACE = os.path.join(ASSISTANT_DIR, "workspace")
+#: 在线目录缓存目录（1.0.8 增量：mcp_servers.json / gh_repos.json / gh_skills.json）
+CATALOG_DIR = os.path.join(ASSISTANT_DIR, "catalog")
 
 # 硅基流动 OpenAI 兼容端点（与客户端 chat_page.SILICONFLOW_BASE_URL 保持一致）
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
@@ -43,6 +45,51 @@ SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 #   yolo           全部放行，仅审计（高风险，适合完全信任的沙箱）
 POLICIES = ("readonly_auto", "ask_all", "yolo")
 DEFAULT_POLICY = "readonly_auto"
+
+#: 下发给模型的工具数上限（PRD §4.1 P0-5：8~64，默认 24）
+DEFAULT_MAX_TOOLS = 24
+MIN_MAX_TOOLS = 8
+MAX_MAX_TOOLS = 64
+
+
+def _default_profiles() -> List[Dict[str, Any]]:
+    """3 个内置 profile 的**拷贝**（PRD §5.4.2）。
+
+    刻意不走 profiles.BUILTIN_PROFILES 的引用：store 是最底层的模块，
+    import profiles 会形成循环依赖；两份常量的一致性由 profiles 的兜底逻辑
+    （BUILTIN_PROFILES = _default_profiles()）保证，只抄不改。
+    """
+    return [
+        {"id": "file-organize", "name": "文件整理", "enabled": True,
+         "priority": 10,
+         "triggers": ["整理", "归档", "分类", "收拾", "重命名", "移走",
+                      "清理目录"],
+         "skills": ["workspace-organizer"],
+         "tools": ["fs_list", "fs_read", "fs_info", "fs_mkdir", "fs_move",
+                   "fs_glob", "skill_run"]},
+        {"id": "code-read", "name": "代码阅读", "enabled": True,
+         "priority": 20,
+         "triggers": ["代码", "仓库", "项目", "分析一下", "技术栈", "架构",
+                      "体检", "review"],
+         "skills": ["repo-digest"],
+         "tools": ["fs_list", "fs_glob", "fs_grep", "fs_read", "fs_info",
+                   "skill_run"]},
+        {"id": "web-research", "name": "网页调研", "enabled": True,
+         "priority": 30,
+         "triggers": ["网页", "链接", "文章", "抓取", "调研", "总结一下这",
+                      "http", "url"],
+         "skills": ["web-brief"],
+         "tools": ["web_fetch", "fs_write", "skill_run"]},
+    ]
+
+
+def _default_catalog() -> Dict[str, Any]:
+    """在线目录配置（PRD §6.1）：proxy 空 = 读环境变量，再空 = 本机默认代理。"""
+    return {
+        "proxy": "",
+        "ttl_hours": {"mcp": 24, "gh_repos": 24, "gh_skills": 168},
+        "allow_nonfree": False,
+    }
 
 
 def _default_config() -> Dict[str, Any]:
@@ -65,12 +112,25 @@ def _default_config() -> Dict[str, Any]:
         "approval_timeout": 300,     # 审批等待上限（秒），超时按拒绝处理
         "temperature": 0.3,
         "max_tokens": 2048,
+        # MCP 服务器列表由 MCPManager 负责读写。这里必须声明 key，否则
+        # load_config() 的 `if k in cfg` 过滤会把它丢掉（1.0.8 修复：
+        # mcp_add / mcp_install 写盘后 servers() 读回空列表）。
+        "mcp_servers": [],
+        # ---- 1.0.8 增量：清单中心 / 工具裁剪 / 自动加载 ----
+        # 注意：load_config() 只回填 _default_config() 里存在的 key，
+        # 这 5 个新字段必须在这里，否则老 config.json 读不到（架构 §1.1 D7）。
+        "tool_prefs": {"disabled": [], "max_tools": DEFAULT_MAX_TOOLS},
+        "auto_load": True,
+        "profiles": _default_profiles(),
+        "catalog": _default_catalog(),
+        "skill_sources": {},         # slug -> {kind, repo, ref, dir, commit, ...}
     }
 
 
 def ensure_dirs() -> None:
     """创建全部工作目录（幂等）。"""
-    for d in (ASSISTANT_DIR, SKILLS_DIR, SESSIONS_DIR, AUDIT_DIR, DEFAULT_WORKSPACE):
+    for d in (ASSISTANT_DIR, SKILLS_DIR, SESSIONS_DIR, AUDIT_DIR, DEFAULT_WORKSPACE,
+              CATALOG_DIR):
         os.makedirs(d, exist_ok=True)
 
 

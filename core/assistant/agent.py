@@ -28,7 +28,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from core.assistant import mcp as mcp_mod
+from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
+from core.assistant import tools as tools_mod
 from core.assistant.approval import get_approval_manager
 from core.assistant.providers import ProviderError, get_provider
 from core.assistant.store import (audit, delete_session, ensure_dirs, get_provider as cfg_provider,
@@ -39,6 +41,10 @@ from core.assistant.tools import ToolRegistry
 
 MAX_HISTORY_MESSAGES = 24
 MAX_TOOL_ROUNDS = 12
+#: 单轮自动挂载的技能上限（profile.skills + mounted_skills 合并后）
+MAX_AUTO_SKILLS = 5
+#: 未命中 profile 时写进 system 的可用技能条数上限
+MAX_SKILL_HINTS = 20
 # 单轮总时限（秒）：本地小模型单次调用就可能 30-60s，技能再放大若干倍，
 # 不设上限时一次「卡住」会把会话挂十几分钟，这里兜底强制收尾。
 MAX_TURN_SECONDS = 900
@@ -84,6 +90,7 @@ class Assistant:
     def __init__(self) -> None:
         ensure_dirs()
         skills_mod.ensure_builtin_skills()
+        profiles_mod.ensure_builtin_profiles()
         self._lock = threading.RLock()
         self._registry: Optional[ToolRegistry] = None
         self._registry_ws = ""
@@ -201,8 +208,14 @@ class Assistant:
             return bool(self._cancel.get(sid))
 
     def start_turn(self, session_id: str, text: str, provider_id: str = "",
-                   model: str = "", emit: Optional[Callable[[Dict], None]] = None) -> Dict[str, Any]:
-        """执行一轮对话（阻塞）。事件通过 emit(dict) 实时推送。"""
+                   model: str = "", emit: Optional[Callable[[Dict], None]] = None,
+                   mounted_skills: Optional[List[str]] = None) -> Dict[str, Any]:
+        """执行一轮对话（阻塞）。事件通过 emit(dict) 实时推送。
+
+        `mounted_skills` 是**尾参且带默认值**：既有位置参数调用（测试、路由的
+        非流式/流式两条路径）完全不受影响（架构 §5 A4）。传的是「用户在底栏
+        挂载的技能 slug」，落库的 message 仍是**原文**（不再拼「用 xx 技能：」）。
+        """
         emit = emit or (lambda ev: None)
         cfg = load_config()
         registry = self.registry()
@@ -225,7 +238,13 @@ class Assistant:
                 self._running[session_id] = False
             return {"ok": False, "error": "empty"}
 
-        # 记录用户消息
+        mounted = [str(s) for s in (mounted_skills or []) if str(s).strip()]
+
+        # ---- 按需求自动加载（架构 §5 A3 + A4，PRD §5.4）----
+        profile = self._match_profile(cfg, text, registry)
+        auto_loaded = self._auto_loaded_payload(profile, registry, cfg)
+
+        # 记录用户消息（原文，无前缀）
         session["messages"].append({"role": "user", "content": text,
                                     "time": time.time()})
         # 占位标题（新建时还没说话）才自动用首句当标题；用户改过名的绝不动
@@ -233,9 +252,13 @@ class Assistant:
             session["title"] = text.strip().replace("\n", " ")[:24]
             emit({"type": "title", "title": session["title"]})
         emit({"type": "start", "session_id": session_id,
-              "provider": provider_cfg.get("id"), "label": provider_cfg.get("label")})
+              "provider": provider_cfg.get("id"), "label": provider_cfg.get("label"),
+              "auto_loaded": auto_loaded})
 
-        messages = self._build_messages(session, registry, cfg)
+        # ---- 同源（A3）：schemas 只算一次，provider 与系统提示共用同一份 ----
+        schemas = self._select_schemas(cfg, registry, profile)
+        messages = self._build_messages(session, registry, cfg, schemas,
+                                        mounted_skills=mounted, profile=profile)
         final_text = ""
         error = ""
         rounds = 0
@@ -317,7 +340,7 @@ class Assistant:
                     break
                 rounds += 1
                 reply = provider.chat(
-                    messages, tools=registry.openai_schemas(), model=model_name,
+                    messages, tools=schemas, model=model_name,
                     temperature=float(cfg.get("temperature") or 0.3),
                     max_tokens=int(cfg.get("max_tokens") or 2048),
                     on_delta=on_delta, cancel_check=lambda: self._cancelled(session_id))
@@ -474,23 +497,156 @@ class Assistant:
             cleaned = cleaned[:start] + cleaned[end:]
         return found[:8], cleaned
 
+    # ------------------------------------------------------------------ #
+    # 自动加载 / 同源（1.0.8 增量）
+    # ------------------------------------------------------------------ #
+    def _match_profile(self, cfg: Dict[str, Any], text: str,
+                       registry: ToolRegistry) -> Optional[Dict[str, Any]]:
+        """按需求匹配 profile（纯本地关键词，无网络）。
+
+        `auto_load=false` 直接返回 None（用户关了自动加载，一票否决）。
+        技能未安装时 `match_profile` 会返回 None（走 L3 降级：把已安装技能
+        清单写进 system，模型自行决定 skill_run）。
+        """
+        if not bool(cfg.get("auto_load", True)):
+            return None
+        profiles = cfg.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            profiles = profiles_mod.BUILTIN_PROFILES
+        try:
+            available = [str(s.get("slug") or "") for s in skills_mod.list_skills()
+                         if s.get("slug")]
+        except Exception:
+            available = None
+        _ = registry
+        return profiles_mod.match_profile(text, profiles, available)
+
+    @staticmethod
+    def _auto_loaded_payload(profile: Optional[Dict[str, Any]],
+                             registry: ToolRegistry,
+                             cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """`start.auto_loaded` 的载荷；未命中 -> 空 dict。
+
+        字段名是跨端接缝（任务分解 S3）：`profile / name / skills / tools`。
+        `tools` 取**实际下发条数**，与同源裁剪一致，不重复计算。
+        """
+        if profile is None:
+            return {}
+        prefs = cfg.get("tool_prefs") if isinstance(cfg.get("tool_prefs"), dict) else {}
+        allow = profile.get("tools") or None
+        schemas = registry.select_schemas(
+            disabled=set(prefs.get("disabled") or []),
+            allow=allow,
+            max_tools=int(prefs.get("max_tools") or tools_mod.DEFAULT_MAX_TOOLS))
+        return {"profile": str(profile.get("id") or ""),
+                "name": str(profile.get("name") or ""),
+                "skills": [str(s) for s in (profile.get("skills") or [])][:MAX_AUTO_SKILLS],
+                "tools": len(schemas)}
+
+    def _select_schemas(self, cfg: Dict[str, Any], registry: ToolRegistry,
+                        profile: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """下发的**唯一** schema 列表（A3：provider 与系统提示共用）。
+
+        过滤条件来自 `tool_prefs`；命中 profile 时额外收窄白名单
+        （`allow=profile.tools`）。顺带 `set_filter()`，让 `/state` 的
+        `enabled` 字段与本次下发口径一致（时序图图 2 第 15 步）。
+        """
+        prefs = cfg.get("tool_prefs") if isinstance(cfg.get("tool_prefs"), dict) else {}
+        disabled = {str(x) for x in (prefs.get("disabled") or [])}
+        try:
+            max_tools = int(prefs.get("max_tools") or tools_mod.DEFAULT_MAX_TOOLS)
+        except (TypeError, ValueError):
+            max_tools = tools_mod.DEFAULT_MAX_TOOLS
+        allow = (profile.get("tools") or None) if profile else None
+        registry.set_filter(disabled=disabled, allow=allow, max_tools=max_tools)
+        return registry.select_schemas(disabled=disabled, allow=allow,
+                                       max_tools=max_tools)
+
     def _build_messages(self, session: Dict[str, Any], registry: ToolRegistry,
-                        cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-        tools_desc = []
-        for t in registry.list():
-            risk = {"low": "只读", "medium": "写入", "high": "高危"}.get(t["risk"], t["risk"])
-            tools_desc.append(f"- {t['name']}（{risk}）：{t['description']}")
+                        cfg: Dict[str, Any],
+                        schemas: Optional[List[Dict[str, Any]]] = None,
+                        mounted_skills: Optional[List[str]] = None,
+                        profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """组装 messages（system + 历史）。
+
+        **工具清单从 `schemas` 渲染**（架构 §5 A3）：`registry.list()` 返回的是
+        `Tool.to_dict()`（没有 `function` 键），直接拿它渲染会和下发给模型的
+        function schema 不一致——模型会照着提示去调一个 schema 里不存在的工具，
+        registry.call 返回「未知工具」，白烧一轮。
+
+        `schemas` 为空时自己取一次 `select_schemas()`（向后兼容其他调用点），
+        但 agent 主循环里始终传入同一份对象，保证同源。
+        """
+        if schemas is None:
+            schemas = registry.select_schemas()
+        risk_by_name = {str(t["name"]): str(t.get("risk") or "low")
+                        for t in registry.list()}
+        risk_text = {"low": "只读", "medium": "写入", "high": "高危"}
+        tools_desc: List[str] = []
+        for s in schemas:
+            fn = s.get("function") if isinstance(s, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name") or "")
+            if not name:
+                continue
+            risk = risk_text.get(risk_by_name.get(name, "low"), "低风险")
+            tools_desc.append(f"- {name}（{risk}）：{fn.get('description') or ''}")
+
         system = SYSTEM_PROMPT.format(
             workspace=cfg.get("workspace"),
             policy_text=POLICY_TEXT.get(cfg.get("policy"), ""),
             now=time.strftime("%Y-%m-%d %H:%M:%S"),
-            tool_list="\n".join(tools_desc[:80]) or "（暂无工具）")
+            # 不再 [:80] 截断：max_tools 上限 64 < 80，天然收敛（A3 说明 2）
+            tool_list="\n".join(tools_desc) or "（暂无工具）")
+        system += self._skills_hint(cfg, profile, mounted_skills)
+
         msgs: List[Dict[str, Any]] = [{"role": "system", "content": system}]
         history = [m for m in (session.get("messages") or [])
                    if m.get("role") in ("user", "assistant") and m.get("content")]
         for m in history[-MAX_HISTORY_MESSAGES:]:
             msgs.append({"role": m["role"], "content": m["content"]})
         return msgs
+
+    def _skills_hint(self, cfg: Dict[str, Any],
+                     profile: Optional[Dict[str, Any]],
+                     mounted_skills: Optional[List[str]] = None) -> str:
+        """system 尾部的技能段：命中 profile -> 指定技能；否则 -> 可用技能清单。
+
+        只写进 system，**不进 message 正文**（架构 §5 A4：历史保持干净）。
+        """
+        mounted = [str(s) for s in (mounted_skills or []) if str(s).strip()]
+        if profile is not None:
+            merged: List[str] = []
+            for slug in list(profile.get("skills") or []) + mounted:
+                if slug not in merged:
+                    merged.append(slug)
+            merged = merged[:MAX_AUTO_SKILLS]
+            if not merged:
+                return ""
+            return ("\n## 本轮指定技能\n用户明确指定使用技能："
+                    + "、".join(merged)
+                    + "。请优先调用 skill_run 执行它们；"
+                      "技能内部的文件写入仍会逐个请求用户确认。\n")
+        if mounted:
+            return ("\n## 本轮指定技能\n用户明确指定使用技能："
+                    + "、".join(mounted[:MAX_AUTO_SKILLS])
+                    + "。请优先调用 skill_run 执行它们。\n")
+        if not bool(cfg.get("auto_load", True)):
+            return ""
+        try:
+            items = skills_mod.list_skills()[:MAX_SKILL_HINTS]
+        except Exception:
+            return ""
+        if not items:
+            return ""
+        lines = []
+        for s in items:
+            desc = str(s.get("description") or "").strip()[:40]
+            lines.append(f"- {s.get('name') or s.get('slug')}：{desc}")
+        return ("\n## 可用技能\n"
+                "以下技能已安装，用户需求与某个技能吻合时可调用 skill_run 执行：\n"
+                + "\n".join(lines) + "\n")
 
 
 def _loads_jsonish(raw: str) -> Any:

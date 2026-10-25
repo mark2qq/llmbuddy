@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 import zipfile
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +36,13 @@ from core.assistant.store import SKILLS_DIR, audit, ensure_dirs
 
 MAX_ZIP_BYTES = 20 * 1024 * 1024
 _SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+#: 从本地文件夹安装时收取的文本类后缀（脚本永不执行，只落文件）
+TEXT_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml", ".py", ".toml", ".cfg",
+                 ".ini", ".csv", ".html", ".js", ".ts", ".sh", ".ps1", ".bat",
+                 ".cmd", ".env", ".gitignore", ".mod", ".sum")
+#: 单个文本文件的体积上限（本地目录导入时跳过更大的文件）
+MAX_SKILL_MD_BYTES = 200 * 1024
 
 
 class SkillError(RuntimeError):
@@ -90,6 +98,10 @@ def list_skills() -> List[Dict[str, Any]]:
     ensure_dirs()
     out: List[Dict[str, Any]] = []
     for slug in sorted(os.listdir(SKILLS_DIR)):
+        # 架构 §5 A8：安装临时目录 `.installing-<uuid>` 与备份 `.backup-<ts>`
+        # 也可能含 SKILL.md，必须跳过，否则会被当成两个额外技能列出来。
+        if slug.startswith("."):
+            continue
         d = os.path.join(SKILLS_DIR, slug)
         md = os.path.join(d, "SKILL.md")
         if not (os.path.isdir(d) and os.path.isfile(md)):
@@ -266,6 +278,249 @@ def _slugify(name: str) -> str:
 
 
 # ----------------------------------------------------------------------------
+# 在线 / 本地目录安装（1.0.8 增量，架构 §5 A1 / A8）
+#
+# 所有落盘路径收敛到 `_atomic_install()`：
+#     .installing-<uuid> 写全 -> 校验 frontmatter -> [备份旧目录] ->
+#     os.replace 到 <slug> -> prune_backups；任一步失败全量回滚，不留半成品。
+# 临时目录名以 `.` 开头，天然不被 `list_skills()` 与 `_SLUG_RE` 接受。
+# ----------------------------------------------------------------------------
+INSTALLING_PREFIX = ".installing-"
+BACKUP_PREFIX = ".backup-"
+MAX_BACKUPS = 5
+MAX_INSTALL_BYTES = 8 * 1024 * 1024
+
+
+def _safe_rel(rel: str) -> str:
+    """附属文件相对路径安全检查：拒绝 ..、盘符、绝对路径。"""
+    text = str(rel or "").replace("\\", "/").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.lstrip("/")
+    if not text:
+        raise SkillError("附属文件名不能为空")
+    if ".." in text.split("/"):
+        raise SkillError(f"非法文件路径（含 ..）：{rel}")
+    if len(text) >= 2 and text[1] == ":":
+        raise SkillError(f"非法文件路径（含盘符）：{rel}")
+    return text
+
+
+def _new_temp_dir() -> str:
+    """创建 `.installing-<uuid>` 临时目录（不校验 slug，见架构 §5 A8 末尾说明）。"""
+    ensure_dirs()
+    path = os.path.join(SKILLS_DIR, INSTALLING_PREFIX + uuid.uuid4().hex)
+    os.makedirs(path, exist_ok=False)
+    return path
+
+
+def _write_files(root: str, files: Dict[str, str]) -> int:
+    """把 `{rel: text}` 写进 root（自动建父目录），返回写入字节数。
+
+    只落文件，**永不执行任何脚本**（安全红线）。
+    """
+    total = 0
+    for rel, text in (files or {}).items():
+        safe = _safe_rel(rel)
+        target = os.path.join(root, safe)
+        os.makedirs(os.path.dirname(target) or root, exist_ok=True)
+        body = "" if text is None else str(text)
+        data = body.encode("utf-8", "replace")
+        total += len(data)
+        if total > MAX_INSTALL_BYTES:
+            raise SkillError(f"技能包过大（>{MAX_INSTALL_BYTES // 1024 // 1024}MB）")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(body)
+    return total
+
+
+def _rollback(tmp_dir: str, backup_dir: str, slug: str) -> None:
+    """回滚：删临时目录；若有备份则还原到 `<slug>`（失败静默）。"""
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    target = os.path.join(SKILLS_DIR, slug)
+    if backup_dir and os.path.isdir(backup_dir):
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            os.replace(backup_dir, target)
+        except OSError:
+            pass
+
+
+def prune_backups(keep: int = MAX_BACKUPS) -> int:
+    """只保留最近 `keep` 份 `.backup-<ts>`，返回删除份数。"""
+    ensure_dirs()
+    try:
+        names = [n for n in os.listdir(SKILLS_DIR) if n.startswith(BACKUP_PREFIX)]
+    except OSError:
+        return 0
+    if len(names) <= max(0, int(keep)):
+        return 0
+    names.sort(key=lambda n: os.path.getmtime(os.path.join(SKILLS_DIR, n))
+               if os.path.exists(os.path.join(SKILLS_DIR, n)) else 0)
+    removed = 0
+    for name in names[: len(names) - max(0, int(keep))]:
+        shutil.rmtree(os.path.join(SKILLS_DIR, name), ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def _atomic_install(slug: str, files: Dict[str, str],
+                    overwrite: bool = False) -> Dict[str, Any]:
+    """原子安装一个技能包。
+
+    Args:
+        slug: 目标目录名，必须过 `_SLUG_RE`（首字符字母/数字，天然拒绝 `.` 开头）。
+        files: `{相对路径: 文本}`，必须含 `SKILL.md` 且 frontmatter 有 name。
+        overwrite: 目标已存在时是否覆盖（旧目录先搬到 `.backup-<ts>`）。
+
+    Returns:
+        `{slug, files, bytes, path, backup, overwritten}`
+
+    Raises:
+        SkillError: slug 非法 / 缺 SKILL.md / frontmatter 缺 name / 已存在且不覆盖。
+    """
+    if not _SLUG_RE.match(slug or ""):
+        raise SkillError("技能标识只能包含字母、数字、点、下划线、连字符")
+    payload = dict(files or {})
+    md_key = next((k for k in payload
+                   if str(k).replace("\\", "/").lower() == "skill.md"), None)
+    if md_key is None:
+        raise SkillError("技能包缺少 SKILL.md")
+    parsed = parse_skill_md(str(payload.get(md_key) or ""))
+    if not str(parsed["meta"].get("name") or "").strip():
+        raise SkillError("SKILL.md 的 frontmatter 缺少 name，不是有效技能包")
+
+    ensure_dirs()
+    target = os.path.join(SKILLS_DIR, slug)
+    if os.path.isdir(target) and not overwrite:
+        raise SkillError(f"技能已存在：{slug}")
+
+    tmp_dir = _new_temp_dir()
+    backup_dir = ""
+    try:
+        written = _write_files(tmp_dir, payload)
+        if os.path.isdir(target):
+            backup_dir = os.path.join(SKILLS_DIR,
+                                      BACKUP_PREFIX + time.strftime("%Y%m%d%H%M%S")
+                                      + "-" + uuid.uuid4().hex[:6])
+            os.replace(target, backup_dir)
+        os.replace(tmp_dir, target)
+    except Exception as e:                      # noqa: BLE001
+        _rollback(tmp_dir, backup_dir, slug)
+        if isinstance(e, SkillError):
+            raise
+        raise SkillError(f"安装失败（已回滚）：{type(e).__name__}: {e}") from e
+
+    prune_backups()
+    audit("skill_installed", slug=slug, files=len(payload), bytes=written,
+          overwrite=bool(overwrite), backup=os.path.basename(backup_dir))
+    return {"slug": slug, "files": sorted(payload.keys()), "bytes": written,
+            "path": target, "backup": os.path.basename(backup_dir),
+            "overwritten": bool(backup_dir), "name": parsed["meta"].get("name")}
+
+
+def install_from_github(bundle: Dict[str, Any], slug: str = "",
+                        overwrite: bool = False,
+                        source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """安装 `catalog.fetch_skill_bundle()` 的内存包（A1：catalog 只交字节）。
+
+    Args:
+        bundle: `{slug, files:{rel:text}, repo, ref, dir, commit, has_scripts}`
+        slug: 覆盖目标 slug（为空则用 bundle 里的 slug）
+        overwrite: 是否覆盖已存在技能
+        source: 写进 `config.skill_sources` 的来源信息（可选）
+    """
+    bundle = bundle or {}
+    files = bundle.get("files") if isinstance(bundle.get("files"), dict) else {}
+    target_slug = _slugify(slug or bundle.get("slug") or bundle.get("name") or "skill")
+    result = _atomic_install(target_slug, files, overwrite=overwrite)
+    result.update({
+        "commit": str(bundle.get("commit") or ""),
+        "ref": str(bundle.get("ref") or ""),
+        "repo": str(bundle.get("repo") or ""),
+        "dir": str(bundle.get("dir") or ""),
+        "has_scripts": bool(bundle.get("has_scripts")),
+        "skipped": int(bundle.get("skipped") or 0),
+    })
+    if source:
+        try:
+            from core.assistant.store import load_config, save_config
+            cur = dict(load_config().get("skill_sources") or {})
+            rec = {"kind": "github", "installed_at": time.time()}
+            rec.update({k: v for k, v in source.items() if v is not None})
+            cur[target_slug] = rec
+            save_config({"skill_sources": cur})
+        except Exception:
+            pass
+    return result
+
+
+def install_from_dir(src: str, overwrite: bool = False,
+                     slug: str = "") -> Dict[str, Any]:
+    """从本地文件夹安装（只读文本类文件；不跟随符号链接）。"""
+    root = os.path.abspath(str(src or ""))
+    if not os.path.isdir(root):
+        raise SkillError(f"不是目录：{src}")
+    md_path = os.path.join(root, "SKILL.md")
+    if not os.path.isfile(md_path):
+        raise SkillError("该目录里没有 SKILL.md，不是技能包")
+    with open(md_path, "r", encoding="utf-8", errors="replace") as f:
+        md_text = f.read()
+    parsed = parse_skill_md(md_text)
+    if not str(parsed["meta"].get("name") or "").strip():
+        raise SkillError("SKILL.md 的 frontmatter 缺少 name，不是有效技能包")
+    target_slug = _slugify(slug or parsed["meta"].get("name")
+                           or os.path.basename(root))
+    files: Dict[str, str] = {"SKILL.md": md_text}
+    total = len(md_text.encode("utf-8", "replace"))
+    has_scripts = False
+    for dirpath, _dirs, filenames in os.walk(root):
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            if rel.lower() == "skill.md":
+                continue
+            low = rel.lower()
+            if low.startswith("scripts/") or low.endswith((".py", ".sh", ".ps1",
+                                                          ".bat", ".cmd", ".js")):
+                has_scripts = True
+            if not low.endswith(TEXT_SUFFIXES):
+                continue
+            try:
+                if os.path.getsize(full) > MAX_SKILL_MD_BYTES:
+                    continue
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if total + len(text.encode("utf-8", "replace")) > MAX_INSTALL_BYTES:
+                continue
+            total += len(text.encode("utf-8", "replace"))
+            files[rel] = text
+    result = _atomic_install(target_slug, files, overwrite=overwrite)
+    result.update({"commit": "", "ref": "", "repo": root, "dir": "",
+                   "has_scripts": has_scripts, "skipped": 0})
+    return result
+
+
+def install_from_url(bundle: Dict[str, Any], slug: str = "",
+                     overwrite: bool = False) -> Dict[str, Any]:
+    """安装 `catalog.fetch_bundle_from_raw()` 的结果（粘贴 URL 安装）。"""
+    bundle = bundle or {}
+    files = bundle.get("files") if isinstance(bundle.get("files"), dict) else {}
+    target_slug = _slugify(slug or bundle.get("slug") or bundle.get("name") or "skill")
+    result = _atomic_install(target_slug, files, overwrite=overwrite)
+    result.update({"commit": str(bundle.get("commit") or ""),
+                   "ref": str(bundle.get("ref") or ""),
+                   "repo": str(bundle.get("repo") or ""),
+                   "dir": str(bundle.get("dir") or ""),
+                   "has_scripts": bool(bundle.get("has_scripts")),
+                   "skipped": 0})
+    return result
+
+
+# ----------------------------------------------------------------------------
 # 内置示例技能（首次运行时落地，用户可改可删）
 # ----------------------------------------------------------------------------
 BUILTIN_SKILLS: Dict[str, str] = {
@@ -350,3 +605,5 @@ def ensure_builtin_skills() -> None:
                 f.write(content)
         except OSError:
             continue
+    # 安装覆盖会累积 `.backup-<ts>`；启动时收敛到最近 5 份，避免无限增长
+    prune_backups()

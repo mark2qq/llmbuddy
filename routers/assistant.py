@@ -50,7 +50,11 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from core.assistant import catalog as catalog_mod
+from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
+from core.assistant import store as store_mod
+from core.assistant import tools as tools_mod
 from core.assistant.agent import get_assistant
 from core.assistant.approval import get_approval_manager
 from core.assistant.mcp import get_mcp_manager
@@ -255,13 +259,18 @@ async def chat(body: Dict[str, Any]):
 
     provider_id = str(body.get("provider") or "")
     model = str(body.get("model") or "")
+    # 挂载技能（1.0.8，架构 §5 A4）：客户端传列表，正文保持原文；
+    # 老客户端不带这个字段 -> None，行为与今天完全一致。
+    mounted = body.get("mounted_skills")
+    mounted_skills = ([str(s) for s in mounted if str(s).strip()]
+                      if isinstance(mounted, list) else None)
 
     if not stream:
         from fastapi.concurrency import run_in_threadpool
         events = []
         result = await run_in_threadpool(
             ass.start_turn, session_id, first_text, provider_id, model,
-            events.append)
+            events.append, mounted_skills)
         return ok({"result": result, "events": events,
                    "session_id": session_id})
 
@@ -289,7 +298,7 @@ async def chat(body: Dict[str, Any]):
                 def run(t: str = text_now) -> None:
                     try:
                         ass.start_turn(session_id, t, provider_id, model,
-                                       emit)
+                                       emit, mounted_skills)
                     except Exception as e:  # noqa: BLE001
                         emit({"type": "error",
                               "message": f"{type(e).__name__}: {e}"})
@@ -573,7 +582,7 @@ async def get_settings():
 async def put_settings(body: Dict[str, Any]):
     allowed = {"policy", "active_provider", "providers", "workspace",
                "max_steps", "approval_timeout", "temperature", "max_tokens",
-               "skill_timeout"}
+               "skill_timeout", "auto_load"}
     patch = {k: v for k, v in (body or {}).items() if k in allowed}
     if "providers" in patch:
         # 按 id 合并：客户端拿到的 providers 不含 api_key（state 不下发密钥），
@@ -607,3 +616,304 @@ async def put_settings(body: Dict[str, Any]):
 @router.get("/audit")
 async def get_audit(limit: int = 200):
     return ok(read_audit(max(1, min(int(limit), 1000))))
+
+
+# ----------------------------------------------------------------------------
+# 在线目录（1.0.8 增量，架构 §8 REST 接口表）
+#
+# 返回约定与既有接口一致：业务错误一律 HTTP 200 + fail(code, message, data)，
+# 错误码 2020-2026（2020 不可达 / 2021 上游非 200 / 2022 结构非法 /
+# 2023 已存在 / 2024 必填 env 缺失 / 2025 连接失败 / 2026 URL 不受支持）。
+# ----------------------------------------------------------------------------
+def _catalog_fail(e: Any) -> Dict[str, Any]:
+    """CatalogError -> fail() 的统一转换（保留 data 供对话框逐项标红）。"""
+    code = int(getattr(e, "code", catalog_mod.ERR_UNREACHABLE) or
+               catalog_mod.ERR_UNREACHABLE)
+    return fail(code, str(getattr(e, "message", e)), getattr(e, "data", None))
+
+
+def _catalog_cfg() -> Dict[str, Any]:
+    return load_config()
+
+
+@router.get("/catalog/mcp")
+async def catalog_mcp(q: str = "", cursor: str = "", force: bool = False):
+    """在线 MCP 目录（先返缓存；force=1 才同步联网，超时 5s）。"""
+    from fastapi.concurrency import run_in_threadpool
+    try:
+        data = await run_in_threadpool(catalog_mod.list_mcp, _catalog_cfg(),
+                                       q, cursor, force)
+    except catalog_mod.CatalogError as e:
+        return _catalog_fail(e)
+    return ok(data)
+
+
+@router.get("/catalog/skills")
+async def catalog_skills(q: str = "", force: bool = False):
+    """在线技能仓库（GitHub `topic:claude-skills`，star 降序）。"""
+    from fastapi.concurrency import run_in_threadpool
+    try:
+        data = await run_in_threadpool(catalog_mod.list_repos, _catalog_cfg(),
+                                       q, force)
+    except catalog_mod.CatalogError as e:
+        return _catalog_fail(e)
+    return ok(data)
+
+
+@router.get("/catalog/skills/{owner}/{repo}")
+async def catalog_repo_skills(owner: str, repo: str, ref: str = ""):
+    """枚举单仓库里的技能目录（`**/SKILL.md`）。"""
+    from fastapi.concurrency import run_in_threadpool
+    try:
+        data = await run_in_threadpool(catalog_mod.list_repo_skills,
+                                       _catalog_cfg(), owner, repo, ref)
+    except catalog_mod.CatalogError as e:
+        return _catalog_fail(e)
+    return ok(data)
+
+
+@router.post("/catalog/skills/install")
+async def catalog_install_skill(body: Dict[str, Any]):
+    """在线安装技能：GitHub 拉包（内存）-> 原子落盘 -> 记 skill_sources。"""
+    from fastapi.concurrency import run_in_threadpool
+    body = body or {}
+    repo = str(body.get("repo") or "").strip()
+    if "/" not in repo:
+        return fail(2022, "repo 必须是 owner/repo 形式")
+    owner, name = repo.split("/", 1)
+    ref = str(body.get("ref") or "").strip()
+    dirpath = str(body.get("dir") or "").strip()
+    slug = str(body.get("slug") or "").strip()
+    overwrite = bool(body.get("overwrite"))
+    cfg = _catalog_cfg()
+    try:
+        bundle = await run_in_threadpool(catalog_mod.fetch_skill_bundle,
+                                         cfg, owner, name, ref, dirpath)
+        result = await run_in_threadpool(
+            skills_mod.install_from_github, bundle, slug, overwrite,
+            {"repo": repo, "ref": bundle.get("ref") or ref,
+             "dir": dirpath, "commit": bundle.get("commit") or "",
+             "has_scripts": bool(bundle.get("has_scripts"))})
+    except catalog_mod.CatalogError as e:
+        audit("catalog_install_failed", kind="skill", target=repo, error=str(e))
+        return _catalog_fail(e)
+    except skills_mod.SkillError as e:
+        code = (2023 if "已存在" in str(e) else 2022)
+        audit("catalog_install_failed", kind="skill", target=repo, error=str(e))
+        return fail(code, str(e))
+    audit("skill_installed_online", slug=result.get("slug"), repo=repo,
+          ref=result.get("ref") or ref, dir=dirpath,
+          commit=result.get("commit") or "", bytes=result.get("bytes") or 0,
+          has_scripts=bool(result.get("has_scripts")), overwrite=overwrite)
+    return ok(result)
+
+
+@router.post("/catalog/mcp/install")
+async def catalog_install_mcp(body: Dict[str, Any]):
+    """在线安装 MCP：Registry 条目 -> mcp_servers 配置 -> 可选立即连接。"""
+    from fastapi.concurrency import run_in_threadpool
+    body = body or {}
+    registry_name = str(body.get("registry_name") or "").strip()
+    if not registry_name:
+        return fail(2022, "registry_name 不能为空")
+    env = body.get("env") if isinstance(body.get("env"), dict) else {}
+    server_id = str(body.get("id") or "").strip()
+    name = str(body.get("name") or "").strip()
+    risk = str(body.get("risk") or "high")
+    if risk not in ("low", "medium", "high"):
+        risk = "high"
+    do_connect = bool(body.get("connect", True))
+    item = body.get("item") if isinstance(body.get("item"), dict) else None
+    mgr = get_mcp_manager()
+    try:
+        result = await run_in_threadpool(
+            mgr.install_from_registry, registry_name, item, env, server_id,
+            name, risk, do_connect, get_assistant().registry())
+    except catalog_mod.CatalogError as e:
+        if e.code == catalog_mod.ERR_CONNECT_FAILED:
+            # 2025：配置已保留，客户端展示「已保存配置但连接失败」+ 卡片 ×
+            audit("mcp_installed_online", server=(e.data or {}).get("server", {})
+                  .get("id"), registry_name=registry_name, connected=False)
+            return fail(e.code, e.message, e.data)
+        audit("catalog_install_failed", kind="mcp", target=registry_name,
+              error=str(e))
+        return _catalog_fail(e)
+    except Exception as e:                      # noqa: BLE001
+        audit("catalog_install_failed", kind="mcp", target=registry_name,
+              error=str(e))
+        return fail(catalog_mod.ERR_CONNECT_FAILED, str(e))
+    return ok(result)
+
+
+@router.post("/catalog/refresh")
+async def catalog_refresh():
+    """并行刷新三源（总 12s 上限）；**总是 ok()**，错误在 data.errors 里。"""
+    from fastapi.concurrency import run_in_threadpool
+    data = await run_in_threadpool(catalog_mod.refresh_all, _catalog_cfg(), True)
+    audit("catalog_refreshed", ok=bool(data.get("ok")),
+          counts=data.get("counts") or {}, errors=data.get("errors") or [])
+    return ok(data)
+
+
+@router.post("/catalog/skills/from_dir")
+async def catalog_skill_from_dir(body: Dict[str, Any]):
+    """从本地文件夹导入技能（客户端经 `_pick_file(directory=True)` 选目录）。"""
+    from fastapi.concurrency import run_in_threadpool
+    body = body or {}
+    path = str(body.get("path") or "").strip()
+    if not path:
+        return fail(2022, "path 不能为空")
+    overwrite = bool(body.get("overwrite"))
+    try:
+        result = await run_in_threadpool(skills_mod.install_from_dir, path,
+                                         overwrite, str(body.get("slug") or ""))
+    except skills_mod.SkillError as e:
+        code = (2023 if "已存在" in str(e) else 2022)
+        return fail(code, str(e))
+    audit("skill_installed_local", slug=result.get("slug"), path=path,
+          overwrite=overwrite)
+    return ok(result)
+
+
+@router.post("/catalog/skills/from_url")
+async def catalog_skill_from_url(body: Dict[str, Any]):
+    """粘贴 URL 安装技能（只支持 GitHub / Gitee 的 SKILL.md 直链）。"""
+    from fastapi.concurrency import run_in_threadpool
+    body = body or {}
+    url = str(body.get("url") or "").strip()
+    if not url:
+        return fail(catalog_mod.ERR_BAD_URL, "url 不能为空")
+    overwrite = bool(body.get("overwrite"))
+    cfg = _catalog_cfg()
+    try:
+        bundle = await run_in_threadpool(catalog_mod.fetch_bundle_from_raw,
+                                         cfg, url)
+        result = await run_in_threadpool(skills_mod.install_from_url, bundle,
+                                         str(body.get("slug") or ""), overwrite)
+    except catalog_mod.CatalogError as e:
+        return _catalog_fail(e)
+    except skills_mod.SkillError as e:
+        code = (2023 if "已存在" in str(e) else 2022)
+        return fail(code, str(e))
+    audit("skill_installed_online", slug=result.get("slug"), url=url,
+          overwrite=overwrite)
+    return ok(result)
+
+
+# ----------------------------------------------------------------------------
+# 工具偏好 / 自动加载 profile（1.0.8 增量）
+# ----------------------------------------------------------------------------
+def _tool_prefs_payload(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET/PUT /tools/prefs 的响应体：偏好 + 计数 + 被上限裁掉的工具名。"""
+    cfg = cfg or load_config()
+    prefs = cfg.get("tool_prefs") if isinstance(cfg.get("tool_prefs"), dict) else {}
+    disabled = [str(x) for x in (prefs.get("disabled") or [])]
+    try:
+        max_tools = int(prefs.get("max_tools") or tools_mod.DEFAULT_MAX_TOOLS)
+    except (TypeError, ValueError):
+        max_tools = tools_mod.DEFAULT_MAX_TOOLS
+    registry = get_assistant().registry()
+    total = len(registry.names())
+    active = [t.name for t in registry.active(disabled=set(disabled), allow=None)]
+    over = active[max_tools:] if max_tools > 0 else []
+    return {"disabled": disabled, "max_tools": max_tools, "total": total,
+            "active": len(active[:max_tools]) if max_tools > 0 else len(active),
+            "over": over or None}
+
+
+@router.get("/tools/prefs")
+async def get_tool_prefs():
+    return ok(_tool_prefs_payload())
+
+
+@router.put("/tools/prefs")
+async def put_tool_prefs(body: Dict[str, Any]):
+    """保存工具偏好。`max_tools` 允许 8~64；非法参数 2002。"""
+    body = body or {}
+    patch: Dict[str, Any] = {}
+    prefs_cur = load_config().get("tool_prefs")
+    prefs = dict(prefs_cur) if isinstance(prefs_cur, dict) else {}
+    if "disabled" in body:
+        raw = body.get("disabled")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            return fail(2002, "disabled 必须是字符串数组")
+        prefs["disabled"] = [str(x) for x in raw if str(x).strip()]
+    if "max_tools" in body:
+        try:
+            val = int(body.get("max_tools"))
+        except (TypeError, ValueError):
+            return fail(2002, "max_tools 必须是整数（8~64）")
+        if not (store_mod.MIN_MAX_TOOLS <= val <= store_mod.MAX_MAX_TOOLS):
+            return fail(2002, f"max_tools 只允许 {store_mod.MIN_MAX_TOOLS}~"
+                              f"{store_mod.MAX_MAX_TOOLS}")
+        prefs["max_tools"] = val
+    prefs.setdefault("disabled", [])
+    prefs.setdefault("max_tools", tools_mod.DEFAULT_MAX_TOOLS)
+    patch["tool_prefs"] = prefs
+    cfg = save_config(patch)
+    audit("tools_prefs_updated", disabled=prefs.get("disabled"),
+          max_tools=prefs.get("max_tools"))
+    registry = get_assistant().registry()
+    registry.set_filter(disabled=set(prefs.get("disabled") or []), allow=None,
+                        max_tools=int(prefs.get("max_tools")
+                                      or tools_mod.DEFAULT_MAX_TOOLS))
+    return ok(_tool_prefs_payload(cfg))
+
+
+def _profiles_payload(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = cfg or load_config()
+    profiles = cfg.get("profiles")
+    if not isinstance(profiles, list) or not profiles:
+        profiles = profiles_mod.BUILTIN_PROFILES
+    return {"auto_load": bool(cfg.get("auto_load", True)),
+            "profiles": profiles}
+
+
+@router.get("/profiles")
+async def get_profiles():
+    """自动加载 profile 列表 + 总开关（P0 只做查看/启停，不做自定义编辑）。"""
+    return ok(_profiles_payload())
+
+
+@router.put("/profiles")
+async def put_profiles(body: Dict[str, Any]):
+    """改 `auto_load` 与 profile 启停（只接受已知 id，避免脏数据写进 config）。"""
+    body = body or {}
+    patch: Dict[str, Any] = {}
+    if "auto_load" in body:
+        patch["auto_load"] = bool(body.get("auto_load"))
+    if "profiles" in body:
+        incoming = body.get("profiles")
+        if not isinstance(incoming, list):
+            return fail(2002, "profiles 必须是数组")
+        cur_list = _profiles_payload().get("profiles") or []
+        cur = {str(p.get("id") or ""): p for p in cur_list if isinstance(p, dict)}
+        merged: List[Dict[str, Any]] = []
+        for row in incoming:
+            if not isinstance(row, dict) or not row.get("id"):
+                return fail(2002, "每个 profile 必须有 id")
+            pid = str(row.get("id"))
+            if pid not in cur:
+                return fail(2002, f"未知 profile：{pid}")
+            base = dict(cur[pid])
+            if "enabled" in row:
+                base["enabled"] = bool(row.get("enabled"))
+            if "triggers" in row:
+                raw = row.get("triggers")
+                if not isinstance(raw, list):
+                    return fail(2002, "triggers 必须是字符串数组")
+                base["triggers"] = [str(t) for t in raw if str(t).strip()]
+            if "priority" in row:
+                try:
+                    base["priority"] = int(row.get("priority"))
+                except (TypeError, ValueError):
+                    return fail(2002, "priority 必须是整数")
+            merged.append(base)
+        patch["profiles"] = merged
+    cfg = save_config(patch)
+    if patch:
+        audit("auto_load_updated", auto_load=patch.get("auto_load"),
+              profiles=[p.get("id") for p in (patch.get("profiles") or [])])
+    return ok(_profiles_payload(cfg))

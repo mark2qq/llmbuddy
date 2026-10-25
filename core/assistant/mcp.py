@@ -311,6 +311,112 @@ class MCPManager:
             self._status.pop(server_id, None)
         return True
 
+    def install_from_registry(self, name: str, item: Optional[Dict[str, Any]] = None,
+                              env: Optional[Dict[str, Any]] = None,
+                              server_id: str = "", display_name: str = "",
+                              risk: str = "high",
+                              connect: bool = True, registry=None) -> Dict[str, Any]:
+        """从在线 MCP Registry 条目安装一台服务器（1.0.8 增量）。
+
+        两步刻意分开（架构 §8 时序图）：
+            1. `add_server(cfg)` 先落配置（原子写）——即使 connect 失败，
+               用户也能就地修 env/命令再连，不用重装；
+            2. connect 失败 -> `CatalogError(2025)`，`data.server` 保留配置。
+
+        Args:
+            name: Registry 条目名（`registry_name`），用于在线查找条目。
+            item: 已归一化的条目（`catalog.normalize_mcp_server()` 的结果）；
+                为空时按 `name` 现拉一次目录（取缓存优先）。
+            env: 用户填的环境变量（必填项由 catalog 校验）。
+            server_id: 显式 id（为空则由 catalog 归一化 + 去冲突）。
+            display_name: 展示名（为空取条目 title）。
+            risk: 风险等级，默认 high（第三方在线来源）。
+            connect: 安装后是否立即连接。
+            registry: ToolRegistry（连接成功后注册工具用）。
+
+        Raises:
+            CatalogError(2020/2021): 目录不可达且无缓存
+            CatalogError(2022): 条目无法映射成配置
+            CatalogError(2024): 必填环境变量缺失
+            CatalogError(2025): 配置已保存但连接失败
+        """
+        from core.assistant import catalog as catalog_mod
+
+        if item is None:
+            item = self._find_registry_item(name)
+        config = catalog_mod.build_mcp_config(
+            item, server_id=server_id, name=display_name, env=env, risk=risk,
+            existing_ids=[str(s.get("id") or "") for s in self.servers()])
+        cfg = self.add_server(config)
+        audit("mcp_installed_online", server=cfg.get("id"),
+              registry_name=cfg.get("registry_name") or name,
+              version=cfg.get("version") or "", transport=cfg.get("transport"))
+        result: Dict[str, Any] = {"server": cfg, "connected": False, "error": ""}
+        if not connect:
+            return result
+        try:
+            self.connect(cfg["id"], registry)
+            result["connected"] = True
+        except Exception as e:                      # noqa: BLE001
+            err = str(e)
+            result["error"] = err[:400]
+            raise catalog_mod.CatalogError(
+                catalog_mod.ERR_CONNECT_FAILED,
+                f"已保存配置但连接失败：{err}",
+                result) from e
+        return result
+
+    @staticmethod
+    def _find_registry_item(name: str) -> Dict[str, Any]:
+        """按 registry_name 在目录缓存/在线列表里找条目（找不到抛 2020/2022）。"""
+        from core.assistant import catalog as catalog_mod
+        target = str(name or "").strip()
+        if not target:
+            raise catalog_mod.CatalogError(catalog_mod.ERR_BAD_BUNDLE,
+                                           "registry_name 不能为空")
+        cfg = load_config()
+        found: Optional[Dict[str, Any]] = None
+        for force in (False, True):
+            try:
+                listing = catalog_mod.list_mcp(cfg, force=force)
+            except catalog_mod.CatalogError:
+                if force:
+                    raise
+                continue
+            for row in listing.get("items") or []:
+                if str(row.get("registry_name") or "") == target:
+                    found = row
+                    break
+            if found is not None:
+                break
+            if listing.get("items"):
+                break                     # 缓存里没有就看一次在线，别反复拉
+        if found is None:
+            raw = self._registry_raw_lookup(cfg, target)
+            if raw is None:
+                raise catalog_mod.CatalogError(
+                    catalog_mod.ERR_BAD_BUNDLE,
+                    f"在线目录里找不到该 MCP：{target}")
+            found = catalog_mod.normalize_mcp_server(raw)
+        return found
+
+    @staticmethod
+    def _registry_raw_lookup(cfg: Dict[str, Any],
+                             target: str) -> Optional[Dict[str, Any]]:
+        """按名字直接查 Registry 详情（服务端 search 可能不精确匹配）。"""
+        from core.assistant import catalog as catalog_mod
+        try:
+            payload, _headers = catalog_mod._get_json(
+                cfg, catalog_mod.REGISTRY_BASE,
+                params={"search": target, "limit": "50"})
+        except catalog_mod.CatalogError:
+            return None
+        norm = catalog_mod._normalize_registry_list(payload)
+        for row in norm["items"]:
+            if str(row.get("registry_name") or "") == target:
+                return row.get("raw") or row
+        return None
+
     # ---------------- 连接 ----------------
     def connect(self, server_id: str, registry=None) -> Dict[str, Any]:
         cfg = next((s for s in self.servers() if s.get("id") == server_id), None)

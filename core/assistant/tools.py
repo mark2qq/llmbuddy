@@ -23,6 +23,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 MAX_OUTPUT = 20000          # 单个工具返回给模型的字符上限
 TRASH_DIRNAME = ".trash"
+#: 工具下发上限默认值（与 store.DEFAULT_MAX_TOOLS 保持一致，PRD §4.1 P0-5）
+DEFAULT_MAX_TOOLS = 24
+MAX_MAX_TOOLS = 64
 
 
 @dataclass
@@ -86,6 +89,9 @@ class ToolRegistry:
         self.workspace = os.path.abspath(workspace or os.getcwd())
         self._tools: Dict[str, Tool] = {}
         self._lock = __import__("threading").RLock()
+        # 下发过滤（架构 §5 A2：只存值、不做 IO；registry 仍是纯内存对象）
+        self._filter: Dict[str, Any] = {"disabled": set(), "allow": None,
+                                        "max_tools": DEFAULT_MAX_TOOLS}
         self._register_builtin()
 
     # ------------------------------------------------------------------ #
@@ -110,19 +116,136 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
-    def list(self) -> List[Dict[str, Any]]:
+    # ------------------------------------------------------------------ #
+    # 下发过滤（1.0.8 增量：工具开关 + 上限裁剪 + 同源出口）
+    # ------------------------------------------------------------------ #
+    def set_filter(self, disabled: Optional[Any] = None,
+                   allow: Optional[Any] = None,
+                   max_tools: Optional[int] = None) -> None:
+        """设置下发过滤条件（只存值，不读盘、不重算缓存）。
+
+        Args:
+            disabled: 被禁用的工具名集合（None 表示不改）。
+            allow: 额外白名单（None = 不额外限制；空 list 会被当成
+                「一个都不许」，这是 PRD 语义，不做特殊处理）。
+            max_tools: 下发上限；`<=0` 视为「不裁剪」（供内部调用方要全量）。
+        """
         with self._lock:
-            return [t.to_dict() for t in sorted(self._tools.values(),
-                                                key=lambda x: (x.source, x.name))]
+            if disabled is not None:
+                self._filter["disabled"] = {str(x) for x in disabled}
+            if allow is not None:
+                self._filter["allow"] = ([str(x) for x in allow]
+                                         if not isinstance(allow, str) else [allow])
+            if max_tools is not None:
+                try:
+                    val = int(max_tools)
+                except (TypeError, ValueError):
+                    val = DEFAULT_MAX_TOOLS
+                self._filter["max_tools"] = val if val > 0 else None
+
+    def filter_state(self) -> Dict[str, Any]:
+        """当前过滤条件的快照（UI / 测试用）。"""
+        with self._lock:
+            return {"disabled": sorted(self._filter.get("disabled") or set()),
+                    "allow": (None if self._filter.get("allow") is None
+                              else list(self._filter.get("allow") or [])),
+                    "max_tools": self._filter.get("max_tools")}
+
+    @staticmethod
+    def _priority_key(tool: Tool) -> tuple:
+        """裁剪优先级（架构 §6.2 / PRD §4.1 P0-5）。
+
+        顺序：内置 low -> web_fetch -> skill_* -> 内置 medium 写入
+              -> 内置 high -> MCP 工具（按 source 顺序，server 内按 name）。
+        用元组排序而不是硬编码名单：新增内置工具按 risk 自动落位，
+        漏配也只会退到「高危」档（安全方向）。
+        """
+        source = str(tool.source or "builtin")
+        name = tool.name
+        risk = (tool.risk or "low").lower()
+        is_mcp = source.startswith("mcp:")
+        if is_mcp:
+            group = 6
+        elif source == "skill" or name.startswith("skill_"):
+            group = 3
+        elif name == "web_fetch":
+            group = 2
+        elif risk == "low":
+            group = 1
+        elif risk == "high":
+            group = 5
+        else:                      # medium（写入类）
+            group = 4
+        return (group, source, name)
+
+    def active(self, disabled: Optional[Any] = None,
+               allow: Optional[Any] = None) -> List[Tool]:
+        """未被禁用且（allow 为空 或 在 allow 内）的工具，按 §6.2 优先级排序。
+
+        注意 `allow` 的「空」语义：`None` = 不限制；`[]` = 一个都不给。
+        """
+        with self._lock:
+            disabled_set = ({str(x) for x in disabled} if disabled is not None
+                            else set(self._filter.get("disabled") or set()))
+            allow_list = (allow if allow is not None
+                          else self._filter.get("allow"))
+            allow_set = None if allow_list is None else {str(x) for x in allow_list}
+            tools = list(self._tools.values())
+        out = [t for t in tools
+               if t.name not in disabled_set
+               and (allow_set is None or t.name in allow_set)]
+        out.sort(key=self._priority_key)
+        return out
+
+    def select_schemas(self, disabled: Optional[Any] = None,
+                       allow: Optional[Any] = None,
+                       max_tools: Optional[int] = None) -> List[Dict[str, Any]]:
+        """**下发的唯一出口**（架构 §5 A3）：过滤 + 排序 + 裁到 max_tools -> schema。
+
+        参数全 None 时用 `set_filter()` 存的值；显式传入时以传入值为准
+        （profile 收窄白名单用）。`max_tools <= 0` 表示不裁剪。
+        """
+        if max_tools is None:
+            max_tools = self._filter.get("max_tools")
+        tools = self.active(disabled=disabled, allow=allow)
+        try:
+            limit = int(max_tools)
+        except (TypeError, ValueError):
+            limit = DEFAULT_MAX_TOOLS
+        if limit > 0:
+            tools = tools[:limit]
+        return [t.openai_schema() for t in tools]
+
+    def list(self) -> List[Dict[str, Any]]:
+        """工具清单（含 `enabled` 字段：是否在当前过滤条件下会下发）。
+
+        `enabled` 的判定只看 disabled / allow，**不看 max_tools 裁剪**——
+        被上限裁掉的工具由前端 tooltip「超出上限未下发」表达，语义分开，
+        避免用户关掉开关后仍看不到它。
+        """
+        with self._lock:
+            disabled_set = set(self._filter.get("disabled") or set())
+            allow_list = self._filter.get("allow")
+        allow_set = None if allow_list is None else {str(x) for x in allow_list}
+        with self._lock:
+            tools = sorted(self._tools.values(), key=lambda x: (x.source, x.name))
+        out: List[Dict[str, Any]] = []
+        for t in tools:
+            row = t.to_dict()
+            row["enabled"] = (t.name not in disabled_set
+                              and (allow_set is None or t.name in allow_set))
+            out.append(row)
+        return out
 
     def names(self) -> List[str]:
         with self._lock:
             return sorted(self._tools.keys())
 
     def openai_schemas(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            return [t.openai_schema() for t in sorted(self._tools.values(),
-                                                      key=lambda x: x.name)]
+        """兼容旧签名：内部走 `select_schemas()`（orchestrator 也调这里，
+        所以技能内下发同样遵守禁用与上限——架构 §3.2 的期望行为）。
+        """
+        return self.select_schemas()
 
     def risk_of(self, name: str, args: Dict[str, Any]) -> str:
         tool = self.get(name)
