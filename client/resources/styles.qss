@@ -717,6 +717,60 @@ QTabBar::tab:hover { color: #d6dbe8; }
 }
 #NavSessList::item:hover { background-color: #1d2230; color: #eef1fa; }
 #NavSessList::item:selected { background-color: #20263a; color: #ffffff; }
+
+/* 左栏「任务 / 空间」两区（语义对齐 WorkBuddy：任务=一次对话，空间=工作区目录） */
+#NavTaskScroll, #NavTaskBody { background: transparent; border: none; }
+#NavGroupTitle {
+    color: #6d7585;
+    font-size: 10px;
+    font-weight: 700;
+    background: transparent;
+    border: none;
+    padding: 8px 0 2px 20px;
+}
+#NavTaskItem {
+    background: transparent;
+    color: #a9b1c2;
+    border: none;
+    border-radius: 6px;
+    text-align: left;
+    padding-left: 18px;
+    margin: 0 6px;
+    font-size: 12px;
+}
+#NavTaskItem:hover { background-color: #1d2230; color: #eef1fa; }
+#NavTaskItem[active="true"] { background-color: #20263a; color: #ffffff; }
+#NavTaskItem[sub="true"] {
+    padding-left: 34px;
+    font-size: 11px;
+    color: #98a1b4;
+}
+#NavTaskItem[sub="true"][active="true"] { color: #ffffff; }
+#NavTaskItem[more="true"] {
+    padding-left: 34px;
+    font-size: 11px;
+    color: #7f8aa3;
+}
+#NavTaskItem[more="true"]:hover { color: #cfd7e8; }
+#NavSpaceItem {
+    background: transparent;
+    color: #b0b9cc;
+    border: none;
+    border-radius: 6px;
+    text-align: left;
+    padding-left: 18px;
+    margin: 0 6px;
+    font-size: 12px;
+}
+#NavSpaceItem:hover { background-color: #1d2230; color: #eef1fa; }
+#NavSpaceItem[open="true"] { color: #eef1fa; }
+#NavEmpty {
+    color: #6d7585;
+    font-size: 11px;
+    background: transparent;
+    border: none;
+    padding: 5px 20px 7px 20px;
+}
 #NavSubItem {
     background: transparent;
     color: #a9b1c2;

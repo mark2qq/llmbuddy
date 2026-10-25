@@ -394,6 +394,254 @@ def test_skill_depth_guard_blocks_infinite_recursion(env):
 
 
 # ----------------------------------------------------------------------------
+# 任务 / 空间（1.0.8：会话改叫「任务」，按工作区目录分组成「空间」）
+# ----------------------------------------------------------------------------
+def test_new_task_belongs_to_current_workspace(env):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    s = ass.new_session()
+    assert s["title"] == "新任务"
+    assert store_mod.norm_workspace(s["workspace"]) == \
+        store_mod.norm_workspace(str(env["workspace"]))
+    assert s["pinned"] is False and s["archived"] is False
+
+
+def test_rename_pin_archive_task(env):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    s = ass.new_session()
+    ass.update_session(s["id"], {"title": "  月度报表  ", "pinned": True})
+    got = store_mod.load_session(s["id"])
+    assert got["title"] == "月度报表" and got["pinned"] is True
+    # 归档后默认列表不出现，include_archived 才给
+    ass.update_session(s["id"], {"archived": True})
+    assert s["id"] not in [x["id"] for x in ass.session_list()]
+    assert s["id"] in [x["id"] for x in ass.session_list(include_archived=True)]
+
+
+def test_update_task_does_not_bump_updated_at(env):
+    """重命名/置顶不该把任务顶到「最近活动」最前面（与 WorkBuddy 一致）。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    s = ass.new_session()
+    before = store_mod.load_session(s["id"])["updated_at"]
+    time.sleep(0.02)
+    ass.update_session(s["id"], {"title": "改名", "pinned": True})
+    assert store_mod.load_session(s["id"])["updated_at"] == before
+
+
+def test_pinned_task_sorts_first(env):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    old = ass.new_session("旧")
+    store_mod.save_session({**store_mod.load_session(old["id"]),
+                            "updated_at": 100.0})
+    pinned = ass.new_session("置顶")
+    store_mod.save_session({**store_mod.load_session(pinned["id"]),
+                            "updated_at": 50.0, "pinned": True})
+    rows = ass.session_list()
+    assert rows[0]["id"] == pinned["id"]
+
+
+def test_space_list_groups_tasks_by_workspace(env, tmp_path):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    ws1, ws2 = tmp_path / "ws1", tmp_path / "ws2"
+    ws1.mkdir()
+    ws2.mkdir()
+    a = ass.new_session("甲", str(ws1))
+    b = ass.new_session("乙", str(tmp_path / "ws2"))
+    ass.update_session(b["id"], {"pinned": True})
+    spaces = {sp["name"]: sp for sp in ass.space_list()}
+    assert {"ws1", "ws2"} <= set(spaces)
+    assert spaces["ws1"]["count"] == 1
+    assert spaces["ws2"]["tasks"][0]["id"] == b["id"]      # 置顶排组内第一
+    assert spaces["ws1"]["exists"] is True
+    assert a["id"] in [t["id"] for t in spaces["ws1"]["tasks"]]
+
+
+def test_space_path_normalized(env, tmp_path):
+    """E:////x 与 E:/x/ 是同一个空间，不能拆成两条同名目录。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    ws = tmp_path / "merged"
+    ws.mkdir()
+    alt = str(ws).replace("\\", "/") + "/"
+    ass.new_session("一", str(ws))
+    ass.new_session("二", alt)
+    groups = [sp for sp in ass.space_list() if sp["name"] == "merged"]
+    assert len(groups) == 1 and groups[0]["count"] == 2
+
+
+def test_legacy_task_without_workspace_falls_back(env):
+    """1.0.8 之前的老会话没有 workspace 字段，归到当前工作区而不是单列一组。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    store_mod.save_session({"id": "sold", "title": "老任务", "created_at": 1,
+                            "updated_at": 1, "messages": []})
+    spaces = ass.space_list()
+    assert "（未归属）" not in [sp["name"] for sp in spaces]
+    hit = [t for sp in spaces for t in sp["tasks"] if t["id"] == "sold"]
+    assert hit and hit[0]["workspace"] == \
+        store_mod.norm_workspace(str(env["workspace"]))
+
+
+def test_space_missing_dir_flagged(env, tmp_path):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    gone = tmp_path / "gone"
+    ass.new_session("x", str(gone))         # 不创建目录
+    sp = [s for s in ass.space_list() if s["name"] == "gone"]
+    assert sp and sp[0]["exists"] is False
+
+
+def test_http_task_and_space_endpoints(env):
+    import asyncio
+    from routers import assistant as api
+
+    created = asyncio.run(api.create_session({"title": "接口任务"}))
+    assert created["code"] == 0
+    sid = created["data"]["id"]
+
+    patch = asyncio.run(api.session_update(sid, {"pinned": True,
+                                                 "title": "接口任务改名"}))
+    assert patch["code"] == 0 and patch["data"]["pinned"] is True
+
+    spaces = asyncio.run(api.spaces())
+    assert spaces["code"] == 0
+    assert any(t["id"] == sid for sp in spaces["data"] for t in sp["tasks"])
+
+    state = asyncio.run(api.state())
+    assert any(s["id"] == sid for s in state["data"]["sessions"])
+
+    missing = asyncio.run(api.session_update("nope", {"pinned": True}))
+    assert missing["code"] != 0
+
+
+# ----------------------------------------------------------------------------
+# 任务 / 空间（1.0.8：会话改叫「任务」，按工作区目录分组成「空间」）
+# ----------------------------------------------------------------------------
+def test_new_task_belongs_to_current_workspace(env):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    s = ass.new_session()
+    assert s["title"] == "新任务"
+    assert store_mod.norm_workspace(s["workspace"]) ==         store_mod.norm_workspace(str(env["workspace"]))
+    assert s["pinned"] is False and s["archived"] is False
+
+
+def test_rename_pin_archive_task(env):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    s = ass.new_session()
+    ass.update_session(s["id"], {"title": "  月度报表  ", "pinned": True})
+    got = store_mod.load_session(s["id"])
+    assert got["title"] == "月度报表" and got["pinned"] is True
+    # 归档后默认列表不出现，include_archived 才给
+    ass.update_session(s["id"], {"archived": True})
+    assert s["id"] not in [x["id"] for x in ass.session_list()]
+    assert s["id"] in [x["id"] for x in ass.session_list(include_archived=True)]
+
+
+def test_update_task_does_not_bump_updated_at(env):
+    """重命名/置顶不该把任务顶到「最近活动」最前面（与 WorkBuddy 一致）。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    s = ass.new_session()
+    before = store_mod.load_session(s["id"])["updated_at"]
+    time.sleep(0.02)
+    ass.update_session(s["id"], {"title": "改名", "pinned": True})
+    assert store_mod.load_session(s["id"])["updated_at"] == before
+
+
+def test_pinned_task_sorts_first(env):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    old = ass.new_session("旧")
+    store_mod.save_session({**store_mod.load_session(old["id"]),
+                            "updated_at": 100.0})
+    pinned = ass.new_session("置顶")
+    store_mod.save_session({**store_mod.load_session(pinned["id"]),
+                            "updated_at": 50.0, "pinned": True})
+    rows = ass.session_list()
+    assert rows[0]["id"] == pinned["id"]
+
+
+def test_space_list_groups_tasks_by_workspace(env, tmp_path):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    ws1, ws2 = tmp_path / "ws1", tmp_path / "ws2"
+    ws1.mkdir()
+    ws2.mkdir()
+    a = ass.new_session("甲", str(ws1))
+    b = ass.new_session("乙", str(tmp_path / "ws2"))
+    ass.update_session(b["id"], {"pinned": True})
+    spaces = {sp["name"]: sp for sp in ass.space_list()}
+    assert {"ws1", "ws2"} <= set(spaces)
+    assert spaces["ws1"]["count"] == 1
+    assert spaces["ws2"]["tasks"][0]["id"] == b["id"]      # 置顶排组内第一
+    assert spaces["ws1"]["exists"] is True
+    assert a["id"] in [t["id"] for t in spaces["ws1"]["tasks"]]
+
+
+def test_space_path_normalized(env, tmp_path):
+    """反斜杠写法与正斜杠写法属于同一个空间，不能拆成两条同名目录。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    ws = tmp_path / "merged"
+    ws.mkdir()
+    alt = str(ws).replace("\\", "/") + "/"
+    ass.new_session("一", str(ws))
+    ass.new_session("二", alt)
+    groups = [sp for sp in ass.space_list() if sp["name"] == "merged"]
+    assert len(groups) == 1 and groups[0]["count"] == 2
+
+
+def test_legacy_task_without_workspace_falls_back(env):
+    """1.0.8 之前的老会话没有 workspace 字段，归到当前工作区而不是单列一组。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    store_mod.save_session({"id": "sold", "title": "老任务", "created_at": 1,
+                            "updated_at": 1, "messages": []})
+    spaces = ass.space_list()
+    assert "（未归属）" not in [sp["name"] for sp in spaces]
+    hit = [t for sp in spaces for t in sp["tasks"] if t["id"] == "sold"]
+    assert hit and hit[0]["workspace"] ==         store_mod.norm_workspace(str(env["workspace"]))
+
+
+def test_space_missing_dir_flagged(env, tmp_path):
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    gone = tmp_path / "gone"
+    ass.new_session("x", str(gone))         # 不创建目录
+    sp = [s for s in ass.space_list() if s["name"] == "gone"]
+    assert sp and sp[0]["exists"] is False
+
+
+def test_http_task_and_space_endpoints(env):
+    import asyncio
+    from routers import assistant as api
+
+    created = asyncio.run(api.create_session({"title": "接口任务"}))
+    assert created["code"] == 0
+    sid = created["data"]["id"]
+
+    patch = asyncio.run(api.session_update(sid, {"pinned": True,
+                                                 "title": "接口任务改名"}))
+    assert patch["code"] == 0 and patch["data"]["pinned"] is True
+
+    spaces = asyncio.run(api.spaces())
+    assert spaces["code"] == 0
+    assert any(t["id"] == sid for sp in spaces["data"] for t in sp["tasks"])
+
+    state = asyncio.run(api.state())
+    assert any(s["id"] == sid for s in state["data"]["sessions"])
+
+    missing = asyncio.run(api.session_update("nope", {"pinned": True}))
+    assert missing["code"] != 0
+
+
+# ----------------------------------------------------------------------------
 # HTTP 层
 # ----------------------------------------------------------------------------
 def test_http_state_and_tools(env):

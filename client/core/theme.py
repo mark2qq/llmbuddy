@@ -304,6 +304,21 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #NavSessList::item:selected { background-color: #dbe4fb; color: #1b3a8f; }
 #NavSubItem { color: #3a4152; }
 #NavSubItem:hover { background-color: #e2e7f0; color: #12161f; }
+
+/* 左栏「任务 / 空间」两区 */
+#NavTaskScroll, #NavTaskBody { background: transparent; border: none; }
+#NavGroupTitle { color: #7b8496; }
+#NavTaskItem { color: #3a4152; }
+#NavTaskItem:hover { background-color: #e2e7f0; color: #12161f; }
+#NavTaskItem[active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
+#NavTaskItem[sub="true"] { color: #4d5567; }
+#NavTaskItem[sub="true"][active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
+#NavTaskItem[more="true"] { color: #6f7a8f; }
+#NavTaskItem[more="true"]:hover { color: #12161f; }
+#NavSpaceItem { color: #3a4152; }
+#NavSpaceItem:hover { background-color: #e2e7f0; color: #12161f; }
+#NavSpaceItem[open="true"] { color: #12161f; }
+#NavEmpty { color: #7b8496; }
 """
 
 

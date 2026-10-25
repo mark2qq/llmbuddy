@@ -5,7 +5,7 @@
 布局（1.0.8 按 WorkBuddy 对话框形态重排）：
     左栏（主窗口 NavPanel 内）              右栏（本页）
       智能助理                          ┌ 标题 + 管理入口 ────────────────┐
-        ▸ 会话（最近 5 条，点即切换）    │ 对话流（气泡 / 工具卡 / 审批卡） │
+        ▸ 任务（最近 6 条，点即切换）    │ 对话流（气泡 / 工具卡 / 审批卡） │
         ▸ 技能 / 工具 / MCP / 审计      │ ┌─ 输入框 ────────────────────┐ │
           （点开管理面板）              │ │ [+] [工作区][审批][技能]      │ │
                                         │ │          ◐  [模型 ▾]   [↑]  │ │
@@ -26,20 +26,21 @@
     - 操作本机文件、执行命令、抓网页（工具卡片可视化每次调用）
     - MCP 服务器增删、连接/断开，工具自动进白名单
     - 技能包 SKILL.md 的新建/编辑/导入(zip)/导出(zip)/删除
-    - 高危动作审批卡片（允许 / 本会话允许同类 / 拒绝）
+    - 高危动作审批卡片（允许 / 本任务允许同类 / 拒绝）
     - 本地模型 / 硅基流动 / 自定义 OpenAI 兼容端点切换
-    - 会话历史保存与回看（左栏二级栏目 + 管理面板）
+    - 任务历史保存与回看（左栏「任务 / 空间」两区 + 管理面板）
 """
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMenu, QMessageBox, QPlainTextEdit, QPushButton,
                                QSizePolicy, QTabWidget, QTextEdit, QVBoxLayout,
                                QWidget)
 
@@ -57,9 +58,65 @@ POLICY_ITEMS = [
 POLICY_ICON = {"readonly_auto": "⊘", "ask_all": "✓", "yolo": "⚡"}
 RISK_TEXT = {"low": "只读", "medium": "写入", "high": "高危"}
 
-# 左栏二级栏目里直接显示的会话条数（其余进管理面板）
-NAV_MAX_SESSIONS = 5
-NAV_SESSION_ROW = 26
+# 左栏「任务 / 空间」两区（对齐 WorkBuddy 的语义）：
+#   任务 = 一次对话（后端仍是 sessions），空间 = 任务所属的工作区目录。
+# 条数必须克制 —— 左栏宽 200、最高只有几百像素，靠滚动条才能看到其余内容。
+NAV_TASK_MAX = 4            # 「任务」区直接显示几条（WorkBuddy 的「任务 (4)」同款）
+NAV_SPACE_MAX = 4           # 「空间」区最多显示几个空间
+NAV_SPACE_TASK_MAX = 5      # 空间展开后最多显示几条任务
+NAV_ROW = 26                # 单行高度
+NAV_SCROLL_MAX = 420        # 任务+空间滚动区最高多少（超出内部滚动）
+# 兼容旧命名（管理面板文案里还引用着）
+NAV_MAX_SESSIONS = NAV_TASK_MAX
+NAV_SESSION_ROW = NAV_ROW
+
+
+class _NavScrollArea(AutoHideScrollArea):
+    """左栏任务/空间滚动区：sizeHint 可指定。
+
+    QScrollArea 默认的 sizeHint 在 widgetResizable 下不可靠（实测只有几十像素），
+    布局据此分配高度时会把「空间」那一段裁出视口 —— 表现为左栏只有 4 条任务。
+    这里让 sizeHint 跟着内容行数走，布局就能一次给对高度；同时仍保留
+    minimumHeight 以便窗口变矮时压缩 + 内部滚动。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hint = 0
+
+    def set_hint_height(self, h: int) -> None:
+        if h == self._hint:
+            return
+        self._hint = max(0, int(h))
+        self.updateGeometry()
+
+    def sizeHint(self):  # noqa: N802 - Qt 命名
+        size = super().sizeHint()
+        if self._hint:
+            size.setHeight(self._hint)
+        return size
+
+
+def _norm_ws(path: Any) -> str:
+    """工作区路径归一化（与后端 store.norm_workspace 同规则）。
+
+    同一个目录写成 E:/x、E:\\x、e:/x/ 会被当成三个「空间」，左栏就会出现
+    三条同名目录，所以比较前一律归一化。
+    """
+    p = str(path or "").strip().replace("\\", "/")
+    if not p.startswith("//"):          # UNC 路径（//server/share）保持双斜杠
+        while "//" in p:
+            p = p.replace("//", "/")
+    p = p.rstrip("/")
+    if len(p) >= 2 and p[1] == ":":
+        p = p[0].upper() + p[1:]
+    return p
+
+
+def _ellipsis(text: str, limit: int = 12) -> str:
+    """左栏只有 200px，标题必须截断（完整标题放 tooltip）。"""
+    text = " ".join(str(text or "").split()) or "未命名任务"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 # 运行中指示的旋转字符
 SPIN_FRAMES = "◐◓◑◒"
 
@@ -90,13 +147,13 @@ class AssistantPage(QWidget):
         self._active_model = ""
         self._skill_slug = ""
         self._model_cache: Dict[str, List[str]] = {}
-        # 管理面板 / 会话列表：记住用户选中的会话与最近一次列表快照
+        # 管理面板 / 任务列表：记住用户选中的任务与最近一次列表快照
         # （列表会被 refresh 重建，重建瞬间 currentItem 为 None，必须靠 _sel_sid 兜底）
         self._sel_sid = ""
         self._session_rows: List[Dict[str, Any]] = []
         # 工作区自愈：本机记忆与后端不一致时，每个页面实例只补同步一次，避免刷新循环
         self._ws_synced = False
-        # 管理面板懒创建（会话/技能/工具/MCP/审计 tab 在里面）
+        # 管理面板懒创建（任务/技能/工具/MCP/审计 tab 在里面）
         self._manager: Optional["ManagerDialog"] = None
         self._spin_i = 0
         # 各管理列表在面板未创建时为 None，填充函数都要判空
@@ -105,7 +162,15 @@ class AssistantPage(QWidget):
         self._tool_list = None
         self._mcp_list = None
         self._audit_view = None
-        self._nav_sess = None
+        # 左栏「任务 / 空间」两区：任务行按钮表、空间分组快照、当前展开的空间
+        self._nav_scroll = None
+        self._nav_body = None
+        self._nav_body_lay = None
+        self._nav_task_title = None
+        self._nav_task_btns: Dict[str, QPushButton] = {}
+        self._nav_spaces: List[Dict[str, Any]] = []
+        self._nav_rows: Optional[List[Dict[str, Any]]] = None   # 左栏用的任务快照
+        self._open_space = ""
         self._nav_entries: Dict[str, QPushButton] = {}
 
         self._build_ui()
@@ -123,7 +188,7 @@ class AssistantPage(QWidget):
         root.setSpacing(6)
 
         root.addLayout(self._build_header())
-        # 右侧 tab 面板已取消：会话/技能/工具/MCP/审计 全部移到左栏二级栏目
+        # 右侧 tab 面板已取消：任务/技能/工具/MCP/审计 全部移到左栏二级栏目
         # 与「管理」面板（批注：作为二级栏目放在智能助理下面直接显示）。
         root.addWidget(self._build_chat_panel(), 1)
 
@@ -145,7 +210,7 @@ class AssistantPage(QWidget):
 
         self._manage_btn = QPushButton("管理")
         self._manage_btn.setObjectName("GhostBtn")
-        self._manage_btn.setToolTip("打开管理面板：会话 / 技能 / 工具 / MCP / 审计")
+        self._manage_btn.setToolTip("打开管理面板：任务 / 技能 / 工具 / MCP / 审计")
         self._manage_btn.setCursor(Qt.PointingHandCursor)
         self._manage_btn.clicked.connect(lambda: self.open_manager())
         head.addWidget(self._manage_btn)
@@ -389,13 +454,19 @@ class AssistantPage(QWidget):
         self._input.moveCursor(QTextCursor.End)
         self._input.setFocus()
 
-    # ---------------- 左栏二级栏目（挂到主窗口 NavPanel） ----------------
+    # ---------------- 左栏二级栏目：任务 / 空间（挂到主窗口 NavPanel） ----------------
     def build_nav_panel(self) -> QWidget:
-        """一级「智能助理」下面的二级栏目：会话直接列出，管理入口紧随其后。
+        """一级「智能助理」下面的二级栏目，语义与 WorkBuddy 一致：
 
-        批注要求：把原先右侧那个「会话 / 技能 / 工具 / MCP / 审计」tab 面板
-        「作为二级栏目放在智能助理下面直接显示」，所以右侧面板整块取消，
-        会话列表直接铺在左栏，其余四项点开管理面板。
+            任务 (N)                跨空间的最近任务，置顶优先，点一条即切换
+              · 任务标题
+            空间 (M)                任务按所属工作区目录分组，点空间展开 / 收起
+              ▸ 📁 llm-service  2
+                  · 任务标题
+            技能 · 3 / 工具 · 14 / MCP · 0 / 审计
+
+        「任务」= 一次对话（后端仍叫 session，数据格式不变），
+        「空间」= 任务所属的工作区目录，等价于 WorkBuddy 里挂在某个文件夹下的任务。
         """
         panel = QWidget()
         panel.setObjectName("NavSub")
@@ -408,28 +479,35 @@ class AssistantPage(QWidget):
         head = QHBoxLayout()
         head.setContentsMargins(20, 7, 10, 2)
         head.setSpacing(4)
-        title = QLabel("会话")
-        title.setObjectName("NavSubTitle")
-        head.addWidget(title)
+        self._nav_task_title = QLabel("任务")
+        self._nav_task_title.setObjectName("NavSubTitle")
+        head.addWidget(self._nav_task_title)
         head.addStretch(1)
         add = QPushButton("+")
         add.setObjectName("NavSubAdd")
         add.setFixedSize(18, 18)
         add.setCursor(Qt.PointingHandCursor)
-        add.setToolTip("新会话")
+        add.setToolTip("新建任务")
         add.clicked.connect(lambda: self._new_session())
         head.addWidget(add)
         lay.addLayout(head)
 
-        self._nav_sess = QListWidget()
-        self._nav_sess.setObjectName("NavSessList")
-        self._nav_sess.setFrameShape(QFrame.NoFrame)
-        self._nav_sess.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._nav_sess.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._nav_sess.setFixedHeight(0)
-        self._nav_sess.setToolTip("点一条会话即切换（全部历史在「管理」里）")
-        self._nav_sess.itemClicked.connect(self._load_session_item)
-        lay.addWidget(self._nav_sess)
+        # 任务区 + 空间区共用一个可滚动容器：左栏高度有限，
+        # 窗口矮的时候必须能在内部滚动，而不是把导航按钮挤没。
+        self._nav_scroll = _NavScrollArea()
+        self._nav_scroll.setObjectName("NavTaskScroll")
+        self._nav_scroll.setMinimumHeight(64)
+        self._nav_scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        body.setObjectName("NavTaskBody")
+        self._nav_body = body
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+        self._nav_body_lay = body_lay
+        self._nav_scroll.setWidget(body)
+        # stretch=1：让滚动区吃掉面板剩余高度（内容少时由 maxHeight 限制，不留白）
+        lay.addWidget(self._nav_scroll, 1)
 
         self._nav_entries: Dict[str, QPushButton] = {}
         for key, label in (("skills", "技能"), ("tools", "工具"),
@@ -441,6 +519,7 @@ class AssistantPage(QWidget):
             lay.addWidget(btn)
             self._nav_entries[key] = btn
         self._sync_nav_entries()
+        self._rebuild_nav_tasks()
         return panel
 
     def _sync_nav_entries(self) -> None:
@@ -458,7 +537,376 @@ class AssistantPage(QWidget):
                 continue
             btn.setText(f"{label} · {counts[key]}" if key in counts else label)
 
-    # ---------------- 管理面板（会话 / 技能 / 工具 / MCP / 审计） ----------------
+    # ---------------- 左栏：任务 / 空间 渲染 ----------------
+    def _clear_nav_body(self) -> None:
+        lay = getattr(self, "_nav_body_lay", None)
+        if lay is None:
+            return
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._nav_task_btns = {}
+
+    def _task_tip(self, t: Dict[str, Any]) -> str:
+        ts = t.get("updated_at") or 0
+        when = time.strftime("%m月%d日 %H:%M", time.localtime(ts)) if ts else "—"
+        return (f"{t.get('title') or '未命名任务'}\n"
+                f"{t.get('message_count', 0)} 条消息 · {when}\n"
+                f"空间：{t.get('workspace') or '（未记录）'}\n"
+                f"右键：置顶 / 重命名 / 归档 / 删除")
+
+    def _nav_task_row(self, t: Dict[str, Any], *, sub: bool = False) -> QPushButton:
+        sid = str(t.get("id") or "")
+        text = _ellipsis(t.get("title"), 11 if sub else 12)
+        btn = QPushButton(("📌 " if t.get("pinned") else "") + text)
+        btn.setObjectName("NavTaskItem")
+        btn.setProperty("sub", "true" if sub else "false")
+        btn.setProperty("active", "true" if sid == self._session_id else "false")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(NAV_ROW)
+        btn.setToolTip(self._task_tip(t))
+        btn.clicked.connect(lambda _c=False, s=sid: self._open_task(s))
+        btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        btn.customContextMenuRequested.connect(
+            lambda pos, s=sid, b=btn: self._show_task_menu(s, b.mapToGlobal(pos)))
+        self._nav_task_btns[sid] = btn
+        return btn
+
+    def _group_spaces(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按所属空间分组（与后端 store.space_list 同规则）。
+
+        历史任务没有 workspace 字段（1.0.8 之前建的），统一归到当前工作区，
+        否则左栏会多出一个「未归属」组，看起来像数据丢了。
+        """
+        cur = _norm_ws(self._state.get("workspace"))
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            ws = _norm_ws(r.get("workspace")) or cur or "（未归属）"
+            groups.setdefault(ws, []).append(r)
+        out: List[Dict[str, Any]] = []
+        for ws, tasks in groups.items():
+            tasks.sort(key=lambda x: (not x.get("pinned"),
+                                      -(x.get("updated_at") or 0)))
+            out.append({
+                "path": ws,
+                "name": ws.rsplit("/", 1)[-1] or ws,
+                "count": len(tasks),
+                "exists": ws == "（未归属）" or os.path.isdir(ws),
+                "updated_at": max((t.get("updated_at") or 0) for t in tasks),
+                "tasks": tasks,
+            })
+        out.sort(key=lambda g: -(g.get("updated_at") or 0))
+        return out
+
+    def _rebuild_nav_tasks(self) -> None:
+        """重画左栏「任务 / 空间」两区（数据变了就整体重建，逻辑最简单）。"""
+        lay = getattr(self, "_nav_body_lay", None)
+        if lay is None:
+            return
+        rows = getattr(self, "_nav_rows", None)
+        if rows is None:
+            rows = self._session_rows or []
+        rows = [r for r in rows if isinstance(r, dict)]
+        spaces = self._nav_spaces or self._group_spaces(rows)
+        # 内容签名：refresh 可能被高频触发（状态轮询 / 切页 / 流式结束），
+        # 每次清空重建会让左栏闪烁且丢鼠标 hover 态，签名没变就直接返回。
+        sig = (tuple((r.get("id"), r.get("title"), r.get("pinned"),
+                      r.get("message_count"), r.get("workspace")) for r in rows),
+               tuple((sp.get("path"), sp.get("count")) for sp in spaces),
+               self._open_space, self._session_id)
+        if sig == getattr(self, "_nav_sig", None):
+            return
+        self._nav_sig = sig
+        self._clear_nav_body()
+        if self._nav_task_title is not None:
+            self._nav_task_title.setText(f"任务 ({len(rows)})")
+        lines = 0
+
+        # ---- 任务区：跨空间最近任务（置顶的排最前，后端已排好）----
+        for t in rows[:NAV_TASK_MAX]:
+            lay.addWidget(self._nav_task_row(t))
+            lines += 1
+        if not rows:
+            empty = QLabel("还没有任务，点右上角 + 新建")
+            empty.setObjectName("NavEmpty")
+            empty.setWordWrap(True)
+            lay.addWidget(empty)
+            lines += 1
+
+        # ---- 空间区：任务按工作区目录分组，点空间展开 / 收起 ----
+        if spaces:
+            gtitle = QLabel(f"空间 ({len(spaces)})")
+            gtitle.setObjectName("NavGroupTitle")
+            lay.addWidget(gtitle)
+            lines += 1              # 分组标题也占一行，漏算会把最后一行挤出视口
+            for sp in spaces[:NAV_SPACE_MAX]:
+                path = str(sp.get("path") or "")
+                opened = bool(self._open_space) and path == self._open_space
+                missing = not sp.get("exists", True)
+                row = QPushButton(
+                    f"{'▾' if opened else '▸'} {'⚠ ' if missing else '📁 '}"
+                    f"{_ellipsis(sp.get('name') or path, 11)}   {sp.get('count')}")
+                row.setObjectName("NavSpaceItem")
+                row.setProperty("open", "true" if opened else "false")
+                row.setCursor(Qt.PointingHandCursor)
+                row.setFixedHeight(NAV_ROW)
+                row.setToolTip(
+                    f"{path}\n{sp.get('count')} 个任务"
+                    + ("\n⚠ 目录不存在（可能被删除或移动盘已拔出）" if missing else "")
+                    + "\n点击展开 / 收起；右键可在此空间新建任务")
+                row.clicked.connect(lambda _c=False, p=path: self._toggle_space(p))
+                row.setContextMenuPolicy(Qt.CustomContextMenu)
+                row.customContextMenuRequested.connect(
+                    lambda pos, p=path, b=row: self._show_space_menu(
+                        p, b.mapToGlobal(pos)))
+                lay.addWidget(row)
+                lines += 1
+                if not opened:
+                    continue
+                for t in (sp.get("tasks") or [])[:NAV_SPACE_TASK_MAX]:
+                    lay.addWidget(self._nav_task_row(t, sub=True))
+                    lines += 1
+                if sp.get("count", 0) > NAV_SPACE_TASK_MAX:
+                    more = QPushButton(f"查看全部 {sp.get('count')} 个…")
+                    more.setObjectName("NavTaskItem")
+                    more.setProperty("sub", "true")
+                    more.setProperty("more", "true")
+                    more.setCursor(Qt.PointingHandCursor)
+                    more.setFixedHeight(NAV_ROW)
+                    more.clicked.connect(lambda _c=False: self.open_manager("sessions"))
+                    lay.addWidget(more)
+                    lines += 1
+            if len(spaces) > NAV_SPACE_MAX:
+                more_sp = QPushButton(f"其余 {len(spaces) - NAV_SPACE_MAX} 个空间…")
+                more_sp.setObjectName("NavTaskItem")
+                more_sp.setProperty("more", "true")
+                more_sp.setCursor(Qt.PointingHandCursor)
+                more_sp.setFixedHeight(NAV_ROW)
+                more_sp.clicked.connect(lambda _c=False: self.open_manager("sessions"))
+                lay.addWidget(more_sp)
+                lines += 1
+
+        lay.addStretch(1)
+        self._fit_nav_scroll(lines)
+
+    def _fit_nav_scroll(self, rows: int = 0) -> None:
+        """按行数算高，但允许被窗口压缩。
+
+        刻意不依赖 `body.sizeHint()`：滚动区内部 widget 的布局在首次重建时
+        还没 activate，sizeHint 会偏小，结果「空间」那一段被裁掉（实测过，
+        任务区 4 行后再也看不到「空间 (N)」）。行数是自己数的，确定性强。
+
+        也不能 setFixedHeight：主窗口最小高 680，左栏还要放标题 + 6 个一级入口
+        + 4 个管理入口；这里给「最小可压到 96 / 最大不超过 NAV_SCROLL_MAX」，
+        中间由布局协商，内容超出时滚动区内部消化（细条自动浮出）。
+        """
+        sc = getattr(self, "_nav_scroll", None)
+        if sc is None:
+            return
+        h = max(96, min(rows * NAV_ROW + 4, NAV_SCROLL_MAX))
+        # 最小 96（约 3 行）保证矮窗口下还能看到任务区；最大=内容高，
+        # 内容少时不占一大片空白，内容多时由布局压缩 → 内部滚动。
+        sc.setMinimumHeight(min(h, 96))
+        sc.setMaximumHeight(h)
+        if hasattr(sc, "set_hint_height"):
+            sc.set_hint_height(h)
+
+    def _toggle_space(self, path: str) -> None:
+        # 手风琴：一次只展开一个空间，避免展开多个把左栏撑爆
+        self._open_space = "" if path == (self._open_space or "") else path
+        self._rebuild_nav_tasks()
+
+    # ---------------- 任务操作（右键：置顶 / 重命名 / 归档 / 删除） ----------------
+    def _open_task(self, sid: str) -> None:
+        """点左栏一条任务 = 切到它（与 WorkBuddy 点任务开对话一致）。"""
+        if not sid:
+            return
+        self._sel_sid = sid
+        w = Worker(self._assist.session, sid)
+        w.result.connect(self._apply_session_detail)
+        w.error.connect(lambda m: self._set_status(f"打开任务失败：{m}"))
+        w.start()
+
+    def _patch_task(self, sid: str, patch: Dict[str, Any]) -> None:
+        key = next(iter(patch), "")
+        label = {"pinned": "置顶", "archived": "归档", "title": "重命名",
+                 "workspace": "移动"}.get(key, "更新")
+        self._set_status(f"正在{label}…")
+        w = Worker(self._assist.update_session, sid, patch)
+        w.result.connect(lambda _r: self._after_task_patched(label))
+        w.error.connect(lambda m: self._set_status(f"{label}失败：{m}"))
+        w.start()
+
+    def _after_task_patched(self, label: str) -> None:
+        self._set_status(f"已{label}")
+        self._fill_sessions()      # 立刻重画左栏 + 管理面板列表
+        self.refresh()             # 再拉一次 state：空间分组的顺序也会变
+
+    def _rename_task(self, sid: str, cur: str) -> None:
+        text, ok = QInputDialog.getText(
+            self._dialog_parent(), "重命名任务", "任务名称：",
+            QLineEdit.EchoMode.Normal, cur or "")
+        if not ok:
+            return
+        text = (text or "").strip()
+        if not text or text == cur:
+            return
+        self._patch_task(sid, {"title": text[:80]})
+
+    def _delete_task(self, sid: str, title: str) -> None:
+        ans = QMessageBox.question(
+            self._dialog_parent(), "删除任务",
+            f"确定删除「{title}」？\n删除后无法恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._set_status(f"正在删除「{title}」…")
+        w = Worker(self._assist.delete_session, sid)
+        w.result.connect(lambda res, s=sid: self._on_session_deleted(res, s))
+        w.error.connect(self._on_session_delete_failed)
+        w.start()
+
+    def build_task_menu(self, sid: str) -> Optional[QMenu]:
+        """任务右键菜单（对齐 WorkBuddy：置顶 / 重命名 / 打开文件夹 / 归档 / 删除）。
+
+        「分享任务」在本机产品里换成「导出为 Markdown」——没有分享服务，
+        但把任务交出去的需求是真实的；「在独立窗口中打开」不适用（单窗口应用），
+        对应能力是「打开所在空间」。
+        """
+        row = next((r for r in self._session_rows if str(r.get("id")) == sid), {})
+        if not row:
+            return None
+        title = row.get("title") or "未命名任务"
+        pinned = bool(row.get("pinned"))
+        archived = bool(row.get("archived"))
+        ws = str(row.get("workspace") or "")
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")
+        menu.addAction("取消置顶" if pinned else "置顶",
+                       lambda: self._patch_task(sid, {"pinned": not pinned}))
+        menu.addAction("重命名…", lambda: self._rename_task(sid, title))
+        menu.addSeparator()
+        act_dir = menu.addAction("打开所在空间", lambda: self._open_space_folder(ws))
+        act_dir.setEnabled(bool(ws))
+        menu.addAction("导出为 Markdown…", lambda: self._export_task(sid, title))
+        menu.addSeparator()
+        menu.addAction("取消归档" if archived else "归档",
+                       lambda: self._patch_task(sid, {"archived": not archived}))
+        menu.addAction("删除任务", lambda: self._delete_task(sid, title))
+        return menu
+
+    def _show_task_menu(self, sid: str, gpos) -> None:
+        menu = self.build_task_menu(sid)
+        if menu is not None:
+            menu.exec(gpos)
+
+    def build_space_menu(self, path: str) -> QMenu:
+        """空间右键菜单：在此空间新建任务 / 展开收起 / 打开目录。"""
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")
+        menu.addAction("在此空间新建任务", lambda: self._new_task_in_space(path))
+        menu.addAction("展开 / 收起", lambda: self._toggle_space(path))
+        menu.addSeparator()
+        act = menu.addAction("在资源管理器中打开",
+                             lambda: self._open_space_folder(path))
+        act.setEnabled(os.path.isdir(path))
+        return menu
+
+    def _show_space_menu(self, path: str, gpos) -> None:
+        self.build_space_menu(path).exec(gpos)
+
+    def _new_task_in_space(self, path: str) -> None:
+        """在该空间下新建任务，并把工作区切过去（文件工具落在同一目录）。"""
+        name = _ellipsis(path.rsplit("/", 1)[-1] or path, 8)
+        self._set_status(f"正在「{name}」中新建任务…")
+        w = Worker(self._assist.new_session, path)
+        w.result.connect(lambda s, p=path: self._on_space_task_created(s, p))
+        w.error.connect(lambda m: self._set_status(f"新建任务失败：{m}"))
+        w.start()
+
+    def _on_space_task_created(self, session: Any, path: str) -> None:
+        if not isinstance(session, dict) or not session.get("id"):
+            self._set_status("任务创建失败，请确认后端已启动")
+            return
+        self._open_space = path
+        self._sync_workspace_to_task(path)
+        self._on_session_created(session, False)
+
+    def _open_space_folder(self, path: str) -> None:
+        p = _norm_ws(path)
+        if not p or not os.path.isdir(p):
+            self._set_status(f"空间目录不存在：{path or '（未记录）'}")
+            return
+        try:
+            if hasattr(os, "startfile"):          # Windows
+                os.startfile(p)                   # noqa: S606
+            else:                                 # macOS / Linux
+                import subprocess
+                import sys
+                subprocess.Popen(["open" if sys.platform == "darwin"
+                                  else "xdg-open", p])
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"打开失败：{e}")
+
+    def _export_task(self, sid: str, title: str) -> None:
+        """WorkBuddy 的「分享任务」在本机产品里的等价能力：导出成 md 文件。"""
+        w = Worker(self._assist.session, sid)
+        w.result.connect(lambda s: self._save_task_md(s, title))
+        w.error.connect(lambda m: self._set_status(f"导出失败：{m}"))
+        w.start()
+
+    def _save_task_md(self, session: Any, title: str) -> None:
+        if not isinstance(session, dict):
+            return
+        safe = "".join(c for c in (title or "任务")
+                       if c not in '\\/:*?"<>|').strip() or "任务"
+        path = self._pick_file("导出任务", os.path.expanduser("~"),
+                               "Markdown (*.md)", save=True,
+                               default_name=f"{safe}.md", accept_text="保存")
+        if not path:
+            return
+        if not path.lower().endswith(".md"):
+            path += ".md"
+        lines = [f"# {session.get('title') or title}", "",
+                 f"- 空间：{session.get('workspace') or '（未记录）'}",
+                 f"- 消息数：{len(session.get('messages') or [])}", ""]
+        for m in session.get("messages") or []:
+            role = {"user": "我", "assistant": "助理"}.get(m.get("role"),
+                                                          m.get("role") or "")
+            content = (m.get("content") or "").strip()
+            if content:
+                lines += [f"## {role}", "", content, ""]
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            self._set_status(f"已导出：{path}")
+        except OSError as e:
+            self._set_status(f"写入失败：{e}")
+
+    def _sync_workspace_to_task(self, path: str) -> None:
+        """打开任务时把工作区切到它所属的空间。
+
+        任务归属于空间，但文件工具用的是全局工作区；不同步就会出现
+        「在 A 空间的任务里让助理改文件，结果改到了 B 目录」。
+        """
+        ws = _norm_ws(path)
+        if not ws or ws == _norm_ws(self._state.get("workspace")):
+            return
+        if not os.path.isdir(ws):
+            return
+        self._state["workspace"] = ws
+        self._remember_workspace(ws)
+        self._refresh_ws_btn(ws)
+        w = Worker(self._assist.save_settings, {"workspace": ws})
+        w.error.connect(lambda m: self._set_status(f"切换空间失败：{m}"))
+        w.start()
+
+
+    # ---------------- 管理面板（任务 / 技能 / 工具 / MCP / 审计） ----------------
     def open_manager(self, key: str = "sessions") -> None:
         if self._manager is None:
             self._manager = ManagerDialog(self)
@@ -479,7 +927,8 @@ class AssistantPage(QWidget):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
         lay.addWidget(self._hint(
-            f"左栏只直接显示最近 {NAV_MAX_SESSIONS} 条，完整历史在这里。"
+            f"左栏「任务」区只直接显示最近 {NAV_TASK_MAX} 条、" +
+            f"「空间」区每空间至多 {NAV_SPACE_TASK_MAX} 条，全部任务都在这里。"
             "点选后可打开或删除（也支持右键菜单）。"))
         self._all_sess_list = QListWidget()
         self._all_sess_list.setSelectionMode(
@@ -492,15 +941,15 @@ class AssistantPage(QWidget):
         lay.addWidget(self._all_sess_list, 1)
 
         row = QHBoxLayout()
-        b_new = QPushButton("新会话")
+        b_new = QPushButton("新建任务")
         b_new.clicked.connect(lambda: self._new_session())
         b_open = QPushButton("打开")
         b_open.clicked.connect(self._open_selected_session)
         b_del = QPushButton("删除")
-        b_del.setToolTip("删除选中的会话（单个）")
+        b_del.setToolTip("删除选中的任务（单个）")
         b_del.clicked.connect(self._delete_session)
-        b_sweep = QPushButton("清理空会话")
-        b_sweep.setToolTip("批量删除 0 条消息的空会话（不含当前会话）")
+        b_sweep = QPushButton("清理空任务")
+        b_sweep.setToolTip("批量删除 0 条消息的空任务（不含当前任务）")
         b_sweep.clicked.connect(self._sweep_empty_sessions)
         for b in (b_new, b_open, b_del):
             row.addWidget(b)
@@ -509,17 +958,17 @@ class AssistantPage(QWidget):
         lay.addLayout(row)
         return w
 
-    # ---------------- 会话列表：选中 / 打开 / 删除 ----------------
+    # ---------------- 任务列表：选中 / 打开 / 删除 ----------------
     def _on_all_sess_clicked(self, item) -> None:
         sid = item.data(Qt.UserRole) if item is not None else None
         self._sel_sid = str(sid) if sid else ""
 
     def _selected_session_sid(self) -> str:
-        """当前要操作的会话：优先列表选中项，其次记住的选中，最后当前会话。
+        """当前要操作的任务：优先列表选中项，其次记住的选中，最后当前任务。
 
         列表会被 refresh 重建，重建瞬间 currentItem() 为 None；如果只认
         currentItem()，用户「刚选中就被刷新」后点删除就会静默失败
-        （问题反馈：会话无法删除）。这里用 _sel_sid 兜底。
+        （问题反馈：任务无法删除）。这里用 _sel_sid 兜底。
         """
         lst = getattr(self, "_all_sess_list", None)
         item = lst.currentItem() if lst is not None else None
@@ -536,8 +985,8 @@ class AssistantPage(QWidget):
 
     def _warn_no_selection(self, action: str) -> None:
         QMessageBox.information(
-            self._dialog_parent(), f"{action}会话",
-            "请先在列表里点选一个会话，再点这个按钮。")
+            self._dialog_parent(), f"{action}任务",
+            "请先在列表里点选一个任务，再点这个按钮。")
 
     def _dialog_parent(self) -> QWidget:
         """当前可见的顶层窗口。
@@ -557,62 +1006,51 @@ class AssistantPage(QWidget):
             self._warn_no_selection("删除")
             return
         raw = (item.text() if item is not None else "") or ""
-        title = raw.split("（")[0].strip() or "该会话"
-        ans = QMessageBox.question(
-            self._dialog_parent(), "删除会话",
-            f"确定删除「{title}」？\n删除后无法恢复。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        self._set_status(f"正在删除「{title}」…")
-        w = Worker(self._assist.delete_session, sid)
-        w.result.connect(lambda res, s=sid: self._on_session_deleted(res, s))
-        w.error.connect(self._on_session_delete_failed)
-        w.start()
+        title = raw.split("（")[0].replace("★", "").strip() or "该任务"
+        self._delete_task(sid, title)
 
     def _on_session_deleted(self, res, sid: str) -> None:
         if not (isinstance(res, dict) and res.get("deleted")):
-            self._on_session_delete_failed("后端未确认删除（会话可能已不存在）")
+            self._on_session_delete_failed("后端未确认删除（任务可能已不存在）")
             return
         if self._sel_sid == sid:
             self._sel_sid = ""
         if sid == self._session_id:
-            # 删的是当前会话：清空并新开一个，否则界面停在一条已删除的会话上
+            # 删的是当前任务：清空并新开一个，否则界面停在一条已删除的任务上
             self._session_id = ""
             self._clear_chat()
             self._new_session(silent=True)
         else:
             self._fill_sessions()
-        self._set_status("会话已删除")
+        self._set_status("任务已删除")
 
     def _on_session_delete_failed(self, msg: str) -> None:
         self._set_status(f"删除失败：{msg}")
-        QMessageBox.warning(self._dialog_parent(), "删除会话",
+        QMessageBox.warning(self._dialog_parent(), "删除任务",
                             f"删除失败：{msg}")
 
     def _sweep_empty_sessions(self) -> None:
-        """清掉 0 条消息的空会话。
+        """清掉 0 条消息的空任务。
 
-        反复点「新会话」或反复切页会自动建会话，列表里会攒一堆「新会话（0 条）」，
-        单个删除太慢，这里给个一键清理（当前会话永远保留）。
+        反复点「新建任务」或反复切页会自动建任务，列表里会攒一堆「新任务（0 条）」，
+        单个删除太慢，这里给个一键清理（当前任务永远保留）。
         """
         empties = [s for s in self._session_rows
                    if not s.get("message_count") and s.get("id") != self._session_id]
         if not empties:
-            QMessageBox.information(self._dialog_parent(), "清理空会话",
-                                    "没有可清理的空会话。")
+            QMessageBox.information(self._dialog_parent(), "清理空任务",
+                                    "没有可清理的空任务。")
             return
         ans = QMessageBox.question(
-            self._dialog_parent(), "清理空会话",
-            f"将删除 {len(empties)} 个 0 条消息的空会话，确定？",
+            self._dialog_parent(), "清理空任务",
+            f"将删除 {len(empties)} 个 0 条消息的空任务，确定？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if ans != QMessageBox.StandardButton.Yes:
             return
         for s in empties:
             Worker(self._assist.delete_session, str(s.get("id"))).start()
-        self._set_status(f"正在清理 {len(empties)} 个空会话…")
+        self._set_status(f"正在清理 {len(empties)} 个空任务…")
         QTimer.singleShot(800, self._fill_sessions)
 
     def _show_sess_menu(self, pos) -> None:
@@ -624,13 +1062,11 @@ class AssistantPage(QWidget):
             return
         lst.setCurrentItem(item)
         self._on_all_sess_clicked(item)
-        menu = QMenu(self)
-        menu.setObjectName("ModelMenu")
-        act_open = menu.addAction("打开")
-        act_open.triggered.connect(lambda _c=False: self._load_session_item(item))
-        act_del = menu.addAction("删除")
-        act_del.triggered.connect(lambda _c=False: self._delete_session())
-        menu.exec(lst.mapToGlobal(pos))
+        sid = item.data(Qt.UserRole)
+        if not sid:
+            return
+        # 与左栏任务行共用同一套菜单（置顶 / 重命名 / 归档 / 删除）
+        self._show_task_menu(str(sid), lst.mapToGlobal(pos))
 
     def _build_skills_tab(self) -> QWidget:
         w = QWidget()
@@ -724,7 +1160,7 @@ class AssistantPage(QWidget):
         return lbl
 
     # ------------------------------------------------------------------ #
-    # 刷新：状态 / 底栏按钮 / 技能 / 工具 / MCP / 会话
+    # 刷新：状态 / 底栏按钮 / 技能 / 工具 / MCP / 任务
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
         if self._loading:
@@ -781,9 +1217,17 @@ class AssistantPage(QWidget):
         self._fill_mcp(st.get("mcp") or [])
         self._fill_sessions()
 
-        # 首次进入自动建一个会话，减少「空白不知道点哪」
+        # 首次进入不要无脑新建：先复用最近一个「0 条消息」的任务。
+        # 否则每启动一次就多一个空任务，左栏「任务 / 空间」两区很快被刷满。
         if not self._session_id:
-            self._new_session(silent=True)
+            rows = [s for s in (st.get("sessions") or []) if isinstance(s, dict)]
+            idle = next((s for s in rows if not s.get("message_count")), None)
+            if idle is not None:
+                self._session_id = str(idle.get("id") or "")
+                self._sel_sid = self._session_id
+                self._greet()
+            else:
+                self._new_session(silent=True)
 
     def _set_status(self, text: str) -> None:
         """状态行：有内容才占位，避免底栏上方常驻一条空白。"""
@@ -916,73 +1360,67 @@ class AssistantPage(QWidget):
 
     def _apply_sessions(self, items) -> None:
         items = [s for s in (items or []) if isinstance(s, dict)]
-        self._session_rows = items        # 「清理空会话」靠这份快照
+        # 置顶优先、组内按最近活动：后端已排好，这里再排一次是防御
+        # （旧版后端 / 本地缓存回来的顺序不一定可靠），刷新后顺序不会被抖乱。
+        items.sort(key=lambda x: (not x.get("pinned"), -(x.get("updated_at") or 0)))
+        self._session_rows = items        # 「清理空任务」靠这份快照
 
-        # 左栏二级栏目：只显示最近 NAV_MAX_SESSIONS 条，点一条即切换
-        nav = getattr(self, "_nav_sess", None)
-        if nav is not None:
-            nav.blockSignals(True)
-            nav.clear()
-            for s in items[:NAV_MAX_SESSIONS]:
-                text = s.get("title") or "新会话"
-                if len(text) > 10:
-                    text = text[:9] + "…"
-                item = QListWidgetItem(text)
-                item.setData(Qt.UserRole, s.get("id"))
-                item.setSizeHint(QSize(0, NAV_SESSION_ROW))
-                item.setToolTip(f"{s.get('title') or '新会话'}\n"
-                                f"{s.get('message_count', 0)} 条消息")
-                if s.get("id") == self._session_id:
-                    item.setSelected(True)
-                nav.addItem(item)
-            rows = min(len(items), NAV_MAX_SESSIONS)
-            nav.setFixedHeight(rows * NAV_SESSION_ROW + 2 if rows else 0)
-            nav.setVisible(bool(rows))
-            nav.blockSignals(False)
+        # 左栏「任务 / 空间」两区整体重画。
+        # 左栏只列有内容的任务：0 条消息的空任务（反复点「+」/ 来回切页攒出来的）
+        # 只留在管理面板里，否则「任务」区那几个位置会被一串「新任务」占满，
+        # 真正在聊的任务反而看不到。当前任务无论空不空都保留。
+        # 注意用 get(..., 1)：字段缺失视为「有内容」，宁可多显示也不要把任务藏掉
+        self._nav_rows = [s for s in items
+                          if s.get("message_count", 1) or s.get("id") == self._session_id]
+        self._nav_spaces = self._group_spaces(self._nav_rows)
+        self._rebuild_nav_tasks()
 
-        # 管理面板里的完整会话列表（面板未打开时为 None）
+        # 管理面板里的完整任务列表（面板未打开时为 None）
         lst = getattr(self, "_all_sess_list", None)
         if lst is not None:
-            # 选中态优先跟随用户手动选的那条，其次当前会话；
+            # 选中态优先跟随用户手动选的那条，其次当前任务；
             # 否则只要列表被刷新一下，用户刚选中的行就没了，点删除会像「没反应」
             keep = self._sel_sid or self._session_id
             lst.blockSignals(True)
             lst.clear()
             for s in items:
-                item = QListWidgetItem(f"{s.get('title') or '新会话'}   "
-                                       f"（{s.get('message_count', 0)} 条）")
+                ws = _norm_ws(s.get("workspace")).rsplit("/", 1)[-1] or "—"
+                pin = "★ " if s.get("pinned") else ""
+                item = QListWidgetItem(f"{pin}{s.get('title') or '新任务'}   "
+                                       f"（{s.get('message_count', 0)} 条 · {ws}）")
                 item.setData(Qt.UserRole, s.get("id"))
+                item.setToolTip(self._task_tip(s))
                 lst.addItem(item)
                 if s.get("id") == keep:
                     item.setSelected(True)
                     lst.setCurrentItem(item)   # 必须在 addItem 之后，否则不生效
             if not items:
-                lst.addItem("（还没有会话）")
+                lst.addItem("（还没有任务）")
             lst.blockSignals(False)
 
     # ------------------------------------------------------------------ #
-    # 会话
+    # 任务
     # ------------------------------------------------------------------ #
     def _new_session(self, silent: bool = False) -> None:
-        # 当前会话本来就是空的（0 条消息）就直接复用，别再建一个：
-        # 反复点左栏「+」或来回切页会攒出一长串「新会话（0 条）」
+        # 当前任务本来就是空的（0 条消息）就直接复用，别再建一个：
+        # 反复点左栏「+」或来回切页会攒出一长串「新任务（0 条）」
         cur = next((s for s in self._session_rows
                     if s.get("id") == self._session_id), None)
         if not silent and cur is not None and not cur.get("message_count"):
             self._clear_chat()
             self._greet()
-            self._set_status("当前已经是新会话")
+            self._set_status("当前已经是新任务")
             return
         w = Worker(self._assist.new_session)
         w.result.connect(lambda s: self._on_session_created(s, silent))
-        w.error.connect(lambda m: self._set_status(f"新建会话失败：{m}"))
+        w.error.connect(lambda m: self._set_status(f"新建任务失败：{m}"))
         w.start()
 
     def _on_session_created(self, session: Dict[str, Any], silent: bool) -> None:
         if not isinstance(session, dict) or not session.get("id"):
             return
         self._session_id = session["id"]
-        self._sel_sid = str(session["id"])      # 新会话立刻成为列表选中项
+        self._sel_sid = str(session["id"])      # 新任务立刻成为列表选中项
         self._clear_chat()
         self._greet()
         self._fill_sessions()
@@ -1002,13 +1440,15 @@ class AssistantPage(QWidget):
             return
         w = Worker(self._assist.session, sid)
         w.result.connect(self._apply_session_detail)
-        w.error.connect(lambda m: self._set_status(f"加载会话失败：{m}"))
+        w.error.connect(lambda m: self._set_status(f"加载任务失败：{m}"))
         w.start()
 
     def _apply_session_detail(self, data: Dict[str, Any]) -> None:
         if not isinstance(data, dict):
             return
         self._session_id = data.get("id") or ""
+        # 任务属于某个空间：切过去，否则文件工具还在上一个目录里干活
+        self._sync_workspace_to_task(str(data.get("workspace") or ""))
         self._clear_chat()
         for m in data.get("messages") or []:
             role = m.get("role")
@@ -1016,9 +1456,9 @@ class AssistantPage(QWidget):
             if role in ("user", "assistant") and content:
                 bubble = ChatBubble(role, content)
                 self._append_widget(bubble)
-        self._add_step("已载入历史会话")
+        self._add_step("已载入历史任务")
         self._sel_sid = str(self._session_id or "")
-        self._fill_sessions()      # 同步左栏二级栏目的选中态
+        self._fill_sessions()      # 同步左栏的选中态与「任务 / 空间」两区
 
     # ------------------------------------------------------------------ #
     # 对话
@@ -1058,7 +1498,7 @@ class AssistantPage(QWidget):
 
     def _send_with_session(self, session: Any, text: str) -> None:
         if not isinstance(session, dict) or not session.get("id"):
-            self._set_status("会话创建失败，请检查后端服务")
+            self._set_status("任务创建失败，请检查后端服务")
             return
         self._session_id = session["id"]
         self._input.clear()
@@ -1640,11 +2080,11 @@ class AssistantPage(QWidget):
 class ManagerDialog(QDialog):
     """智能助理管理面板（原右侧 tab 面板整块搬到这里）。
 
-    左栏二级栏目只做「会话直显 + 四个入口」，真正需要空间的列表操作
-    （全部会话、技能包导入导出、工具清单、MCP 增删、审计明细）在面板里。
+    左栏只做「任务 / 空间两区 + 四个入口」，真正需要空间的列表操作
+    （全部任务、技能包导入导出、工具清单、MCP 增删、审计明细）在面板里。
     """
 
-    TABS = [("sessions", "会话"), ("skills", "技能"), ("tools", "工具"),
+    TABS = [("sessions", "任务"), ("skills", "技能"), ("tools", "工具"),
             ("mcp", "MCP"), ("audit", "审计")]
 
     def __init__(self, page):
@@ -1658,7 +2098,7 @@ class ManagerDialog(QDialog):
         lay.setSpacing(8)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(page._build_sessions_tab(), "会话")
+        self.tabs.addTab(page._build_sessions_tab(), "任务")
         self.tabs.addTab(page._build_skills_tab(), "技能")
         self.tabs.addTab(page._build_tools_tab(), "工具")
         self.tabs.addTab(page._build_mcp_tab(), "MCP")

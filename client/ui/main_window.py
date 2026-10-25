@@ -96,12 +96,15 @@ class MainWindow(QMainWindow):
             self._nav_buttons.append(btn)
             nav_layout.addWidget(btn)
             if idx == 0:
-                # 「智能助理」下面直接挂二级栏目（会话列表 + 技能/工具/MCP/审计）
+                # 「智能助理」下面直接挂二级栏目（任务/空间 + 技能/工具/MCP/审计）
                 host = QWidget()
                 host.setObjectName("NavSubHost")
                 host_lay = QVBoxLayout(host)
                 host_lay.setContentsMargins(0, 2, 0, 6)
                 host_lay.setSpacing(0)
+                # 不给 stretch：让 host 按 sizeHint 拿高度（滚动区已重写 sizeHint），
+                # 末尾的 addStretch(1) 吃掉剩余空间。给 stretch 反而会与它按比例
+                # 分空间，host 只拿到 2/3，最后一行被挤出视口。
                 nav_layout.addWidget(host)
                 self._assistant_nav_host = host
                 self._assistant_nav_lay = host_lay
@@ -132,9 +135,11 @@ class MainWindow(QMainWindow):
                   self.api_page, self.settings):
             self._stack.addWidget(p)
 
-        # 二级栏目要等页面建好才能取控件（会话列表由 AssistantPage 维护）
+        # 二级栏目要等页面建好才能取控件（任务/空间两块由 AssistantPage 维护）
         if self._assistant_nav_host is not None:
-            self._assistant_nav_lay.addWidget(self.assistant.build_nav_panel())
+            # stretch=1 同样不能省：否则 panel 只按 sizeHint 排，里面的滚动区
+            # 拿不到剩余高度，「空间」那一段就被裁在视口外了。
+            self._assistant_nav_lay.addWidget(self.assistant.build_nav_panel(), 1)
 
         # 注意：构造函数期间不要触发各页 refresh()（其内部会启动 QThread 后台任务）。
         # 在 Qt 事件循环启动前启动 QThread 会导致死锁/卡死（窗口永远不显示）。

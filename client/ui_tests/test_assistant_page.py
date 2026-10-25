@@ -2,12 +2,13 @@
 """
 智能助理页面（1.0.8）无头烟雾测试。
 
-1.0.9 结构调整（照 WorkBuddy 重排）后验证点：
+1.0.8 结构调整（照 WorkBuddy 重排）后验证点：
     - 页面可构造、导航项出现在第一位
     - 底栏融合工具条：附件/工作区/审批/技能/模型/发送全在输入容器内，单行
     - 模型来源与模型合并进一个下拉菜单（不再两个 QComboBox 并排）
-    - 左栏二级栏目：会话直接列出、管理入口带数量，其余进管理面板
-    - 状态回填：审批策略 / 工作区 / 技能 / 工具 / MCP / 新会话
+    - 左栏「任务 / 空间」两区：任务置顶优先、空间按工作区分组且可展开
+    - 任务右键菜单：置顶 / 重命名 / 归档 / 打开所在空间 / 导出 / 删除
+    - 状态回填：审批策略 / 工作区 / 技能 / 工具 / MCP / 新任务
     - SSE 事件渲染：delta → 气泡；tool_call → 工具卡片；approval_request → 审批卡
     - 技能 chip：挂载后发消息自动带「用 xx 技能」前缀，输入框不被改写
     - 浅色主题覆盖新增的选择器
@@ -30,7 +31,7 @@ import time  # noqa: E402
 import pytest  # noqa: E402
 from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
-                               QMessageBox)
+                               QInputDialog, QLabel, QMessageBox)
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -66,6 +67,11 @@ class _Api:
 
 
 class _FakeAssistApi:
+    #: 任务摘要（带所属空间，1.0.8 起任务归属于工作区目录）
+    TASK = {"id": "s1", "title": "历史任务", "message_count": 2,
+            "workspace": r"E://tmp//ws", "pinned": False, "archived": False,
+            "created_at": 1.0, "updated_at": 2.0, "preview": "你好"}
+
     def __init__(self, *a, **kw):
         self.saved = {}
         self.save_calls = []
@@ -73,6 +79,21 @@ class _FakeAssistApi:
         self.approvals = []
         self.deleted = []
         self.created = 0
+        self.created_ws = ""
+        self.patches = []         # (sid, patch)：置顶/重命名/归档走这里
+        self.tasks = [dict(self.TASK)]
+
+    def spaces(self):
+        return [{"path": r"E://tmp//ws", "name": "ws", "count": len(self.tasks),
+                 "exists": True, "tasks": [dict(t) for t in self.tasks]}]
+
+    def update_session(self, sid, patch):
+        self.patches.append((sid, dict(patch)))
+        for t in self.tasks:
+            if t.get("id") == sid:
+                t.update(patch)
+                return dict(t)
+        return {"id": sid, **patch}
 
     def state(self):
         return {
@@ -98,18 +119,21 @@ class _FakeAssistApi:
                         "description": "代码摘要", "tools": ["fs_read"]}],
             "mcp": [{"id": "fs", "name": "文件系统", "transport": "stdio",
                      "status": "connected", "tool_count": 3, "error": ""}],
-            "sessions": [],
+            "sessions": self.sessions(),
+            "spaces": self.spaces(),
         }
 
     def sessions(self):
-        return [{"id": "s1", "title": "历史会话", "message_count": 2}]
+        return [dict(t) for t in self.tasks]
 
-    def new_session(self):
+    def new_session(self, workspace=""):
         self.created += 1
-        return {"id": "s-new", "title": "新会话"}
+        self.created_ws = workspace
+        return {"id": "s-new", "title": "新任务",
+                "workspace": workspace or r"E://tmp//ws"}
 
     def session(self, sid):
-        return {"id": sid, "messages": [
+        return {"id": sid, "workspace": r"E://tmp//ws", "messages": [
             {"role": "user", "content": "你好"},
             {"role": "assistant", "content": "在的，需要我做什么？"}]}
 
@@ -178,7 +202,8 @@ def page(monkeypatch):
     p.refresh()           # 构造不自动刷新（避免 exec() 前起线程），测试里手动触发
     assert _pump(lambda: bool(p._state))
     assert _pump(lambda: bool(p._session_id))
-    assert _pump(lambda: p._nav_sess.count() == 1)
+    assert _pump(lambda: "s1" in p._nav_task_btns)
+    assert p._nav_spaces
     return p, fake
 
 
@@ -191,23 +216,40 @@ def test_nav_has_assistant_first():
     assert len(MainWindow.NAV_ITEMS) == 6
 
 
-def test_nav_panel_lists_sessions_directly(page):
-    """批注：会话/技能/工具/MCP/审计 作为二级栏目放在智能助理下面直接显示。"""
+def test_nav_panel_title_says_tasks_not_sessions(page):
+    """批注：左栏「会话」改成「任务」（与 WorkBuddy 的任务/空间一致）。"""
     p, _fake = page
-    assert p._nav_sess is not None          # 二级栏目在页面构造时就绪
-    assert p._nav_sess.count() == 1         # sessions() 返回 1 条
-    assert p._nav_sess.height() > 0
+    assert p._nav_task_title.text() == "任务 (1)"
+
+
+def test_approval_card_uses_task_wording():
+    """「本会话允许同类」跟着改成「本任务允许同类」，术语全链路一致。"""
+    from PySide6.QtWidgets import QPushButton
+    from ui.widgets.assistant_cards import ApprovalCard
+    card = ApprovalCard("a1", "fs_write", "写文件 a.txt", "medium",
+                        {"path": "a.txt"})
+    texts = [b.text() for b in card.findChildren(QPushButton)]
+    assert "本任务允许同类" in texts
+
+
+def test_nav_panel_lists_tasks_directly(page):
+    """任务直接铺在左栏，管理入口带数量。"""
+    p, _fake = page
+    btn = p._nav_task_btns.get("s1")
+    assert btn is not None
+    assert "历史任务" in btn.text()
     assert p._nav_entries["skills"].text() == "技能 · 1"
     assert p._nav_entries["tools"].text() == "工具 · 2"
     assert p._nav_entries["mcp"].text() == "MCP · 1"
     assert p._nav_entries["audit"].text() == "审计"
 
 
-def test_nav_panel_hidden_when_empty(page):
+def test_nav_panel_empty_state(page):
     p, _fake = page
     p._apply_sessions([])
-    assert p._nav_sess.count() == 0
-    assert p._nav_sess.height() == 0        # 空列表不占位
+    assert p._nav_task_btns == {}
+    texts = [w.text() for w in p._nav_body.findChildren(QLabel)]
+    assert any("还没有任务" in t for t in texts)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +333,7 @@ def test_manager_dialog_has_five_tabs(page):
     dlg = ManagerDialog(p)
     assert dlg.tabs.count() == 5
     assert [dlg.tabs.tabText(i) for i in range(5)] == \
-        ["会话", "技能", "工具", "MCP", "审计"]
+        ["任务", "技能", "工具", "MCP", "审计"]
     dlg.show_tab("mcp")
     assert dlg.tabs.currentIndex() == 3
     dlg.deleteLater()
@@ -454,6 +496,253 @@ def test_new_session_reuses_empty_current(page):
     created = fake.created
     p._new_session()
     assert fake.created == created          # 复用，没新建
+
+
+# ---------------------------------------------------------------------------
+# 任务 / 空间（批注：「会话」改成「任务」，按 WorkBuddy 的任务+空间实现）
+#
+# 语义对齐 WorkBuddy：
+#   任务 = 一次对话（后端仍叫 session，数据格式不变，老数据无需迁移）
+#   空间 = 任务所属的工作区目录；任务挂在空间下，点空间展开
+# ---------------------------------------------------------------------------
+def _two_tasks(nav_page):
+    p, fake = nav_page
+    fake.tasks = [
+        {"id": "a", "title": "旧任务", "message_count": 3, "workspace": r"E://ws1",
+         "pinned": False, "archived": False, "updated_at": 100.0},
+        {"id": "b", "title": "新任务", "message_count": 1, "workspace": r"E://ws2",
+         "pinned": False, "archived": False, "updated_at": 200.0},
+    ]
+    p._apply_sessions([dict(t) for t in fake.tasks])
+    return p, fake
+
+
+def test_pinned_task_sorts_first(page):
+    """置顶的任务永远排最前（WorkBuddy 的「置顶」语义），其余按最近活动。"""
+    p, fake = page
+    p._apply_sessions([
+        {"id": "a", "title": "旧", "updated_at": 100.0, "pinned": False},
+        {"id": "b", "title": "置顶的", "updated_at": 50.0, "pinned": True},
+        {"id": "c", "title": "新", "updated_at": 200.0, "pinned": False},
+    ])
+    order = [s["id"] for s in p._session_rows]
+    assert order == ["b", "c", "a"]
+
+
+def test_space_groups_by_workspace(page):
+    """任务按所属工作区分组成「空间」，同名目录只算一个空间。"""
+    p, fake = _two_tasks(page)
+    spaces = {sp["name"]: sp["count"] for sp in p._nav_spaces}
+    assert spaces == {"ws1": 1, "ws2": 1}
+
+
+def test_space_path_normalized_so_no_duplicate_groups(page):
+    """E:////x 与 E:/x/ 是同一个空间，否则左栏会出现两条同名目录。"""
+    p, _fake = page
+    p._apply_sessions([
+        {"id": "a", "title": "t1", "workspace": r"E://llm-service", "updated_at": 1},
+        {"id": "b", "title": "t2", "workspace": "E:/llm-service/", "updated_at": 2},
+    ])
+    assert len(p._nav_spaces) == 1
+    assert p._nav_spaces[0]["count"] == 2
+
+
+def test_space_expands_to_show_its_tasks(page):
+    """展开空间会多出一组该空间下的任务行（收起后复原）。"""
+    from PySide6.QtWidgets import QPushButton
+    p, fake = _two_tasks(page)
+    path = [sp["path"] for sp in p._nav_spaces if sp["name"] == "ws1"][0]
+    before = len(p._nav_body.findChildren(QPushButton))
+    p._toggle_space(path)
+    assert p._open_space == path
+    assert len(p._nav_body.findChildren(QPushButton)) > before
+    p._toggle_space(path)                        # 再点收起
+    assert p._open_space == ""
+    assert len(p._nav_body.findChildren(QPushButton)) == before
+
+
+def test_space_accordion_only_one_open(page):
+    """手风琴：展开第二个空间时第一个自动收起，避免左栏被撑爆。"""
+    p, fake = _two_tasks(page)
+    p1 = [sp["path"] for sp in p._nav_spaces if sp["name"] == "ws1"][0]
+    p2 = [sp["path"] for sp in p._nav_spaces if sp["name"] == "ws2"][0]
+    p._toggle_space(p1)
+    p._toggle_space(p2)
+    assert p._open_space == p2
+
+
+def test_new_task_in_space_passes_workspace(page, tmp_path):
+    """空间右键「在此空间新建任务」→ 新任务带上该空间，且工作区切过去。"""
+    ws = tmp_path / "ws1"
+    ws.mkdir()
+    p, fake = _two_tasks(page)
+    before = fake.created
+    p._new_task_in_space(str(ws))
+    assert _pump(lambda: fake.created == before + 1)
+    assert fake.created_ws == str(ws)
+    assert _pump(lambda: str(p._state.get("workspace") or "").endswith("ws1"))
+
+
+def test_open_task_switches_workspace_to_its_space(page, monkeypatch, tmp_path):
+    """打开任务时工作区跟到它所属空间，否则文件工具会改到上一个目录。"""
+    ws = tmp_path / "ws2"
+    ws.mkdir()
+    p, fake = page
+    monkeypatch.setattr(
+        fake, "session",
+        lambda sid: {"id": sid, "workspace": str(ws),
+                     "messages": [{"role": "user", "content": "hi"}]})
+    p._open_task("b")
+    assert _pump(lambda: any(str(c.get("workspace") or "").endswith("ws2")
+                             for c in fake.save_calls))
+
+
+def test_open_task_skips_missing_space(page, monkeypatch):
+    """空间目录不存在（移动盘拔了）时不切工作区，免得把工作区指到死路径。"""
+    p, fake = page
+    monkeypatch.setattr(
+        fake, "session",
+        lambda sid: {"id": sid, "workspace": r"Z://gone",
+                     "messages": []})
+    before = len(fake.save_calls)
+    p._open_task("b")
+    assert _pump(lambda: p._session_id == "b")
+    assert len(fake.save_calls) == before
+
+
+def test_rename_task_patches_title(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    p, fake = page
+    monkeypatch.setattr(mod.QInputDialog, "getText",
+                        staticmethod(lambda *a, **kw: ("改好的名字", True)))
+    p._rename_task("s1", "历史任务")
+    assert _pump(lambda: fake.patches)
+    assert fake.patches[0] == ("s1", {"title": "改好的名字"})
+
+
+def test_rename_task_cancel_does_nothing(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    p, fake = page
+    monkeypatch.setattr(mod.QInputDialog, "getText",
+                        staticmethod(lambda *a, **kw: ("", False)))
+    p._rename_task("s1", "历史任务")
+    assert fake.patches == []
+
+
+def test_archive_task_patches_flag(page):
+    p, fake = page
+    p._patch_task("s1", {"archived": True})
+    assert _pump(lambda: fake.patches)
+    assert fake.patches[0] == ("s1", {"archived": True})
+
+
+def _menu_texts(menu):
+    return [a.text() for a in menu.actions() if a.text()]
+
+
+def test_task_context_menu_has_workbuddy_actions(page):
+    """右键菜单对齐 WorkBuddy：置顶 / 重命名 / 打开文件夹 / 归档 / 删除。"""
+    p, _fake = page
+    texts = _menu_texts(p.build_task_menu("s1"))
+    for want in ("置顶", "重命名…", "打开所在空间", "导出为 Markdown…",
+                 "归档", "删除任务"):
+        assert want in texts, want
+
+
+def test_pinned_task_menu_offers_unpin(page):
+    p, fake = page
+    fake.tasks[0]["pinned"] = True
+    p._apply_sessions([dict(t) for t in fake.tasks])
+    assert "取消置顶" in _menu_texts(p.build_task_menu("s1"))
+
+
+def test_space_menu_has_new_task_action(page):
+    p, _fake = page
+    menu = p.build_space_menu(r"E://ws1")
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "在此空间新建任务" in texts
+    assert "在资源管理器中打开" in texts
+
+
+def test_delete_task_from_nav_asks_confirm(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    p, fake = page
+    asked = []
+
+    class _MB:
+        StandardButton = QMessageBox.StandardButton
+
+        @staticmethod
+        def question(parent, title, text, *a, **kw):
+            asked.append((title, text))
+            return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(mod, "QMessageBox", _MB)
+    p._delete_task("s1", "历史任务")
+    assert asked and "删除任务" in asked[0][0]
+    assert "历史任务" in asked[0][1]
+    assert _pump(lambda: fake.deleted == ["s1"])
+
+
+def test_startup_reuses_idle_task_instead_of_creating(monkeypatch):
+    """重启时复用「0 条消息」的空任务，不要每启动一次就多一个空任务。"""
+    from ui.pages import assistant_page as mod
+    fake = _FakeAssistApi()
+    fake.tasks = [{"id": "idle1", "title": "新任务", "message_count": 0,
+                   "workspace": r"E://tmp//ws", "pinned": False,
+                   "archived": False, "updated_at": 5.0}]
+    monkeypatch.setattr(mod, "AssistantApi", lambda *a, **kw: fake)
+    p = mod.AssistantPage(_Api(), None, _Cfg())
+    p.build_nav_panel()
+    p.refresh()
+    assert _pump(lambda: p._session_id == "idle1")
+    assert fake.created == 0
+
+
+def test_space_path_missing_marks_warning(page):
+    """空间目录被删/移动盘拔出：图标变 ⚠，任务仍能看到（不是数据丢失）。"""
+    p, _fake = page
+    p._apply_sessions([{"id": "a", "title": "t", "workspace": r"Z://gone",
+                        "updated_at": 1}])
+    sp = p._nav_spaces[0]
+    assert sp["exists"] is False
+    from PySide6.QtWidgets import QPushButton
+    texts = [b.text() for b in p._nav_body.findChildren(QPushButton)]
+    assert any("⚠" in t for t in texts)
+
+
+def test_empty_tasks_hidden_from_nav_but_kept_for_manager(page):
+    """0 条消息的空任务不进左栏，但仍留在管理面板的任务列表里。
+
+    反复点「+」新建任务会攒出一串「新任务（0 条）」，如果左栏也列出来，
+    「任务」区那几个位置全被空任务占满，真正在聊的任务反而看不见了。
+    但空任务不能删——管理面板要能列出来给用户自己清理（清理空任务按钮）。
+    """
+    p, _fake = page
+    p._apply_sessions([
+        {"id": "a", "title": "聊过的", "message_count": 3,
+         "workspace": r"E://ws1", "updated_at": 300.0},
+        {"id": "b", "title": "新任务", "message_count": 0,
+         "workspace": r"E://ws1", "updated_at": 200.0},
+        {"id": "c", "title": "新任务", "message_count": 0,
+         "workspace": r"E://ws1", "updated_at": 100.0},
+    ])
+    assert [s["id"] for s in p._session_rows] == ["a", "b", "c"]   # 全量快照不丢
+    assert [s["id"] for s in p._nav_rows] == ["a"]                 # 左栏只留非空
+    assert p._nav_task_title.text() == "任务 (1)"
+    assert p._nav_spaces[0]["count"] == 1                          # 空间计数同步
+
+
+def test_current_empty_task_still_shows_in_nav(page):
+    """刚新建、还没发消息的任务要看得见（否则点完「+」左栏没反应）。"""
+    p, _fake = page
+    p._session_id = "b"
+    p._apply_sessions([
+        {"id": "a", "title": "聊过的", "message_count": 3, "updated_at": 300.0},
+        {"id": "b", "title": "新任务", "message_count": 0, "updated_at": 200.0},
+    ])
+    assert [s["id"] for s in p._nav_rows] == ["a", "b"]
+    assert "b" in p._nav_task_btns
 
 
 # ---------------------------------------------------------------------------

@@ -58,6 +58,10 @@ class AssistantApi:
         with _client(self.base_url, self.api_key) as c:
             return self._unwrap(c.put(path, json=body or {}))
 
+    def patch(self, path: str, body: Optional[Dict] = None) -> Any:
+        with _client(self.base_url, self.api_key) as c:
+            return self._unwrap(c.patch(path, json=body or {}))
+
     def delete(self, path: str) -> Any:
         with _client(self.base_url, self.api_key) as c:
             return self._unwrap(c.delete(path))
@@ -76,8 +80,17 @@ class AssistantApi:
     def sessions(self) -> List[Dict]:
         return self.get("/api/v1/assistant/sessions") or []
 
-    def new_session(self) -> Dict:
-        return self.post("/api/v1/assistant/sessions", {}) or {}
+    def spaces(self) -> List[Dict]:
+        """任务按工作区目录分组（左栏「空间」区）。"""
+        return self.get("/api/v1/assistant/spaces") or []
+
+    def new_session(self, workspace: str = "") -> Dict:
+        return self.post("/api/v1/assistant/sessions",
+                         {"workspace": workspace} if workspace else {}) or {}
+
+    def update_session(self, sid: str, patch: Dict) -> Dict:
+        """改任务：标题 / 所属空间 / 置顶 / 归档。"""
+        return self.patch(f"/api/v1/assistant/sessions/{sid}", patch) or {}
 
     def session(self, sid: str) -> Dict:
         return self.get(f"/api/v1/assistant/sessions/{sid}") or {}

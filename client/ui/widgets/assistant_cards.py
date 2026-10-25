@@ -4,7 +4,7 @@
 
     ChatBubble     用户/助手气泡（助手支持 Markdown 渐进渲染）
     ToolCard       工具调用卡片（可展开看参数与结果）
-    ApprovalCard   高危动作审批卡片（允许 / 本会话允许 / 拒绝）
+    ApprovalCard   高危动作审批卡片（允许 / 本任务允许 / 拒绝）
     StepLine       技能阶段提示（plan/act/review 的细线文字）
     ThinkingCard   模型思考过程（可折叠）
 
@@ -217,7 +217,7 @@ class ApprovalCard(QFrame):
         self.btn_allow = QPushButton("允许")
         self.btn_allow.setObjectName("PrimaryBtn")
         self.btn_allow.clicked.connect(lambda: self._done(True, False))
-        self.btn_allow_once = QPushButton("本会话允许同类")
+        self.btn_allow_once = QPushButton("本任务允许同类")
         self.btn_allow_once.clicked.connect(lambda: self._done(True, True))
         self.btn_deny = QPushButton("拒绝")
         self.btn_deny.clicked.connect(lambda: self._done(False, False))

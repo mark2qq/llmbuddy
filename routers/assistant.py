@@ -6,11 +6,13 @@
 鉴权：与管理接口一致（环境变量 LLM_API_KEY 非空时校验 X-API-Key / Bearer）
 
 接口清单：
-    GET    /state                  运行态快照（提供商/工具/技能/MCP/策略/会话）
-    GET    /sessions               会话列表
-    POST   /sessions               新建会话
-    GET    /sessions/{sid}         会话详情
-    DELETE /sessions/{sid}         删除会话
+    GET    /state                  运行态快照（提供商/工具/技能/MCP/策略/任务/空间）
+    GET    /sessions               任务列表（?include_archived=1 连归档一起给）
+    POST   /sessions               新建任务（可指定 workspace）
+    GET    /sessions/{sid}         任务详情（完整消息）
+    PATCH  /sessions/{sid}         改任务（标题/所属空间/置顶/归档）
+    DELETE /sessions/{sid}         删除任务
+    GET    /spaces                 空间列表（任务按工作区目录分组）
     POST   /chat                   一轮对话（SSE 事件流；stream=false 时返回 JSON）
     POST   /stop                   中止当前轮次
     GET    /approvals              待审批列表
@@ -81,13 +83,21 @@ async def state():
 
 
 @router.get("/sessions")
-async def sessions():
-    return ok(get_assistant().session_list())
+async def sessions(include_archived: bool = False):
+    return ok(get_assistant().session_list(include_archived))
 
 
 @router.post("/sessions")
 async def create_session(body: Optional[Dict[str, Any]] = None):
-    return ok(get_assistant().new_session((body or {}).get("title") or ""))
+    body = body or {}
+    return ok(get_assistant().new_session(body.get("title") or "",
+                                          body.get("workspace") or ""))
+
+
+@router.get("/spaces")
+async def spaces(include_archived: bool = False):
+    """任务按空间（工作区目录）分组，左栏「空间」区直接用这个结果。"""
+    return ok(get_assistant().space_list(include_archived))
 
 
 @router.get("/sessions/{sid}")
@@ -96,6 +106,20 @@ async def session_detail(sid: str):
     if s is None:
         return fail(2001, "会话不存在")
     return ok(s)
+
+
+@router.patch("/sessions/{sid}")
+async def session_update(sid: str, body: Dict[str, Any]):
+    """改任务属性：标题（重命名）/ 所属空间 / 置顶 / 归档。"""
+    if not isinstance(body, dict) or not body:
+        return fail(2002, "没有要修改的字段")
+    s = get_assistant().update_session(sid, body)
+    if s is None:
+        return fail(2001, "会话不存在")
+    return ok({"id": s.get("id"), "title": s.get("title"),
+               "workspace": s.get("workspace"),
+               "pinned": bool(s.get("pinned")),
+               "archived": bool(s.get("archived"))})
 
 
 @router.delete("/sessions/{sid}")

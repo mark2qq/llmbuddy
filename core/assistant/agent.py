@@ -31,8 +31,9 @@ from core.assistant import skills as skills_mod
 from core.assistant.approval import get_approval_manager
 from core.assistant.providers import ProviderError, get_provider
 from core.assistant.store import (audit, delete_session, ensure_dirs, get_provider as cfg_provider,
-                                 list_sessions, load_config, load_session, save_config,
-                                 save_session)
+                                 list_sessions, load_config, load_session, norm_workspace,
+                                 save_config, save_session, space_list as group_spaces,
+                                 update_session as patch_session)
 from core.assistant.tools import ToolRegistry
 
 MAX_HISTORY_MESSAGES = 24
@@ -108,6 +109,8 @@ class Assistant:
     def state(self) -> Dict[str, Any]:
         cfg = load_config()
         self._maybe_autostart_mcp()
+        # 一次读盘，任务列表与空间分组共用（左栏要同时渲染「任务」和「空间」两区）
+        rows = list_sessions(500)
         return {
             "version": "1.0.8",
             "policy": cfg.get("policy"),
@@ -124,7 +127,8 @@ class Assistant:
             "tools": self.registry().list(),
             "skills": skills_mod.list_skills(),
             "mcp": self._mcp.status(),
-            "sessions": list_sessions(30),
+            "sessions": rows[:50],
+            "spaces": group_spaces(rows, fallback=cfg.get("workspace") or ""),
             "pending_approvals": self._approval.list_pending(),
             "orchestrator": "langgraph" if _has_langgraph() else "sequential",
             "running": list(k for k, v in self._running.items() if v),
@@ -146,19 +150,38 @@ class Assistant:
     # ------------------------------------------------------------------ #
     # 会话
     # ------------------------------------------------------------------ #
-    def new_session(self, title: str = "") -> Dict[str, Any]:
+    def new_session(self, title: str = "", workspace: str = "") -> Dict[str, Any]:
+        """新建任务。workspace 为空时归属当前工作区（空间 = 工作区目录）。"""
         sid = "s" + uuid.uuid4().hex[:12]
         now = time.time()
-        session = {"id": sid, "title": title or "新会话", "created_at": now,
-                   "updated_at": now, "messages": [], "provider": "", "model": ""}
+        cur_ws = norm_workspace(workspace) or norm_workspace(load_config().get("workspace"))
+        session = {"id": sid, "title": title or "新任务", "created_at": now,
+                   "updated_at": now, "messages": [], "provider": "", "model": "",
+                   "workspace": cur_ws, "pinned": False, "archived": False}
         save_session(session)
         return session
 
     def get_session(self, sid: str) -> Optional[Dict[str, Any]]:
         return load_session(sid)
 
-    def session_list(self) -> List[Dict[str, Any]]:
-        return list_sessions(50)
+    def session_list(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+        return list_sessions(50, include_archived)
+
+    def space_list(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+        """按空间（工作区）分组的任务列表。
+
+        历史任务没有 workspace 字段（1.0.8 之前），统一归到当前工作区名下，
+        否则左栏会多出一个「未归属」组，看着像数据丢了。
+        """
+        cfg = load_config()
+        rows = list_sessions(500, include_archived)
+        return group_spaces(rows, fallback=cfg.get("workspace") or "")
+
+    def update_session(self, sid: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        s = patch_session(sid, patch or {})
+        if s is not None and patch.get("archived"):
+            self._approval.cancel_session(sid)
+        return s
 
     def remove_session(self, sid: str) -> bool:
         self._approval.cancel_session(sid)
@@ -188,6 +211,9 @@ class Assistant:
         session = load_session(session_id) or self.new_session()
         session["id"] = session.get("id") or session_id
         session.setdefault("messages", [])
+        # 老任务没有所属空间：补记当前工作区，左栏「空间」区才能把它归位
+        if not session.get("workspace"):
+            session["workspace"] = norm_workspace(cfg.get("workspace"))
         with self._lock:
             self._cancel[session_id] = False
             self._running[session_id] = True
@@ -201,7 +227,8 @@ class Assistant:
         # 记录用户消息
         session["messages"].append({"role": "user", "content": text,
                                     "time": time.time()})
-        if session.get("title") in ("", "新会话"):
+        # 占位标题（新建时还没说话）才自动用首句当标题；用户改过名的绝不动
+        if session.get("title") in ("", "新会话", "新任务", "未命名任务"):
             session["title"] = text.strip().replace("\n", " ")[:24]
             emit({"type": "title", "title": session["title"]})
         emit({"type": "start", "session_id": session_id,

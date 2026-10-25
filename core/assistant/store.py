@@ -189,8 +189,35 @@ def read_audit(limit: int = 200) -> List[Dict[str, Any]]:
 
 
 # ----------------------------------------------------------------------------
-# 会话
+# 任务（会话）与空间（工作区）
 # ----------------------------------------------------------------------------
+# 对外一律叫「任务」，内部仍沿用 session 命名（会话文件、API 路径都不变），
+# 便于与 WorkBuddy 的「任务 / 空间」对齐而不改动既有数据。
+SESSION_PATCHABLE = ("title", "workspace", "pinned", "archived")
+
+
+def norm_workspace(path: Any) -> str:
+    """工作区路径归一化：分隔符统一为 /、去尾斜杠、盘符大写。
+
+    同一个目录可能以 E:\\x、E:/x、e:/x/ 三种形式出现，不归一化就会被拆成
+    三个「空间」，左栏会出现三条同名目录。
+    """
+    p = str(path or "").strip().replace("\\", "/")
+    while "//" in p:
+        p = p.replace("//", "/")
+    p = p.rstrip("/")
+    if len(p) >= 2 and p[1] == ":":
+        p = p[0].upper() + p[1:]
+    return p
+
+
+def space_name(path: str) -> str:
+    """空间显示名：目录名（C:/ 这种根目录直接显示盘符）。"""
+    p = norm_workspace(path)
+    name = p.rsplit("/", 1)[-1]
+    return name or p
+
+
 def _session_path(sid: str) -> str:
     safe = "".join(c for c in (sid or "") if c.isalnum() or c in "-_")
     return os.path.join(SESSIONS_DIR, f"{safe}.json")
@@ -219,9 +246,33 @@ def load_session(sid: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
-    """会话摘要列表（按更新时间倒序）。"""
+def _session_summary(s: Dict[str, Any]) -> Dict[str, Any]:
+    """列表用的任务摘要（不含 messages，体量可控）。"""
+    msgs = s.get("messages") or []
+    preview = ""
+    for m in reversed(msgs):
+        if m.get("role") in ("user", "assistant"):
+            preview = (m.get("content") or "").strip().replace("\n", " ")
+            if preview:
+                break
+    return {
+        "id": s.get("id"),
+        "title": s.get("title") or "新任务",
+        "created_at": s.get("created_at") or 0,
+        "updated_at": s.get("updated_at") or 0,
+        "message_count": len(msgs),
+        "workspace": norm_workspace(s.get("workspace")),
+        "pinned": bool(s.get("pinned")),
+        "archived": bool(s.get("archived")),
+        "preview": preview[:60],
+    }
+
+
+def list_sessions(limit: int = 50, include_archived: bool = False,
+                  workspace: str = "") -> List[Dict[str, Any]]:
+    """任务摘要列表：置顶优先，其余按最近活动倒序（归档默认不出现）。"""
     ensure_dirs()
+    want_ws = norm_workspace(workspace)
     items: List[Dict[str, Any]] = []
     for fn in os.listdir(SESSIONS_DIR):
         if not fn.endswith(".json"):
@@ -229,13 +280,76 @@ def list_sessions(limit: int = 50) -> List[Dict[str, Any]]:
         try:
             with open(os.path.join(SESSIONS_DIR, fn), "r", encoding="utf-8") as f:
                 s = json.load(f)
-            items.append({"id": s.get("id"), "title": s.get("title") or "新会话",
-                          "updated_at": s.get("updated_at", 0),
-                          "message_count": len(s.get("messages") or [])})
+            if not isinstance(s, dict):
+                continue
+            row = _session_summary(s)
+            if row.get("archived") and not include_archived:
+                continue
+            if want_ws and row.get("workspace") != want_ws:
+                continue
+            items.append(row)
         except Exception:
             continue
-    items.sort(key=lambda x: x.get("updated_at", 0), reverse=True)
+    # 置顶的永远在最前（WorkBuddy 的「置顶」语义），组内再按最近活动排
+    items.sort(key=lambda x: (not x.get("pinned"), -(x.get("updated_at") or 0)))
     return items[:limit]
+
+
+def space_list(sessions: Optional[List[Dict[str, Any]]] = None,
+               fallback: str = "") -> List[Dict[str, Any]]:
+    """把任务按所属空间（工作区目录）分组，供左栏「空间」区渲染。
+
+    sessions 为空时自己读一次；fallback 是当前工作区，历史任务没有记录
+    workspace 字段（1.0.8 之前建的）就归到它名下，避免出现「无归属」空组。
+    """
+    rows = list_sessions(500, False) if sessions is None else sessions
+    fb = norm_workspace(fallback)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for s in rows:
+        ws = norm_workspace(s.get("workspace")) or fb or "（未归属）"
+        # 归位后的空间写回摘要：前端/外部 API 拿到的任务都带明确归属，
+        # 不必各自再实现一遍 fallback。
+        s = dict(s)
+        s["workspace"] = ws
+        groups.setdefault(ws, []).append(s)
+    out: List[Dict[str, Any]] = []
+    for ws, tasks in groups.items():
+        tasks.sort(key=lambda x: (not x.get("pinned"), -(x.get("updated_at") or 0)))
+        out.append({
+            "path": ws,
+            "name": space_name(ws),
+            "exists": ws == "（未归属）" or os.path.isdir(ws),
+            "count": len(tasks),
+            "pinned": sum(1 for t in tasks if t.get("pinned")),
+            "updated_at": max((t.get("updated_at") or 0) for t in tasks),
+            "tasks": tasks,
+        })
+    out.sort(key=lambda g: -(g.get("updated_at") or 0))
+    return out
+
+
+def update_session(sid: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """改任务属性（标题 / 所属空间 / 置顶 / 归档），返回更新后的整条会话。
+
+    刻意不动 updated_at：重命名或置顶如果刷新了「最近活动」时间，
+    任务会莫名跳到列表最前面，与 WorkBuddy 的行为不一致。
+    """
+    s = load_session(sid)
+    if s is None:
+        return None
+    for key in SESSION_PATCHABLE:
+        if key not in (patch or {}):
+            continue
+        val = patch[key]
+        if key == "title":
+            val = str(val or "").strip()[:80] or s.get("title") or "新任务"
+        elif key == "workspace":
+            val = norm_workspace(val)
+        else:
+            val = bool(val)
+        s[key] = val
+    save_session(s)
+    return s
 
 
 def delete_session(sid: str) -> bool:

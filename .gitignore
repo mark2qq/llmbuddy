@@ -48,3 +48,7 @@ Thumbs.db
 /test_*.json
 /test_stream.txt
 /qa_*.py
+
+# ---- 助理工作区产物（运行时生成，不进版本库）----
+/newspace/
+/智能助理功能开发.txt
