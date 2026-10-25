@@ -29,7 +29,8 @@ import time  # noqa: E402
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QObject, Signal  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
+                               QMessageBox)
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -46,8 +47,15 @@ def _pump(cond, timeout=3.0):
 
 
 class _Cfg:
+    def __init__(self):
+        self.assistant_workspace = ""     # 本机记的上次工作区
+        self.saved = 0
+
     def gateway_url(self):
         return "http://127.0.0.1:8000"
+
+    def save(self):
+        self.saved += 1
 
     api_key = ""
 
@@ -60,7 +68,11 @@ class _Api:
 class _FakeAssistApi:
     def __init__(self, *a, **kw):
         self.saved = {}
+        self.save_calls = []
+        self.save_error = ""      # 非空则 save_settings 抛错（模拟后端拒绝）
         self.approvals = []
+        self.deleted = []
+        self.created = 0
 
     def state(self):
         return {
@@ -93,6 +105,7 @@ class _FakeAssistApi:
         return [{"id": "s1", "title": "历史会话", "message_count": 2}]
 
     def new_session(self):
+        self.created += 1
         return {"id": "s-new", "title": "新会话"}
 
     def session(self, sid):
@@ -101,9 +114,13 @@ class _FakeAssistApi:
             {"role": "assistant", "content": "在的，需要我做什么？"}]}
 
     def delete_session(self, sid):
+        self.deleted.append(sid)
         return {"deleted": True}
 
     def save_settings(self, patch):
+        self.save_calls.append(dict(patch))
+        if self.save_error:
+            raise RuntimeError(self.save_error)
         self.saved.update(patch)
         return patch
 
@@ -293,6 +310,402 @@ def test_manager_lists_fill_from_state(page):
     assert p._mcp_list.count() == 1
     assert _pump(lambda: p._all_sess_list.count() == 1)
     dlg.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# 会话删除（问题反馈：会话无法删除）
+# ---------------------------------------------------------------------------
+class _FakeMB:
+    """替代 QMessageBox：不弹真模态框，只记录调用并返回预设结果。"""
+
+    StandardButton = QMessageBox.StandardButton
+    answer = QMessageBox.StandardButton.Yes
+    calls = []
+
+    @classmethod
+    def question(cls, parent, title, text, *a, **kw):
+        cls.calls.append(("question", parent, title, text))
+        return cls.answer
+
+    @classmethod
+    def information(cls, parent, title, text, *a, **kw):
+        cls.calls.append(("information", parent, title, text))
+        return QMessageBox.StandardButton.Ok
+
+    @classmethod
+    def warning(cls, parent, title, text, *a, **kw):
+        cls.calls.append(("warning", parent, title, text))
+        return QMessageBox.StandardButton.Ok
+
+
+def _open_manager(p):
+    from ui.pages.assistant_page import ManagerDialog
+    if p._manager is None:
+        p._manager = ManagerDialog(p)
+    p._fill_sessions()
+    assert _pump(lambda: p._all_sess_list.count() >= 1)
+    return p._manager
+
+
+def test_delete_without_selection_shows_hint(page, monkeypatch):
+    """没选中就点删除：必须给提示，不能静默返回（否则看着像按钮坏了）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    p, fake = page
+    _open_manager(p)
+    p._all_sess_list.setCurrentItem(None)
+    p._sel_sid = ""
+    p._delete_session()
+    assert fake.deleted == []
+    assert _FakeMB.calls and _FakeMB.calls[-1][0] == "information"
+
+
+def test_delete_selected_session_calls_api(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    _FakeMB.answer = QMessageBox.StandardButton.Yes
+    p, fake = page
+    _open_manager(p)
+    p._all_sess_list.setCurrentRow(0)
+    p._on_all_sess_clicked(p._all_sess_list.item(0))
+    p._delete_session()
+    assert _pump(lambda: fake.deleted == ["s1"])
+
+
+def test_delete_confirm_uses_visible_dialog_parent(page, monkeypatch):
+    """确认框的父窗口必须是可见的管理面板，否则会被模态层挡住 → 看起来「点了没反应」。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    p, _fake = page
+    dlg = _open_manager(p)
+    dlg.show()
+    try:
+        assert p._dialog_parent() is dlg
+        p._all_sess_list.setCurrentRow(0)
+        p._delete_session()
+        kinds = [c[0] for c in _FakeMB.calls]
+        assert "question" in kinds
+        question = next(c for c in _FakeMB.calls if c[0] == "question")
+        assert question[1] is dlg          # parent 是管理面板，不是页面
+    finally:
+        dlg.hide()
+
+
+def test_delete_current_session_recreates(page):
+    """删掉的正好是当前会话：清空对话并新开一个，界面不能停在已删除的会话上。"""
+    p, fake = page
+    before = p._session_id
+    created = fake.created
+    p._on_session_deleted({"deleted": True}, before)
+    assert p._session_id != before
+    assert _pump(lambda: fake.created == created + 1)
+
+
+def test_delete_failure_reports_instead_of_silent(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    p, fake = page
+    _open_manager(p)
+    before = list(fake.deleted)
+    p._on_session_deleted({"deleted": False}, "s1")
+    assert fake.deleted == before
+    assert _FakeMB.calls and _FakeMB.calls[-1][0] == "warning"
+
+
+def test_selection_survives_list_refresh(page):
+    """列表被 refresh 重建后仍保持选中：否则刚选中就刷新，点删除会像没反应。"""
+    p, _fake = page
+    _open_manager(p)
+    rows = [{"id": "a", "title": "A", "message_count": 1},
+            {"id": "b", "title": "B", "message_count": 2}]
+    p._apply_sessions(rows)
+    p._sel_sid = "b"
+    p._apply_sessions(rows)          # 模拟后台刷新
+    cur = p._all_sess_list.currentItem()
+    assert cur is not None
+    assert cur.data(0x0100) == "b"
+
+
+def test_sweep_empty_sessions_removes_only_empty(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    _FakeMB.answer = QMessageBox.StandardButton.Yes
+    p, fake = page
+    p._session_id = "k1"
+    p._session_rows = [
+        {"id": "e1", "title": "新会话", "message_count": 0},
+        {"id": "e2", "title": "新会话", "message_count": 0},
+        {"id": "k1", "title": "有内容", "message_count": 3},
+    ]
+    p._sweep_empty_sessions()
+    assert _pump(lambda: sorted(fake.deleted) == ["e1", "e2"])
+
+
+def test_new_session_reuses_empty_current(page):
+    """当前会话本来就空时，点「新会话」不再新建，避免攒一堆空会话。"""
+    p, fake = page
+    p._session_rows = [{"id": p._session_id, "title": "新会话",
+                        "message_count": 0}]
+    created = fake.created
+    p._new_session()
+    assert fake.created == created          # 复用，没新建
+
+
+# ---------------------------------------------------------------------------
+# 工作区切换（问题反馈：选工作区闪退 / 重开不接上次工作区）
+#
+# 两个真实坑：
+#   1) 原生目录选择框（系统 shell 弹）在冻结包/远程桌面下会把主窗口一起带走，
+#      且没有任何 Python 异常记录（crash.log 为空）→ 必须走 Qt 自绘对话框；
+#   2) 选中后如果只发后端 PUT，请求没落地进程就没了 → 下次打开接不上。
+#      所以选中要「先写本机 config，再同步后端」。
+# ---------------------------------------------------------------------------
+class _FakeFD:
+    """替代 QFileDialog：返回可编程的假对话框，不真的弹窗。"""
+
+    Option = QFileDialog.Option
+    DialogLabel = QFileDialog.DialogLabel
+    FileMode = QFileDialog.FileMode
+    AcceptMode = QFileDialog.AcceptMode
+    result = QDialog.DialogCode.Accepted
+    path = ""
+    last = None
+
+    def __init__(self, *a, **kw):
+        self.opts = {}
+        self.labels = {}
+        self.mode = None
+        self.accept_mode = None
+        self.name_filter = ""
+        self.selected = ""
+        _FakeFD.last = self
+
+    def setOption(self, opt, on=True):
+        self.opts[opt] = on
+
+    def setFileMode(self, mode):
+        self.mode = mode
+
+    def setAcceptMode(self, mode):
+        self.accept_mode = mode
+
+    def setNameFilter(self, flt):
+        self.name_filter = flt
+
+    def selectFile(self, name):
+        self.selected = name
+
+    def setLabelText(self, which, text):
+        self.labels[which] = text
+
+    def exec(self):
+        return _FakeFD.result
+
+    def selectedFiles(self):
+        return [_FakeFD.path] if _FakeFD.path else []
+
+
+@pytest.fixture(autouse=True)
+def _reset_fd():
+    """假对话框的类属性会被上一个用例污染，逐个用例重置。"""
+    _FakeFD.result = QDialog.DialogCode.Accepted
+    _FakeFD.path = ""
+    _FakeFD.last = None
+    yield
+
+
+def _mkdir(tmp_path, name="newws"):
+    d = tmp_path / name
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def test_choose_workspace_saves_and_updates_button(page, monkeypatch, tmp_path):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    target = _mkdir(tmp_path)
+    _FakeFD.path = target
+    p, fake = page
+    p._choose_workspace()
+    # 按钮立刻跟着变，不用等后端 refresh 回来（避免「选完像没接上」）
+    assert p._ws_btn.text() == "newws"
+    assert _pump(lambda: fake.saved.get("workspace") == target)
+
+
+def test_choose_workspace_uses_qt_dialog_not_native(page, monkeypatch, tmp_path):
+    """必须显式关掉原生目录框：冻结包里原生框会把主窗口一起带走（无 crash.log）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    _FakeFD.path = _mkdir(tmp_path)
+    _FakeFD.result = QDialog.DialogCode.Accepted
+    p, _fake = page
+    p._choose_workspace()
+    dlg = _FakeFD.last
+    assert dlg.opts[QFileDialog.Option.DontUseNativeDialog] is True
+    assert dlg.opts[QFileDialog.Option.ShowDirsOnly] is True
+    assert dlg.mode == QFileDialog.FileMode.Directory
+    # 自绘框文案写死中文，不依赖 Qt 翻译文件是否随包
+    assert dlg.labels[QFileDialog.DialogLabel.Accept] == "选择此文件夹"
+    assert dlg.labels[QFileDialog.DialogLabel.LookIn] == "位置："
+
+
+def test_choose_workspace_writes_local_config_first(page, monkeypatch, tmp_path):
+    """选中即写本机 config：后端同步失败 / 进程中途退出，下次仍能接上。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    target = _mkdir(tmp_path)
+    _FakeFD.path = target
+    p, fake = page
+    fake.save_error = "后端未启动"
+    before = p.config.saved
+    p._choose_workspace()
+    assert p.config.assistant_workspace == target      # 早已落盘
+    assert p.config.saved == before + 1
+    assert _pump(lambda: "未接受" in p._status.text())  # 同步失败要有说明
+    assert any(c[0] == "warning" for c in _FakeMB.calls)
+
+
+def test_choose_workspace_cancel_does_nothing(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    _FakeFD.path = ""
+    _FakeFD.result = QDialog.DialogCode.Rejected
+    p, fake = page
+    before = dict(fake.saved)
+    p._choose_workspace()
+    assert fake.saved == before
+    assert p._ws_btn.text() == "ws"
+    assert p.config.assistant_workspace in ("", None)
+
+
+def test_choose_workspace_rejects_missing_dir(page, monkeypatch, tmp_path):
+    """选到不可用目录（被删 / 盘拔了）时给提示，不能把坏路径同步给后端。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    _FakeFD.path = str(tmp_path / "not-exists")
+    p, fake = page
+    before = dict(fake.saved)
+    p._choose_workspace()
+    assert fake.saved == before
+    assert _FakeMB.calls and _FakeMB.calls[-1][0] == "warning"
+
+
+def test_workspace_restored_on_refresh(page):
+    """重开/切回页面时，底栏工作区必须显示后端保存的那个，而不是默认值。"""
+    p, _fake = page
+    st = dict(p._state)
+    st["workspace"] = r"E:\llm-service\newspace"
+    p._apply_state(st)
+    assert p._ws_btn.text() == "newspace"
+    assert "newspace" in p._ws_btn.toolTip()
+
+
+def test_workspace_falls_back_to_local_memory(page, tmp_path):
+    """后端回报空工作区时用本机记忆顶住，并把这次选择补同步给后端。"""
+    p, fake = page
+    target = _mkdir(tmp_path)
+    p.config.assistant_workspace = target
+    st = dict(p._state)
+    st["workspace"] = ""
+    p._apply_state(st)
+    assert p._ws_btn.text() == "newws"
+    assert _pump(lambda: {"workspace": target} in fake.save_calls)
+
+
+def test_workspace_sync_runs_only_once(page, tmp_path):
+    """补同步只做一次，免得每次 refresh 都发一次 PUT。"""
+    p, fake = page
+    target = _mkdir(tmp_path)
+    p.config.assistant_workspace = target
+    st = dict(p._state)
+    st["workspace"] = ""
+    p._apply_state(st)
+    assert _pump(lambda: fake.save_calls.count({"workspace": target}) == 1)
+    p._apply_state(st)
+    p._apply_state(st)
+    assert fake.save_calls.count({"workspace": target}) == 1
+
+
+def test_no_native_file_dialog_static_calls():
+    """页面里禁止再出现原生文件对话框的静态调用。
+
+    本机冻结包一调原生框就以 `0x8001010E RPC_E_WRONG_THREAD` 崩掉进程
+    （crash.log 有栈：`_attach_file → QFileDialog.getOpenFileName`），
+    表现就是「点 + / 点工作区直接闪退」。全部走 `_pick_file` 自绘框。
+    """
+    import inspect
+    from ui.pages import assistant_page as mod
+    src = inspect.getsource(mod)
+    for bad in ("getOpenFileName(", "getSaveFileName(", "getExistingDirectory("):
+        assert bad not in src, f"仍有原生文件对话框调用：{bad}"
+
+
+def test_pick_file_sets_non_native_and_labels(page, monkeypatch, tmp_path):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    target = str(tmp_path / "a.md")
+    _FakeFD.path = target
+    p, _fake = page
+    got = p._pick_file("把文件加进这次提问", "", "所有文件 (*.*)")
+    assert got == target
+    dlg = _FakeFD.last
+    assert dlg.opts[QFileDialog.Option.DontUseNativeDialog] is True
+    assert dlg.labels[QFileDialog.DialogLabel.Accept] == "选择"
+    assert dlg.mode == QFileDialog.FileMode.ExistingFile
+
+
+def test_pick_file_save_mode(page, monkeypatch, tmp_path):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    _FakeFD.path = str(tmp_path / "repo.zip")
+    p, _fake = page
+    got = p._pick_file("导出技能包", "", "技能包 (*.zip)", save=True,
+                       default_name="repo.zip")
+    assert got.endswith("repo.zip")
+    dlg = _FakeFD.last
+    assert dlg.accept_mode == QFileDialog.AcceptMode.AcceptSave
+    assert dlg.selected == "repo.zip"
+    assert dlg.labels[QFileDialog.DialogLabel.Accept] == "选择"
+
+
+def test_attach_file_inserts_path(page, monkeypatch, tmp_path):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    target = str(tmp_path / "note.md")
+    _FakeFD.path = target
+    p, _fake = page
+    p._attach_file()
+    assert p._input.toPlainText().strip() == f"@{target}"
+
+
+def test_attach_file_cancel_keeps_input(page, monkeypatch):
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QFileDialog", _FakeFD)
+    _FakeFD.path = ""
+    _FakeFD.result = QDialog.DialogCode.Rejected
+    p, _fake = page
+    p._input.setPlainText("原有内容")
+    p._attach_file()
+    assert p._input.toPlainText() == "原有内容"
+
+
+def test_workspace_error_from_backend_shows_status(page):
+    """后端工作区不可创建（拔盘/无权限）时提示出来，而不是静默当作正常。"""
+    p, _fake = page
+    st = dict(p._state)
+    st["workspace_error"] = "工作区不可用：Z:\\gone"
+    p._apply_state(st)
+    assert "工作区不可用" in p._status.text()
+
 
 
 # ---------------------------------------------------------------------------

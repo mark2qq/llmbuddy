@@ -90,6 +90,12 @@ class AssistantPage(QWidget):
         self._active_model = ""
         self._skill_slug = ""
         self._model_cache: Dict[str, List[str]] = {}
+        # 管理面板 / 会话列表：记住用户选中的会话与最近一次列表快照
+        # （列表会被 refresh 重建，重建瞬间 currentItem 为 None，必须靠 _sel_sid 兜底）
+        self._sel_sid = ""
+        self._session_rows: List[Dict[str, Any]] = []
+        # 工作区自愈：本机记忆与后端不一致时，每个页面实例只补同步一次，避免刷新循环
+        self._ws_synced = False
         # 管理面板懒创建（会话/技能/工具/MCP/审计 tab 在里面）
         self._manager: Optional["ManagerDialog"] = None
         self._spin_i = 0
@@ -334,11 +340,48 @@ class AssistantPage(QWidget):
         pos = anchor.mapToGlobal(QPoint(0, 0))
         menu.exec(QPoint(pos.x(), pos.y() - size.height() - 6))
 
+    # ---------------- 文件选择（统一入口，禁止原生对话框） ----------------
+    def _pick_file(self, title: str, start: str = "",
+                   name_filter: str = "所有文件 (*.*)", save: bool = False,
+                   default_name: str = "", accept_text: str = "选择") -> str:
+        """统一的文件选择入口，返回选中路径（取消返回 ""）。
+
+        **必须 DontUseNativeDialog**：本机冻结包里，系统原生文件对话框一调用就
+        以 `0x8001010E RPC_E_WRONG_THREAD`（COM 套间错误）直接杀掉进程，
+        crash.log 留有栈：`_attach_file → QFileDialog.getOpenFileName`。
+        表现为「点 + 或点工作区就闪退」且没有任何 Python 异常。自绘框没有这条
+        路径依赖，最坏情况只是不弹出。同时标签写死中文，不依赖 Qt 翻译文件。
+        """
+        try:
+            fd = QFileDialog(self._dialog_parent(), title, start)
+            fd.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            fd.setNameFilter(name_filter)
+            if save:
+                fd.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+                fd.setFileMode(QFileDialog.FileMode.AnyFile)
+                if default_name:
+                    fd.selectFile(default_name)
+            else:
+                fd.setFileMode(QFileDialog.FileMode.ExistingFile)
+            fd.setLabelText(QFileDialog.DialogLabel.LookIn, "位置：")
+            fd.setLabelText(QFileDialog.DialogLabel.FileName,
+                            "文件名：" if save else "文件：")
+            fd.setLabelText(QFileDialog.DialogLabel.FileType, "类型：")
+            fd.setLabelText(QFileDialog.DialogLabel.Accept, accept_text)
+            fd.setLabelText(QFileDialog.DialogLabel.Reject, "取消")
+            if fd.exec() != QDialog.DialogCode.Accepted:
+                return ""
+            picked = fd.selectedFiles()
+            return str(picked[0]) if picked else ""
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"打开文件选择框失败：{e}")
+            return ""
+
     def _attach_file(self) -> None:
         """把本机文件作为上下文插入输入框（@路径），模型可用 fs_read 打开。"""
         start = self._state.get("workspace") or os.path.expanduser("~")
-        path, _ = QFileDialog.getOpenFileName(self, "把文件加进这次提问", start,
-                                              "所有文件 (*.*)")
+        path = self._pick_file("把文件加进这次提问", start, "所有文件 (*.*)",
+                               accept_text="添加")
         if not path:
             return
         cur = self._input.toPlainText().rstrip()
@@ -437,23 +480,157 @@ class AssistantPage(QWidget):
         lay.setSpacing(6)
         lay.addWidget(self._hint(
             f"左栏只直接显示最近 {NAV_MAX_SESSIONS} 条，完整历史在这里。"
-            "双击可打开会话。"))
+            "点选后可打开或删除（也支持右键菜单）。"))
         self._all_sess_list = QListWidget()
+        self._all_sess_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection)
+        self._all_sess_list.itemClicked.connect(self._on_all_sess_clicked)
         self._all_sess_list.itemDoubleClicked.connect(self._load_session_item)
+        self._all_sess_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._all_sess_list.customContextMenuRequested.connect(
+            self._show_sess_menu)
         lay.addWidget(self._all_sess_list, 1)
+
         row = QHBoxLayout()
         b_new = QPushButton("新会话")
         b_new.clicked.connect(lambda: self._new_session())
         b_open = QPushButton("打开")
-        b_open.clicked.connect(
-            lambda: self._load_session_item(self._all_sess_list.currentItem()))
+        b_open.clicked.connect(self._open_selected_session)
         b_del = QPushButton("删除")
+        b_del.setToolTip("删除选中的会话（单个）")
         b_del.clicked.connect(self._delete_session)
+        b_sweep = QPushButton("清理空会话")
+        b_sweep.setToolTip("批量删除 0 条消息的空会话（不含当前会话）")
+        b_sweep.clicked.connect(self._sweep_empty_sessions)
         for b in (b_new, b_open, b_del):
             row.addWidget(b)
         row.addStretch(1)
+        row.addWidget(b_sweep)
         lay.addLayout(row)
         return w
+
+    # ---------------- 会话列表：选中 / 打开 / 删除 ----------------
+    def _on_all_sess_clicked(self, item) -> None:
+        sid = item.data(Qt.UserRole) if item is not None else None
+        self._sel_sid = str(sid) if sid else ""
+
+    def _selected_session_sid(self) -> str:
+        """当前要操作的会话：优先列表选中项，其次记住的选中，最后当前会话。
+
+        列表会被 refresh 重建，重建瞬间 currentItem() 为 None；如果只认
+        currentItem()，用户「刚选中就被刷新」后点删除就会静默失败
+        （问题反馈：会话无法删除）。这里用 _sel_sid 兜底。
+        """
+        lst = getattr(self, "_all_sess_list", None)
+        item = lst.currentItem() if lst is not None else None
+        sid = item.data(Qt.UserRole) if item is not None else None
+        return str(sid) if sid else (self._sel_sid or "")
+
+    def _open_selected_session(self) -> None:
+        lst = getattr(self, "_all_sess_list", None)
+        item = lst.currentItem() if lst is not None else None
+        if item is None:
+            self._warn_no_selection("打开")
+            return
+        self._load_session_item(item)
+
+    def _warn_no_selection(self, action: str) -> None:
+        QMessageBox.information(
+            self._dialog_parent(), f"{action}会话",
+            "请先在列表里点选一个会话，再点这个按钮。")
+
+    def _dialog_parent(self) -> QWidget:
+        """当前可见的顶层窗口。
+
+        管理面板是 exec() 起来的模态窗口。确认框/提示框如果还挂在被它遮住的
+        页面上，弹窗会跑到面板背后 —— 用户看到的就是「点删除毫无反应」。
+        """
+        if self._manager is not None and self._manager.isVisible():
+            return self._manager
+        return self
+
+    def _delete_session(self) -> None:
+        lst = getattr(self, "_all_sess_list", None)
+        item = lst.currentItem() if lst is not None else None
+        sid = self._selected_session_sid()
+        if not sid:
+            self._warn_no_selection("删除")
+            return
+        raw = (item.text() if item is not None else "") or ""
+        title = raw.split("（")[0].strip() or "该会话"
+        ans = QMessageBox.question(
+            self._dialog_parent(), "删除会话",
+            f"确定删除「{title}」？\n删除后无法恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._set_status(f"正在删除「{title}」…")
+        w = Worker(self._assist.delete_session, sid)
+        w.result.connect(lambda res, s=sid: self._on_session_deleted(res, s))
+        w.error.connect(self._on_session_delete_failed)
+        w.start()
+
+    def _on_session_deleted(self, res, sid: str) -> None:
+        if not (isinstance(res, dict) and res.get("deleted")):
+            self._on_session_delete_failed("后端未确认删除（会话可能已不存在）")
+            return
+        if self._sel_sid == sid:
+            self._sel_sid = ""
+        if sid == self._session_id:
+            # 删的是当前会话：清空并新开一个，否则界面停在一条已删除的会话上
+            self._session_id = ""
+            self._clear_chat()
+            self._new_session(silent=True)
+        else:
+            self._fill_sessions()
+        self._set_status("会话已删除")
+
+    def _on_session_delete_failed(self, msg: str) -> None:
+        self._set_status(f"删除失败：{msg}")
+        QMessageBox.warning(self._dialog_parent(), "删除会话",
+                            f"删除失败：{msg}")
+
+    def _sweep_empty_sessions(self) -> None:
+        """清掉 0 条消息的空会话。
+
+        反复点「新会话」或反复切页会自动建会话，列表里会攒一堆「新会话（0 条）」，
+        单个删除太慢，这里给个一键清理（当前会话永远保留）。
+        """
+        empties = [s for s in self._session_rows
+                   if not s.get("message_count") and s.get("id") != self._session_id]
+        if not empties:
+            QMessageBox.information(self._dialog_parent(), "清理空会话",
+                                    "没有可清理的空会话。")
+            return
+        ans = QMessageBox.question(
+            self._dialog_parent(), "清理空会话",
+            f"将删除 {len(empties)} 个 0 条消息的空会话，确定？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        for s in empties:
+            Worker(self._assist.delete_session, str(s.get("id"))).start()
+        self._set_status(f"正在清理 {len(empties)} 个空会话…")
+        QTimer.singleShot(800, self._fill_sessions)
+
+    def _show_sess_menu(self, pos) -> None:
+        lst = getattr(self, "_all_sess_list", None)
+        if lst is None:
+            return
+        item = lst.itemAt(pos)
+        if item is None:
+            return
+        lst.setCurrentItem(item)
+        self._on_all_sess_clicked(item)
+        menu = QMenu(self)
+        menu.setObjectName("ModelMenu")
+        act_open = menu.addAction("打开")
+        act_open.triggered.connect(lambda _c=False: self._load_session_item(item))
+        act_del = menu.addAction("删除")
+        act_del.triggered.connect(lambda _c=False: self._delete_session())
+        menu.exec(lst.mapToGlobal(pos))
 
     def _build_skills_tab(self) -> QWidget:
         w = QWidget()
@@ -569,6 +746,20 @@ class AssistantPage(QWidget):
             return
         self._state = st
         ws = str(st.get("workspace") or "")
+        # 本机记忆兜底：后端可能因为「配置被重置 / PUT 没发出去（上次闪退）」
+        # 而回报空或默认工作区。上次的选择记在客户端 config.json 里，优先用它，
+        # 并顺手补同步给后端，避免「重开页面接不上上次工作区」。
+        mirror = str(getattr(self.config, "assistant_workspace", "") or "")
+        if mirror and os.path.isdir(mirror) and (
+                not ws or os.path.normcase(mirror) != os.path.normcase(ws)):
+            ws = mirror
+            self._sync_workspace_once(mirror)
+        elif ws and mirror and os.path.normcase(mirror) != os.path.normcase(ws):
+            # 后端有值但与本机记录不同：以后端为准，回写本机记录保持一致
+            self._remember_workspace(ws)
+        ws_err = str(st.get("workspace_error") or "")
+        if ws_err:
+            self._set_status(ws_err)
         ws_name = os.path.basename(ws.rstrip("\\/")) if ws else ""
         orch = "LangGraph 编排" if st.get("orchestrator") == "langgraph" else "顺序降级编排"
         self._subtitle.setText(f"{orch}   ·   工作区 {ws_name or '（未设置）'}")
@@ -602,7 +793,8 @@ class AssistantPage(QWidget):
     # ---------------- 底栏按钮文本 ----------------
     def _refresh_ws_btn(self, ws: str = "") -> None:
         """工作区按钮显示目录名（WorkBuddy 的「分支 master」位：当前上下文根）。"""
-        path = ws or str(self._state.get("workspace") or "")
+        path = (ws or str(self._state.get("workspace") or "")
+                or str(getattr(self.config, "assistant_workspace", "") or ""))
         name = os.path.basename(path.rstrip("\\/")) if path else ""
         if len(name) > 12:
             name = name[:11] + "…"
@@ -724,6 +916,7 @@ class AssistantPage(QWidget):
 
     def _apply_sessions(self, items) -> None:
         items = [s for s in (items or []) if isinstance(s, dict)]
+        self._session_rows = items        # 「清理空会话」靠这份快照
 
         # 左栏二级栏目：只显示最近 NAV_MAX_SESSIONS 条，点一条即切换
         nav = getattr(self, "_nav_sess", None)
@@ -750,21 +943,36 @@ class AssistantPage(QWidget):
         # 管理面板里的完整会话列表（面板未打开时为 None）
         lst = getattr(self, "_all_sess_list", None)
         if lst is not None:
+            # 选中态优先跟随用户手动选的那条，其次当前会话；
+            # 否则只要列表被刷新一下，用户刚选中的行就没了，点删除会像「没反应」
+            keep = self._sel_sid or self._session_id
+            lst.blockSignals(True)
             lst.clear()
             for s in items:
                 item = QListWidgetItem(f"{s.get('title') or '新会话'}   "
                                        f"（{s.get('message_count', 0)} 条）")
                 item.setData(Qt.UserRole, s.get("id"))
-                if s.get("id") == self._session_id:
-                    item.setSelected(True)
                 lst.addItem(item)
+                if s.get("id") == keep:
+                    item.setSelected(True)
+                    lst.setCurrentItem(item)   # 必须在 addItem 之后，否则不生效
             if not items:
                 lst.addItem("（还没有会话）")
+            lst.blockSignals(False)
 
     # ------------------------------------------------------------------ #
     # 会话
     # ------------------------------------------------------------------ #
     def _new_session(self, silent: bool = False) -> None:
+        # 当前会话本来就是空的（0 条消息）就直接复用，别再建一个：
+        # 反复点左栏「+」或来回切页会攒出一长串「新会话（0 条）」
+        cur = next((s for s in self._session_rows
+                    if s.get("id") == self._session_id), None)
+        if not silent and cur is not None and not cur.get("message_count"):
+            self._clear_chat()
+            self._greet()
+            self._set_status("当前已经是新会话")
+            return
         w = Worker(self._assist.new_session)
         w.result.connect(lambda s: self._on_session_created(s, silent))
         w.error.connect(lambda m: self._set_status(f"新建会话失败：{m}"))
@@ -774,6 +982,7 @@ class AssistantPage(QWidget):
         if not isinstance(session, dict) or not session.get("id"):
             return
         self._session_id = session["id"]
+        self._sel_sid = str(session["id"])      # 新会话立刻成为列表选中项
         self._clear_chat()
         self._greet()
         self._fill_sessions()
@@ -808,24 +1017,8 @@ class AssistantPage(QWidget):
                 bubble = ChatBubble(role, content)
                 self._append_widget(bubble)
         self._add_step("已载入历史会话")
+        self._sel_sid = str(self._session_id or "")
         self._fill_sessions()      # 同步左栏二级栏目的选中态
-
-    def _delete_session(self) -> None:
-        lst = getattr(self, "_all_sess_list", None)
-        item = lst.currentItem() if lst is not None else None
-        sid = item.data(Qt.UserRole) if item else None
-        if not sid:
-            return
-        if QMessageBox.question(self, "删除会话", "确定删除这个会话记录？") \
-                != QMessageBox.StandardButton.Yes:
-            return
-        w = Worker(self._assist.delete_session, sid)
-        w.result.connect(lambda _r: self._fill_sessions())
-        w.start()
-        if sid == self._session_id:
-            self._session_id = ""
-            self._clear_chat()
-            self._new_session(silent=True)
 
     # ------------------------------------------------------------------ #
     # 对话
@@ -1166,10 +1359,77 @@ class AssistantPage(QWidget):
         self._set_status(f"审批策略已更新：{label}")
 
     def _choose_workspace(self) -> None:
-        start = self._state.get("workspace") or os.path.expanduser("~")
-        path = QFileDialog.getExistingDirectory(self, "选择工作区", start)
+        """切换工作区（文件工具的沙箱根）。
+
+        两处容易翻车的点（用户反馈「选工作区闪退 / 重开不接上次工作区」）：
+          1) 原生目录选择框由系统 shell 弹，冻结包 / 远程桌面 / 某些安全软件下
+             会把主窗口一起带走；统一强制 Qt 自绘对话框（DontUseNativeDialog），
+             行为可控、深浅色一致，出问题也只是本对话框不显示，不牵连主窗口；
+          2) 选中后**先写本机 config.json 再发后端请求**。后端 PUT 可能因为
+             「后端未启动 / 目录不可创建」失败，甚至进程在同步途中退出——本地
+             先落盘，下次打开一定能接上上次的选择。
+        """
+        start = (self._state.get("workspace")
+                 or str(getattr(self.config, "assistant_workspace", "") or "")
+                 or os.path.expanduser("~"))
+        try:
+            dlg = QFileDialog(self._dialog_parent(), "选择工作区", start)
+            dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+            dlg.setFileMode(QFileDialog.FileMode.Directory)
+            # 自绘框的标签由 Qt 翻译文件给，缺项会留英文（"Look in:"），
+            # 这里直接写死中文，跟界面其余部分保持一致
+            dlg.setLabelText(QFileDialog.DialogLabel.LookIn, "位置：")
+            dlg.setLabelText(QFileDialog.DialogLabel.FileName, "目录：")
+            dlg.setLabelText(QFileDialog.DialogLabel.FileType, "类型：")
+            dlg.setLabelText(QFileDialog.DialogLabel.Accept, "选择此文件夹")
+            dlg.setLabelText(QFileDialog.DialogLabel.Reject, "取消")
+            ok = dlg.exec() == QDialog.DialogCode.Accepted
+            picked = dlg.selectedFiles() if ok else []
+            path = str(picked[0]) if picked else ""
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"打开目录选择框失败：{e}")
+            return
+        path = str(path or "").strip()
         if not path:
             return
+        if not os.path.isdir(path):
+            QMessageBox.warning(self._dialog_parent(), "工作区不可用",
+                                f"这个路径不是一个可用目录：\n{path}")
+            return
+        self._state["workspace"] = path
+        self._refresh_ws_btn(path)
+        self._remember_workspace(path)          # 先落盘（本地），后端同步在后
+        self._set_status(f"工作区已切换：{path}")
+        w = Worker(self._assist.save_settings, {"workspace": path})
+        w.result.connect(lambda _r: self.refresh())
+        w.error.connect(lambda m, p=path: self._on_workspace_save_failed(m, p))
+        w.start()
+
+    def _remember_workspace(self, path: str) -> None:
+        """把工作区写进本机 config.json（网络请求失败也保住这次选择）。"""
+        try:
+            self.config.assistant_workspace = path
+            save = getattr(self.config, "save", None)
+            if callable(save):
+                save()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_workspace_save_failed(self, msg: str, path: str) -> None:
+        """后端没接受工作区：本机记住的保留，界面回滚并说明原因。"""
+        self._set_status(f"工作区已记在本机，但后端未接受：{msg}")
+        QMessageBox.warning(
+            self._dialog_parent(), "工作区未生效",
+            f"已记住本机选择：\n{path}\n\n后端返回：{msg}\n\n"
+            "文件工具这次仍会用旧工作区。请确认服务已启动后再选一次。")
+        # 不在这里重试：_ws_synced 留给下一次 refresh 时补同步
+
+    def _sync_workspace_once(self, path: str) -> None:
+        """把本机记住的工作区补同步给后端（每个页面实例只尝试一次）。"""
+        if self._ws_synced or not path:
+            return
+        self._ws_synced = True
         self._state["workspace"] = path
         self._refresh_ws_btn(path)
         w = Worker(self._assist.save_settings, {"workspace": path})
@@ -1265,7 +1525,8 @@ class AssistantPage(QWidget):
         w.start()
 
     def _import_skill(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "导入技能包", "", "技能包 (*.zip)")
+        path = self._pick_file("导入技能包", "", "技能包 (*.zip)",
+                               accept_text="导入")
         if not path:
             return
 
@@ -1289,8 +1550,8 @@ class AssistantPage(QWidget):
         slug = item.data(Qt.UserRole) if item else None
         if not slug:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出技能包",
-                                              f"{slug}.zip", "技能包 (*.zip)")
+        path = self._pick_file("导出技能包", "", "技能包 (*.zip)", save=True,
+                               default_name=f"{slug}.zip", accept_text="导出")
         if not path:
             return
 

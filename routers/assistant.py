@@ -335,6 +335,11 @@ async def put_settings(body: Dict[str, Any]):
                 os.makedirs(ws, exist_ok=True)
             except OSError as e:
                 return fail(2010, f"工作区不可用：{e}")
+            if not os.path.isdir(ws):
+                return fail(2011, f"工作区不是目录：{ws}")
+            # 统一成绝对路径，避免 / 与 \ 混写导致客户端比对不上（判定「是不是
+            # 上次那个工作区」时用的是 normcase 比较）
+            patch["workspace"] = os.path.abspath(ws)
     cfg = save_config(patch)
     audit("settings_updated", keys=sorted(patch.keys()))
     return ok({k: cfg.get(k) for k in allowed})

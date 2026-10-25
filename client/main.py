@@ -66,6 +66,37 @@ _install_crash_handler()
 
 import traceback  # noqa: E402  (置于崩溃兜底之后)
 
+# ---------------------------------------------------------------------------
+# 原生崩溃兜底：faulthandler 把「访问违例 / 栈溢出 / 0xC0000409」这类**不是
+# Python 异常**的闪退，连同崩溃瞬间的调用栈一起追加到 crash.log。
+# 由来：用户反馈「点某个按钮就闪退」，但 crash.log 根本不存在、startup.log 也
+# 停在上一行 —— 说明进程是被 Windows 直接带走的。没有这份栈只能靠猜，加上它
+# 才能一次定位（也让后续同类问题有据可查）。
+# ---------------------------------------------------------------------------
+_FAULT_LOG = None
+
+
+def _enable_faulthandler() -> None:
+    global _FAULT_LOG
+    try:
+        import faulthandler
+        local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        log_dir = os.path.join(local, DATA_DIRNAME)
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "crash.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n=== session start %s ===\n"
+                    % time.strftime("%Y-%m-%d %H:%M:%S"))
+        # 句柄必须由模块级变量持有：局部变量回收后 faulthandler 就写不进去了
+        _FAULT_LOG = open(path, "a", buffering=1)
+        faulthandler.enable(file=_FAULT_LOG, all_threads=True)
+    except Exception:  # noqa: BLE001
+        _FAULT_LOG = None
+
+
+_enable_faulthandler()
+
+
 
 # ---------------------------------------------------------------------------
 # 启动里程碑日志：写 %LOCALAPPDATA%/llmBuddy/startup.log。
@@ -149,6 +180,46 @@ def resource_path(rel: str) -> str:
     return os.path.join(candidates[-1], rel)
 
 
+_TRANSLATORS: list = []
+
+
+def install_translations(app) -> None:
+    """加载 Qt 自带的中文翻译。
+
+    智能助理的「选择工作区」走的是 Qt 自绘对话框（见 assistant_page），
+    里面的 Look in / Directory / Choose / Cancel 等标准文案由 Qt 翻译文件
+    提供；不装翻译就是英文界面。冻结包内该文件位于
+    `_internal/PySide6/translations/qtbase_zh_CN.qm`，开发态在 site-packages。
+    """
+    try:
+        from PySide6.QtCore import QLibraryInfo, QTranslator
+    except Exception:  # noqa: BLE001
+        return
+    dirs = []
+    try:
+        dirs.append(QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import PySide6
+        base = os.path.dirname(PySide6.__file__)
+        dirs += [os.path.join(base, "translations"),
+                 os.path.join(getattr(sys, "_MEIPASS", base), "PySide6",
+                              "translations")]
+    except Exception:  # noqa: BLE001
+        pass
+    for name in ("qtbase_zh_CN", "qt_zh_CN"):
+        for d in dirs:
+            path = os.path.join(d or "", name + ".qm")
+            if not os.path.isfile(path):
+                continue
+            tr = QTranslator(app)
+            if tr.load(path):
+                app.installTranslator(tr)
+                _TRANSLATORS.append(tr)    # 必须持有，否则被回收后翻译失效
+            break
+
+
 def load_stylesheet(background_color: str = "") -> str:
     """加载主题样式：基线 styles.qss + 按背景色的覆盖（见 core.theme）。"""
     try:
@@ -192,6 +263,8 @@ def main() -> None:
     # 托盘应用：关闭/隐藏窗口不退出进程（仅托盘“退出”才真正退出）
     app.setQuitOnLastWindowClosed(False)
     _startup_log("QApplication created")
+    install_translations(app)
+    _startup_log("translations installed=%s" % bool(_TRANSLATORS))
 
     # 先载入配置：主题背景色需要它（Config.load 无副作用，可安全提前）
     config = Config.load()

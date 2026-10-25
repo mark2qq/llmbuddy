@@ -107,7 +107,14 @@ def load_config() -> Dict[str, Any]:
     if not ws:
         ws = DEFAULT_WORKSPACE
     cfg["workspace"] = ws
-    os.makedirs(ws, exist_ok=True)
+    # 工作区可能落在「拔掉的移动盘 / 断开的网络位置 / 无权限目录」上。
+    # 这里绝不能抛：load_config 被 state / settings / 对话全链路调用，一抛就是
+    # 整个助理模块 500 —— 客户端看到的是「后端未就绪」且工作区显示成空（用户
+    # 反馈的「重开页面接不上上次工作区」现象之一）。改为只记录错误、继续可用。
+    try:
+        os.makedirs(ws, exist_ok=True)
+    except OSError as e:
+        cfg["workspace_error"] = f"工作区不可用：{ws}（{e}）"
     return cfg
 
 
@@ -118,6 +125,8 @@ def save_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cur.update(cfg or {})
     if cur.get("policy") not in POLICIES:
         cur["policy"] = DEFAULT_POLICY
+    # workspace_error 是运行期探测结果，不写进 config.json
+    cur.pop("workspace_error", None)
     with _LOCK:
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:

@@ -113,6 +113,7 @@ class Assistant:
             "policy": cfg.get("policy"),
             "policies": [{"id": k, "label": v} for k, v in POLICY_TEXT.items()],
             "workspace": cfg.get("workspace"),
+            "workspace_error": cfg.get("workspace_error") or "",
             "active_provider": cfg.get("active_provider"),
             "providers": [{"id": p.get("id"), "label": p.get("label"),
                            "kind": p.get("kind"), "enabled": p.get("enabled"),
