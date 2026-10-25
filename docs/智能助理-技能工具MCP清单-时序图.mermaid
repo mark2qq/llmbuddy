@@ -1,0 +1,352 @@
+%% 智能助理 · 技能 / 工具 / MCP 清单中心 —— 时序图 + 类图
+%% 源：docs/智能助理-技能工具MCP清单-架构设计.md（结论以此为准）
+%% 图 1：在线安装 MCP（含缓存命中、代理、必填 env、连接失败保留配置）
+%% 图 2：按需求自动加载（profile 匹配 → 同源裁剪 → start.auto_loaded → StepLine）
+%% 图 3：在线安装技能（原子写入 + 回滚）
+%% 图 4：类图（CatalogClient / SkillInstaller / ToolFilter / ProfileMatcher）
+
+%% ===========================================================================
+%% 图 1：在线安装 MCP
+%% ===========================================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant P as AssistantPage<br/>(assistant_page.py)
+    participant API as AssistantApi<br/>(client)
+    participant R as routers/assistant.py
+    participant C as catalog.py
+    participant M as MCPManager<br/>(mcp.py)
+    participant S as store.py
+    participant H as 上游 Registry/HTTP
+
+    U->>P: 点 [MCP] →「从在线清单安装 MCP…」
+    P->>P: open_manager("mcp")  ●对话框非模态，不离开对话页
+    P->>API: catalog_mcp(q="", force=0)
+    API->>R: GET /api/v1/assistant/catalog/mcp
+    R->>C: list_mcp(cfg, q, cursor, force=False)
+    C->>C: _cache_read("mcp_servers.json")
+    alt 缓存存在
+        C-->>R: {items, fetched_at, stale:(not _fresh), error:""}
+        Note over C,R: 先返缓存；force=0 不联网 → 首屏 ≤ 2s
+    else 无缓存 or force=1
+        C->>C: _client(cfg) = httpx.Client(trust_env=False, proxy=…)  ★代理硬约束
+        C->>H: GET registry.modelcontextprotocol.io/v0/servers?limit=50&search=q
+        alt 200
+            H-->>C: {servers[], metadata.nextCursor}
+            C->>C: normalize_mcp_server(raw) ×N<br/>free_class_of(raw)
+            C->>C: _cache_write("mcp_servers.json", {fetched_at, cursor, items})
+            C-->>R: {items, cursor, fetched_at, stale:False, error:""}
+        else 000 连接失败 / 非 200
+            H-->>C: 异常
+            C-->>R: raise CatalogError(2020 或 2021)
+            R-->>API: ok? 否 → fail(code, 中文文案)
+            API-->>P: RuntimeError(message)
+            P->>P: 顶部提示条「无法连接在线目录…当前代理：{值} · 显示 {时间} 的缓存 · [重试]」
+            Note over P: 绝不出现空白页（P0-8 硬要求）
+        end
+    end
+    R-->>API: ok(data)
+    API-->>P: 列表 → 渲染卡片（title/description/传输徽标/免费标记）
+
+    U->>P: 点某卡的「安装」→ 确认框<br/>来源 name · 传输 · 是否需密钥 · 风险=high
+    U->>P: 填必填环境变量（isRequired 逐项）
+    P->>P: 缺一项 → 确定按钮禁用，逐项标红
+    P->>API: catalog_install_mcp({registry_name, id?, name?, env, risk:"high", connect:true})
+    API->>R: POST /api/v1/assistant/catalog/mcp/install
+    R->>C: build_mcp_config(item, server_id=_slugify(name), env=…)
+    C->>C: 比对 MCPManager.servers() 的 id → 冲突追加 -2
+    C-->>R: {id, name, transport, command, args, env, url, risk, enabled}
+    R->>M: add_server(cfg)  ●先落配置（connect=false 语义）
+    M->>S: save_config({mcp_servers: items}) ●原子写
+    R->>M: connect(id, get_assistant().registry())
+    alt 连接成功
+        M->>M: MCPClient.start() → tools/list → _register_tools(mcp__id__*)
+        M-->>R: {status:"connected", tools[]}
+        R->>S: audit("mcp_installed_online", server_id, registry_name, version, transport)
+        R-->>API: ok({server, connected:true, error:""})
+        P->>P: 状态栏「已安装并连接 {title}」+ refresh()
+    else 连接失败（npx 缺失 / env 不对）
+        M->>M: client.close(); _status[id]={status:"error", error}
+        M->>S: audit("mcp_connect_failed")
+        R->>S: audit("mcp_installed_online", …)
+        R-->>API: ok({server, connected:false, error:err[:200]})
+        Note over R,API: 配置保留（code 2025 语义），用户可就地修再连
+        P->>P: 卡片显示「× 连接失败」+ 错误摘要 200 字（可展开）；<br/>提示 npx 检测结果 + 官网链接
+    end
+
+%% ===========================================================================
+%% 图 2：按需求自动加载（profile 匹配 + 同源裁剪 + start.auto_loaded）
+%% ===========================================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant P as AssistantPage
+    participant API as AssistantStream
+    participant R as routers/assistant.py<br/>chat()
+    participant A as Assistant.start_turn<br/>(agent.py)
+    participant PM as profiles.py
+    participant REG as ToolRegistry<br/>(tools.py)
+    participant PR as provider
+
+    U->>P: 「帮我把下载目录整理一下」
+    P->>P: payload = {message: 原文,<br/>mounted_skills:[已挂载], stream:true}  ★A4 不再拼正文
+    P->>API: start(payload)
+    API->>R: POST /chat (SSE)
+    R->>R: mounted = body.get("mounted_skills")  (list str 或 None)
+    R->>A: start_turn(sid, text, provider, model, emit,<br/>mounted_skills=mounted)  ★尾参带默认值
+    A->>A: session["messages"].append({role:"user", content: 原文})<br/>●落库干净，无「用 xx 技能：」前缀
+    A->>A: cfg = load_config()  (含 tool_prefs / auto_load / profiles)
+
+    alt cfg.auto_load == true
+        A->>PM: match_profiles(text, cfg.profiles, available_skills)
+        PM->>PM: 中文子串（大小写不敏感）逐 profile 计命中数<br/>→ 命中最多者；平局取 priority<br/>→ 过滤不存在的 slug；全缺 → None
+        PM-->>A: profile = {id:"file-organize", name:"文件整理",<br/>skills:["workspace-organizer"],<br/>tools:[fs_list,…,skill_run], priority:10}
+        A->>A: 合并挂载：profile.skills + mounted_skills，上限 5
+        A->>A: profile_tools = profile.tools（额外白名单）
+    else auto_load == false
+        A->>A: profile = None; profile_tools = None
+        Note over A: 完全不自动加载（P0-6）
+    end
+
+    A->>REG: select_schemas(disabled=tool_prefs.disabled,<br/>allow=profile_tools, max_tools=tool_prefs.max_tools)
+    REG->>REG: active() = 未禁用 ∩ (allow 为空 或 在 allow 内)<br/>按 §6.2 优先级排序：内置low → web_fetch → skill_run<br/>→ 写类 → 高危 → MCP 工具
+    REG->>REG: 裁到 max_tools（默认 24）
+    REG-->>A: schemas  ← ★同源：一个列表对象
+    A->>A: registry.set_filter(...)  (供 /state 的 enabled 字段与 UI 一致)
+
+    A->>A: auto_loaded = {profile:"file-organize", name:"文件整理",<br/>skills:["workspace-organizer"], tools:len(schemas)}<br/>（未命中 → {}）
+    A->>A: emit({"type":"start", session_id, provider, label,<br/>"auto_loaded": auto_loaded})   ★agent.py:235
+
+    A->>A: messages = _build_messages(session, registry, cfg, schemas)<br/>●工具清单文字从同一份 schemas 渲染，去掉 [:80] 截断
+    alt 未命中任何 profile 且 auto_load
+        A->>A: system += "## 可用技能\n- 名称：一句话描述（≤20 条、每条≤30 字）"<br/>●L3 降级：工具白名单不变，模型自行 skill_run
+    end
+
+    A->>PR: chat(messages, tools=schemas, …)   ★同一个 schemas
+    PR-->>A: tool_calls=[{name:"skill_run", arguments:{name:"workspace-organizer",…}}]
+    A->>REG: risk_of("skill_run", args) → "medium"
+    A->>A: approval.request(sid, "skill_run", args, "medium")<br/>●自动加载不降低任何 risk（红线）
+    Note over A,P: 审批卡弹出（readonly_auto 下 medium 需确认）<br/>StepLine 文案已预告「运行时会请求你确认」
+    U->>P: 批准
+    A->>A: registry.call("skill_run", …) → orchestrator.run_skill<br/>●内部 exec_tool 复用同一函数 → 内部 fs_move 仍逐次审批
+    A->>A: emit({"type":"tool_result",…})
+
+    R-->>API: SSE: start(auto_loaded) → delta → tool_call → approval_request → … → done → end
+    API->>P: event(dict)
+    P->>P: _on_event: elif kind == "start": 读 ev["auto_loaded"]<br/>●新增分支，不动既有 session/delta 分支
+    alt auto_loaded 非空 且 (sid, profile) 未提示过
+        P->>P: _add_step_with_action(<br/>"已自动加载：文件整理 · 技能 workspace-organizer · 工具 7 个（运行时会请求你确认）",<br/>"关闭自动加载", self._disable_auto_load)<br/>●StepLine 不改，按钮用 #MiniBtn 并列
+        P->>P: self._auto_tips.add((sid, profile))  ●同任务同 profile 只提示一次
+    end
+    U->>P: 点「关闭自动加载」
+    P->>API: PUT /settings {"auto_load": false}
+    P->>P: 本次会话立即失效 + 状态栏「已关闭自动加载（可在设置里重新打开）」
+
+%% ===========================================================================
+%% 图 3：在线安装技能（原子写入 + 回滚）
+%% ===========================================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant P as AssistantPage
+    participant R as routers/assistant.py
+    participant C as catalog.py
+    participant SK as skills.py
+    participant FS as SKILLS_DIR
+    participant S as store.py
+
+    U->>P: 技能 Tab 点「安装」（或 [技能]→「从在线清单安装…」）
+    P->>P: 确认框：来源 owner/repo·dir / ⭐star / 文件数 /<br/>含 scripts 黄色警示 / 风险=medium
+    U->>P: 确认 [安装]（若已存在则先问 覆盖/取消）
+    P->>R: POST /catalog/skills/install {repo, ref, dir, slug, overwrite}
+    R->>C: fetch_skill_bundle(cfg, owner, repo, ref, dirpath)
+    C->>C: 读 gh_skills.json 缓存（TTL 7d）拿 tree
+    alt 缓存未命中
+        C->>C: GET /repos/{o}/{r}/git/trees/{ref}?recursive=1（trust_env=False+proxy）
+        C->>C: 找 **/SKILL.md；_cache_write("gh_skills.json")
+    end
+    C->>C: 取 SKILL.md + 同目录文本类附件<br/>（.md/.txt/.json/.yaml/.yml/.py；≤20 个；总 ≤2MB）
+    C->>C: parse_skill_md() 校验 frontmatter 有 name；>200KB 拒绝
+    C-->>R: {slug, files:{rel:text}, bytes, has_scripts, commit}<br/>●只在内存，不落盘
+    R->>SK: install_from_github(bundle, overwrite)
+    SK->>SK: 校验 slug ∈ _SLUG_RE；dir 无 ".."/盘符/绝对路径
+    SK->>FS: mkdir .installing-<uuid>   ●前缀 . 不被 list_skills 扫到（A8）
+    SK->>FS: 写 SKILL.md + 附件（**永不执行任何脚本**，只落文件）
+    alt 校验通过
+        alt 目标 <slug> 已存在
+            SK->>FS: rename <slug> → .backup-<ts>
+        end
+        SK->>FS: os.replace(.installing-<uuid>, <slug>)   ●原子
+        SK->>SK: prune_backups(keep=5)
+        R->>S: 写 config.skill_sources[slug]={repo,ref,dir,commit,has_scripts,installed_at}
+        R->>S: audit("skill_installed_online", slug, repo, ref, dir, commit, bytes, has_scripts, overwrite)
+        R-->>P: ok({slug, files, bytes, has_scripts, commit})
+        P->>P: refresh() → /state.skills 数量 +1；状态栏「已安装技能 X」
+    else 任一步失败
+        SK->>FS: rmtree .installing-<uuid>
+        SK->>FS: rename .backup-<ts> → <slug>   ●自动回滚
+        R->>S: audit("catalog_install_failed", kind="skill", target, error)
+        R-->>P: fail(2022|2023|2020, 文案)
+        P->>P: 对话框「安装失败：{原因}，已回滚到安装前状态」
+    end
+
+%% ===========================================================================
+%% 图 4：类图（新增 / 修改的类与关键方法）
+%% ===========================================================================
+classDiagram
+    class CatalogError {
+        +int code
+        +str message
+        +dict data
+    }
+
+    class CatalogClient {
+        <<catalog.py · 唯一出网点>>
+        +str proxy_url
+        +dict cfg
+        +client(timeout) httpx.Client   [trust_env=False + proxy]
+        +cache_read(name) dict
+        +cache_write(name, payload) None
+        +fresh(cache, ttl) bool
+        +list_mcp(q, cursor, force, limit) dict
+        +list_repos(q, force, per_page) dict
+        +list_repo_skills(owner, repo, ref, force) dict
+        +fetch_skill_bundle(owner, repo, ref, dirpath, max_files, max_bytes) dict
+        +refresh_all(force) dict
+    }
+
+    class Normalizer {
+        <<catalog.py · 纯函数>>
+        +normalize_mcp_server(raw) dict
+        +build_mcp_config(item, server_id, name, env, risk) dict
+        +free_class_of(raw) str
+        +url_to_raw(url) dict
+    }
+
+    class SkillInstaller {
+        <<skills.py · 只管落盘>>
+        +install_from_github(bundle, overwrite) dict
+        +install_from_dir(src, overwrite) dict
+        +install_from_url(files, slug, overwrite) dict
+        -_atomic_install(slug, files, overwrite) dict
+        -_rollback(tmp_dir, backup_dir, slug) None
+        +prune_backups(keep) None
+    }
+
+    class ToolFilter {
+        <<tools.py · ToolRegistry 内态>>
+        +set(disabled) set
+        +allow list~str~
+        +max_tools int
+        +active() list~Tool~
+        +select_schemas(disabled, allow, max_tools) list~dict~
+    }
+
+    class ToolRegistry {
+        +str workspace
+        +dict _tools
+        +ToolFilter _filter
+        +register(tool, replace)
+        +unregister(name)
+        +list() list~dict~
+        +active() list~Tool~
+        +set_filter(disabled, allow, max_tools) None
+        +select_schemas(disabled, allow, max_tools) list~dict~
+        +openai_schemas() list~dict~
+        +risk_of(name, args) str
+        +call(name, args, ctx) ToolResult
+    }
+
+    class ProfileMatcher {
+        <<profiles.py · 纯关键词>>
+        +list~dict~ BUILTIN_PROFILES
+        +ensure_builtin_profiles() None
+        +match_profiles(text, profiles, available) dict
+    }
+
+    class Assistant {
+        +ToolRegistry registry()
+        +state() dict
+        +start_turn(sid, text, provider_id, model, emit, mounted_skills) dict
+        -_build_messages(session, registry, cfg, schemas) list~dict~
+        -_ctx(sid, cfg, provider, model, emit, exec_tool) dict
+    }
+
+    class MCPManager {
+        +servers() list~dict~
+        +save_servers(items) None
+        +add_server(cfg) dict
+        +remove_server(id) bool
+        +connect(id, registry) dict
+        +status() list~dict~
+    }
+
+    class SkillsModule {
+        <<skills.py>>
+        +list_skills() list~dict~   [跳过 . 前缀目录（A8）]
+        +load_skill(slug) dict
+        +save_skill(slug, content, files) dict
+        +delete_skill(slug) bool
+        +import_zip(data, overwrite) dict
+        +export_zip(slug) bytes
+        +parse_skill_md(text) dict
+        +_slugify(name) str
+    }
+
+    class AssistantPage {
+        +bool _busy
+        +list~str~ _skill_slugs
+        +set~tuple~ _auto_tips
+        +_pick_file(title, start, filter, save, name, accept, directory) str
+        +_choose_workspace() None
+        +_build_attach_menu() QMenu
+        +_build_skill_menu() QMenu
+        +_build_tool_menu() QMenu
+        +_build_mcp_menu() QMenu
+        +_import_skill_from_dir() None
+        +_install_skill_from_url() None
+        +_send_with_session(session, text) None
+        +_on_event(ev) None
+        +_add_step(text, error) None
+        +_add_step_with_action(text, label, on_action, error) None
+        +_build_skills_tab() QWidget
+        +_build_tools_tab() QWidget
+        +_build_mcp_tab() QWidget
+        +_fill_tools(tools) None
+        +open_manager(key) None
+    }
+
+    class ManagerDialog {
+        +list TABS
+        +show_tab(key) None
+        +minimumSize 700x520   [720 逻辑宽必须放得下（A7）]
+    }
+
+    class AssistantApi {
+        +catalog_mcp(q, cursor, force) dict
+        +catalog_repos(q, force) dict
+        +catalog_repo_skills(owner, repo, ref) dict
+        +catalog_install_skill(body) dict
+        +catalog_install_mcp(body) dict
+        +catalog_refresh() dict
+        +catalog_from_dir(path, overwrite) dict
+        +catalog_from_url(url, overwrite) dict
+        +tool_prefs() dict
+        +save_tool_prefs(patch) dict
+        +profiles() dict
+        +save_profiles(patch) dict
+    }
+
+    AssistantPage --> AssistantApi : 全部 REST
+    AssistantPage --> ManagerDialog : open_manager(key)
+    ManagerDialog --> AssistantPage : page 构建各 Tab
+    AssistantApi ..> CatalogError : 错误码 → RuntimeError
+
+    Assistant --> ToolRegistry
+    Assistant --> ProfileMatcher
+    Assistant --> MCPManager
+    ToolRegistry *-- ToolFilter : 组合（内态）
+    SkillInstaller ..> SkillsModule : 同一模块
+    CatalogClient ..> Normalizer : 调用纯函数
+    CatalogClient ..> SkillInstaller : 只交内存 bundle，不落盘（A1）
+    CatalogClient --> MCPManager : build_mcp_config → add_server
