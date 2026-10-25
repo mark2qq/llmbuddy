@@ -72,6 +72,15 @@ MAX_SKILL_MD_BYTES = 200 * 1024          # SKILL.md 超过 200KB 拒收（R-S3�
 DEFAULT_MAX_FILES = 20
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 
+#: 大技能 / 二进制整包下载（tarball 子树）上限——远大于文本管线的 2MB / 20 文件。
+#: 设计目标：PPT Master 这类 1.3 万文件 / 63MB 含 SVG+WAV 的技能能一整包装下，
+#: 而非被文本管线静默丢 96% 二进制（R-S3 旧约束的已知缺陷，本次修复）。
+ARCHIVE_MAX_FILES = 20000
+ARCHIVE_MAX_BYTES = 256 * 1024 * 1024    # 抽取后落盘预算 256MB（防滥用，默认）
+ARCHIVE_MAX_DOWNLOAD = 512 * 1024 * 1024  # 下载阶段硬上限（按 content-length 预检）
+ARCHIVE_TIMEOUT = 120.0                  # tarball 下载超时（大体积需宽松）
+CODELOAD_BASE = "https://codeload.github.com"
+
 #: 错误码（架构 §8）
 ERR_UNREACHABLE = 2020
 ERR_UPSTREAM = 2021
@@ -1057,6 +1066,182 @@ def fetch_skill_bundle(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
         "dir": dirpath,
         "skipped": skipped,
         "total_files": len(candidates) + 1,
+    }
+
+
+def fetch_skill_archive(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
+                        repo: str = "", ref: str = "", dirpath: str = "",
+                        max_files: int = ARCHIVE_MAX_FILES,
+                        max_bytes: int = ARCHIVE_MAX_BYTES,
+                        ) -> Dict[str, Any]:
+    """下载技能目录的**整棵子树 tarball**（支持任意二进制 + 大体积）。
+
+    走 `codeload.github.com/{owner}/{repo}/tar.gz/{ref}`（无 API 限流、整目录一次
+    拿全），在内存里只抽取 `dirpath` 子树，返回
+    `{slug, files:{rel:bytes}, bytes, has_scripts, commit, ref, repo, dir,
+      skipped, total_files, binary:True}`。
+
+    与文本管线（`fetch_skill_bundle`）互补：文本管线仍用于「粘贴单文件 / 预览」，
+    整包安装一律走本函数，从而不再丢 SVG / 图标 / 音效等二进制资产。
+
+    安全红线（与文本管线一致，架构 §8）：
+      - 不执行任何文件；
+      - 抽取路径做 `..` / 绝对 / 盘符 / 符号链接 / 硬链接逃逸校验，越界成员跳过
+        并计入 `skipped`（不抛，不静默通过）；
+      - 受 `max_files` / `max_bytes`（抽取预算）与 `ARCHIVE_MAX_DOWNLOAD`
+        （下载预算，content-length 预检）约束，超出部分计入 `skipped`。
+    """
+    import io
+    import tarfile
+
+    owner = str(owner or "").strip()
+    repo = str(repo or "").strip()
+    if not owner or not repo:
+        raise CatalogError(ERR_BAD_BUNDLE, "owner / repo 不能为空")
+    dirpath = str(dirpath or "").strip().strip("/")
+    ref = str(ref or "").strip() or _default_branch(cfg, owner, repo)
+
+    # 1) 借 list_repo_skills 拿到 commit + 确认目录存在 + has_scripts（有缓存）
+    listing = list_repo_skills(cfg, owner, repo, ref)
+    hit = next((i for i in listing.get("items") or []
+                if str(i.get("dir") or "") == dirpath), None)
+    if hit is None:
+        raise CatalogError(ERR_BAD_BUNDLE,
+                           f"目录 {dirpath or '/'} 里没有 SKILL.md，不是技能包",
+                           {"owner": owner, "repo": repo, "dir": dirpath})
+    md_path = str(hit.get("path") or "").strip()
+    if not md_path:
+        md_path = f"{dirpath}/SKILL.md" if dirpath else "SKILL.md"
+    commit = str(listing.get("commit") or "")
+    has_scripts = bool(hit.get("has_scripts"))
+
+    # 2) 校验 SKILL.md frontmatter（按文本取一次，复用现有校验）
+    md_text = _get_text(cfg, f"{GITHUB_RAW}/{owner}/{repo}/{ref}/{md_path}")
+    if len(md_text.encode("utf-8", "replace")) > MAX_SKILL_MD_BYTES:
+        raise CatalogError(ERR_BAD_BUNDLE,
+                           f"SKILL.md 过大（>{MAX_SKILL_MD_BYTES // 1024}KB）")
+    try:
+        from core.assistant.skills import parse_skill_md
+        meta = parse_skill_md(md_text).get("meta") or {}
+    except Exception:
+        meta = {}
+    if not str(meta.get("name") or "").strip():
+        raise CatalogError(ERR_BAD_BUNDLE,
+                           "SKILL.md 的 frontmatter 缺少 name，不是有效技能包",
+                           {"owner": owner, "repo": repo, "dir": dirpath})
+    name = str(meta.get("name") or "").strip()
+
+    # 3) 下载整子树 tarball（codeload 无 API 限流，单次拿全）
+    url = f"{CODELOAD_BASE}/{owner}/{repo}/tar.gz/{ref}"
+    try:
+        resp = _do_get(cfg, url, None, timeout=ARCHIVE_TIMEOUT)
+    except Exception as e:                       # noqa: BLE001
+        raise CatalogError(
+            ERR_UNREACHABLE,
+            f"无法下载技能包 tarball（代理：{_proxy(cfg)}）："
+            f"{type(e).__name__}: {e}") from e
+    if resp.status_code != 200:
+        raise CatalogError(ERR_UPSTREAM,
+                           f"tarball 下载失败 HTTP {resp.status_code}：{url}",
+                           {"status": resp.status_code, "url": url})
+    cl = resp.headers.get("content-length")
+    if cl and str(cl).strip().isdigit() \
+            and int(cl) > ARCHIVE_MAX_DOWNLOAD:
+        raise CatalogError(
+            ERR_UPSTREAM,
+            f"技能包 tarball 过大（>{ARCHIVE_MAX_DOWNLOAD // 1024 // 1024}MB），已中止",
+            {"url": url})
+    raw = resp.content
+    if not raw:
+        raise CatalogError(ERR_UPSTREAM, f"tarball 为空：{url}")
+
+    # 4) 抽取 dirpath 子树（内存，不落盘；路径严格校验）
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+    except (tarfile.TarError, OSError) as e:
+        raise CatalogError(ERR_UPSTREAM,
+                           f"tarball 解包失败：{type(e).__name__}: {e}")
+    prefix = (dirpath + "/") if dirpath else ""
+    files: Dict[str, bytes] = {}
+    total = 0
+    skipped = 0
+    total_files = 0
+    seen_top: Optional[str] = None
+    try:
+        members = list(tf)
+        # 找公共顶层目录 top/（codeload 的 tarball 顶层是 repo-<ref>）
+        for m in members:
+            if m.isdir():
+                first = m.name.rstrip("/")
+                if "/" not in first:
+                    seen_top = first + "/"
+                    break
+        if seen_top is None and members:
+            seen_top = members[0].name.split("/", 1)[0] + "/"
+        if not seen_top:
+            raise CatalogError(ERR_BAD_BUNDLE, "tarball 结构异常（无顶层目录）")
+        for m in members:
+            name_in = str(m.name or "")
+            if not name_in.startswith(seen_top):
+                continue
+            rel_all = name_in[len(seen_top):]
+            if prefix:
+                if not rel_all.startswith(prefix):
+                    continue
+                rel = rel_all[len(prefix):]
+            else:
+                rel = rel_all
+            if not rel or rel.endswith("/"):
+                continue
+            # 路径逃逸校验（与 skills._safe_rel 同源）
+            parts = rel.split("/")
+            if ".." in parts or rel.startswith("/") \
+                    or (len(rel) >= 2 and rel[1] == ":"):
+                skipped += 1
+                continue
+            # 拒绝符号/硬链接（防逃逸 + 跨平台便携性）
+            if m.issym() or m.islnk():
+                skipped += 1
+                continue
+            if not m.isfile():
+                continue
+            total_files += 1
+            if len(files) >= max(1, int(max_files or ARCHIVE_MAX_FILES)):
+                skipped += 1
+                continue
+            try:
+                ef = tf.extractfile(m)
+                data = ef.read() if ef is not None else b""
+            except Exception:
+                skipped += 1
+                continue
+            if total + len(data) > max_bytes:
+                skipped += 1
+                continue
+            files[rel] = data
+            total += len(data)
+    finally:
+        tf.close()
+
+    if "SKILL.md" not in files:
+        raise CatalogError(ERR_BAD_BUNDLE,
+                           "tarball 中未找到 SKILL.md（目录可能为空）",
+                           {"owner": owner, "repo": repo, "dir": dirpath})
+
+    return {
+        "slug": _slugify_server(name),
+        "name": name,
+        "description": str(meta.get("description") or ""),
+        "files": files,            # bytes 字典（二进制安全）
+        "bytes": total,
+        "has_scripts": has_scripts,
+        "commit": commit,
+        "ref": ref,
+        "repo": f"{owner}/{repo}",
+        "dir": dirpath,
+        "skipped": skipped,
+        "total_files": total_files + 1,
+        "binary": True,
     }
 
 

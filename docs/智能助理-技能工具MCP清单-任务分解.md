@@ -29,7 +29,7 @@
 **文件**
 | 文件 | 类型 | 内容 |
 |---|---|---|
-| `core/assistant/catalog.py` | 新增 | `CatalogError`；`catalog_dir/_proxy/_client/_cache_read/_cache_write/_fresh`；`list_mcp` / `normalize_mcp_server` / `build_mcp_config` / `free_class_of`；`list_repos` / `list_repo_skills` / `fetch_skill_bundle`；`url_to_raw`；`refresh_all` |
+| `core/assistant/catalog.py` | 新增 | `CatalogError`；`catalog_dir/_proxy/_client/_cache_read/_cache_write/_fresh`；`list_mcp` / `normalize_mcp_server` / `build_mcp_config` / `free_class_of`；`list_repos` / `list_repo_skills` / `fetch_skill_bundle`；`url_to_raw`；`refresh_all`。**v1.0.8 增强**：新增 `fetch_skill_archive`（codeload tarball 整包抽取，支持大体积/二进制）+ 常量 `ARCHIVE_MAX_FILES/ARCHIVE_MAX_BYTES/ARCHIVE_MAX_DOWNLOAD/ARCHIVE_TIMEOUT/CODELOAD_BASE` |
 | `core/assistant/profiles.py` | 新增 | `BUILTIN_PROFILES`（3 个）/ `ensure_builtin_profiles` / `match_profiles` |
 | `core/assistant/store.py` | 修改 | `_default_config()` 增 `tool_prefs` / `auto_load` / `profiles` / `catalog` / `skill_sources`；`ensure_dirs()` 加 `CATALOG_DIR`；新增模块常量 `CATALOG_DIR` |
 | `tests/test_assistant_catalog.py` | 新增 | 单元测试（见验收） |

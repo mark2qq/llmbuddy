@@ -338,22 +338,136 @@ def test_install_from_github_records_source(env):
     assert out["slug"] in [s["slug"] for s in skills_mod.list_skills()]
 
 
-def test_install_from_dir_skips_binary(env, tmp_path):
+def test_install_from_dir_copies_binary(env, tmp_path):
+    """本地目录导入现在复制全部文件（含二进制 SVG/PNG），并排除 .git。"""
     src = tmp_path / "my-skill"
     src.mkdir()
     (src / "SKILL.md").write_text(SKILL_MD_V1, encoding="utf-8")
     (src / "notes.md").write_text("备注", encoding="utf-8")
+    (src / "icon.svg").write_bytes(b"<svg></svg>")
     (src / "pic.png").write_bytes(b"\x89PNG\r\n")
     (src / "scripts").mkdir()
     (src / "scripts" / "run.py").write_text("print(1)", encoding="utf-8")
+    # .git 不应被装进来
+    (src / ".git").mkdir()
+    (src / ".git" / "config").write_text("garbage", encoding="utf-8")
     out = skills_mod.install_from_dir(str(src))
     assert out["slug"] == "pdf-extract"
     assert out["has_scripts"] is True
     d = os.path.join(str(env["skills"]), "pdf-extract")
     assert os.path.isfile(os.path.join(d, "notes.md"))
-    assert not os.path.exists(os.path.join(d, "pic.png"))
+    assert os.path.isfile(os.path.join(d, "icon.svg"))
+    assert os.path.isfile(os.path.join(d, "pic.png"))
+    assert not os.path.exists(os.path.join(d, ".git"))
     with pytest.raises(skills_mod.SkillError):
         skills_mod.install_from_dir(str(tmp_path / "nowhere"))
+
+
+def test_install_from_github_binary(env, monkeypatch):
+    """二进制整包（files 为 bytes + binary=True）原样落盘，不损坏。"""
+    bundle = {"slug": "pdf-extract", "name": "pdf-extract",
+              "files": {"SKILL.md": SKILL_MD_V1.encode("utf-8"),
+                        "icon.svg": b"<svg>bytes</svg>",
+                        "sound.wav": bytes(range(256))},
+              "bytes": 300, "has_scripts": False, "commit": "abc123",
+              "ref": "main", "repo": "acme/skills", "dir": "skills/pdf",
+              "skipped": 0, "binary": True}
+    out = skills_mod.install_from_github(
+        bundle, "", False,
+        {"repo": "acme/skills", "ref": "main", "dir": "skills/pdf",
+         "commit": "abc123", "has_scripts": False})
+    assert out["slug"] == "pdf-extract"
+    d = os.path.join(str(env["skills"]), "pdf-extract")
+    with open(os.path.join(d, "icon.svg"), "rb") as f:
+        assert f.read() == b"<svg>bytes</svg>"
+    with open(os.path.join(d, "sound.wav"), "rb") as f:
+        assert f.read() == bytes(range(256))
+    src = store_mod.load_config()["skill_sources"]["pdf-extract"]
+    assert src["kind"] == "github"
+
+
+def test_fetch_skill_archive_extracts_binary(env, monkeypatch):
+    """fetch_skill_archive 抽取子树 tarball：二进制保留、.. 逃逸与符号链接跳过、
+    受 max_bytes 预算约束。"""
+    import io
+    import tarfile
+
+    SKILL_MD = """---
+name: ppt-master
+description: 大技能
+version: 6.7.3
+---
+# 要求
+1. 干活
+"""
+    # 构造子树 tarball（顶层目录 ppt-master-main/）
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        def add_dir(p):
+            ti = tarfile.TarInfo(name=p)
+            ti.type = tarfile.DIRTYPE
+            tf.addfile(ti)
+        def add_file(p, data):
+            b = data if isinstance(data, bytes) else data.encode("utf-8")
+            ti = tarfile.TarInfo(name=p)
+            ti.size = len(b)
+            tf.addfile(ti, io.BytesIO(b))
+        def add_sym(p, target):
+            ti = tarfile.TarInfo(name=p)
+            ti.type = tarfile.SYMTYPE
+            ti.linkname = target
+            tf.addfile(ti)
+        add_dir("ppt-master-main")
+        add_dir("ppt-master-main/skills")
+        add_dir("ppt-master-main/skills/ppt-master")
+        add_file("ppt-master-main/skills/ppt-master/SKILL.md", SKILL_MD)
+        add_file("ppt-master-main/skills/ppt-master/icon.svg", b"<svg></svg>")
+        add_file("ppt-master-main/skills/ppt-master/sound.wav", bytes(range(200)))
+        add_file("ppt-master-main/skills/ppt-master/notes.md", "备注")
+        # 越界尝试：.. 逃逸
+        add_file("ppt-master-main/skills/ppt-master/../escape.txt", "evil")
+        # 符号链接（应跳过）
+        add_sym("ppt-master-main/skills/ppt-master/link.md", "SKILL.md")
+    raw = buf.getvalue()
+
+    class _Resp:
+        status_code = 200
+        headers: dict = {}
+        content = raw
+
+    monkeypatch.setattr(catalog_mod, "_do_get",
+                        lambda *a, **k: _Resp())
+    monkeypatch.setattr(catalog_mod, "_get_text",
+                        lambda *a, **k: SKILL_MD)
+    monkeypatch.setattr(catalog_mod, "list_repo_skills",
+                        lambda *a, **k: {
+                            "commit": "deadbeef", "ref": "main",
+                            "items": [{"slug": "ppt-master", "dir": "skills/ppt-master",
+                                       "name": "ppt-master", "description": "大技能",
+                                       "path": "skills/ppt-master/SKILL.md",
+                                       "files": ["icon.svg", "sound.wav", "notes.md"],
+                                       "file_count": 3, "has_scripts": False}]})
+
+    bundle = catalog_mod.fetch_skill_archive(
+        None, "hugohe3", "ppt-master", "main", "skills/ppt-master")
+    assert bundle["binary"] is True
+    assert "SKILL.md" in bundle["files"]
+    assert bundle["files"]["icon.svg"] == b"<svg></svg>"
+    assert bundle["files"]["sound.wav"] == bytes(range(200))
+    assert "notes.md" in bundle["files"]
+    # 越界与符号链接被计入 skipped，不出现在 files
+    assert "escape.txt" not in bundle["files"]
+    assert "link.md" not in bundle["files"]
+    assert bundle["skipped"] >= 2
+    assert bundle["commit"] == "deadbeef"
+
+    # 预算约束：max_bytes 介于「仅够 SKILL.md」与「全装下」之间时，
+    # SKILL.md 保留、其余附件被计入 skipped（SKILL.md 自身占 82 字节）。
+    small = catalog_mod.fetch_skill_archive(
+        None, "hugohe3", "ppt-master", "main", "skills/ppt-master", max_bytes=90)
+    assert "SKILL.md" in small["files"]
+    assert small["skipped"] >= 3
+    assert "icon.svg" not in small["files"]
 
 
 # ----------------------------------------------------------------------------
@@ -563,8 +677,8 @@ def test_route_catalog_skills_and_repo(env, monkeypatch):
 
 
 def test_route_skill_install_end_to_end(env, monkeypatch):
-    """在线安装技能全链路：fetch_skill_bundle -> 原子落盘 -> 出现在 list_skills。"""
-    monkeypatch.setattr(catalog_mod, "fetch_skill_bundle", lambda *a, **k: {
+    """在线安装技能全链路：fetch_skill_archive -> 原子落盘 -> 出现在 list_skills。"""
+    monkeypatch.setattr(catalog_mod, "fetch_skill_archive", lambda *a, **k: {
         "slug": "pdf-extract", "name": "pdf-extract",
         "files": {"SKILL.md": SKILL_MD_V1}, "bytes": 120,
         "has_scripts": False, "commit": "c0ffee", "ref": "main",

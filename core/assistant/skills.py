@@ -288,7 +288,13 @@ def _slugify(name: str) -> str:
 INSTALLING_PREFIX = ".installing-"
 BACKUP_PREFIX = ".backup-"
 MAX_BACKUPS = 5
-MAX_INSTALL_BYTES = 8 * 1024 * 1024
+#: 安装包字节预算（抽取后落盘上限）。256MB：足够装下 PPT Master 这类
+#: 1.3 万文件 / 63MB 含 SVG+WAV 的二进制技能；同时仍是防滥用的硬上限。
+MAX_INSTALL_BYTES = 256 * 1024 * 1024
+#: 本地目录导入时跳过的 VCS / 缓存目录（不进技能包，避免把 .git 一并装进来）
+BINARY_SKIP_DIRS = (".git", ".svn", ".hg", "__pycache__", ".venv", "venv",
+                    "node_modules", ".idea", ".vscode", ".mypy_cache",
+                    ".installing-", ".backup-")
 
 
 def _safe_rel(rel: str) -> str:
@@ -332,6 +338,78 @@ def _write_files(root: str, files: Dict[str, str]) -> int:
         with open(target, "w", encoding="utf-8") as f:
             f.write(body)
     return total
+
+
+def _write_files_bytes(root: str, files: Dict[str, bytes]) -> int:
+    """把 `{rel: bytes}` 写进 root（自动建父目录 + 路径校验），返回写入字节数。
+
+    二进制安全：SVG / 图标 / 音效等任意资产原样落盘（与文本路径共用 `_safe_rel`
+    做 `..`/盘符/绝对路径校验）。只落文件，**永不执行任何脚本**（安全红线）。
+    """
+    total = 0
+    for rel, data in (files or {}).items():
+        safe = _safe_rel(rel)
+        target = os.path.join(root, safe)
+        os.makedirs(os.path.dirname(target) or root, exist_ok=True)
+        body = data if isinstance(data, (bytes, bytearray)) else b""
+        total += len(body)
+        if total > MAX_INSTALL_BYTES:
+            raise SkillError(f"技能包过大（>{MAX_INSTALL_BYTES // 1024 // 1024}MB）")
+        with open(target, "wb") as f:
+            f.write(body)
+    return total
+
+
+def _atomic_install_bytes(slug: str, files: Dict[str, bytes],
+                          overwrite: bool = False) -> Dict[str, Any]:
+    """原子安装一个二进制技能包（与 `_atomic_install` 同源流程，落 bytes）。
+
+    Args/Returns/Raises 同 `_atomic_install`，区别是 `files` 为 `{rel: bytes}`。
+    """
+    if not _SLUG_RE.match(slug or ""):
+        raise SkillError("技能标识只能包含字母、数字、点、下划线、连字符")
+    payload = dict(files or {})
+    md_key = next((k for k in payload
+                   if str(k).replace("\\", "/").lower() == "skill.md"), None)
+    if md_key is None:
+        raise SkillError("技能包缺少 SKILL.md")
+    md_bytes = payload.get(md_key) or b""
+    try:
+        md_text = (md_bytes.decode("utf-8", "replace")
+                   if isinstance(md_bytes, (bytes, bytearray)) else str(md_bytes))
+    except Exception:
+        md_text = ""
+    parsed = parse_skill_md(md_text)
+    if not str(parsed["meta"].get("name") or "").strip():
+        raise SkillError("SKILL.md 的 frontmatter 缺少 name，不是有效技能包")
+
+    ensure_dirs()
+    target = os.path.join(SKILLS_DIR, slug)
+    if os.path.isdir(target) and not overwrite:
+        raise SkillError(f"技能已存在：{slug}")
+
+    tmp_dir = _new_temp_dir()
+    backup_dir = ""
+    try:
+        written = _write_files_bytes(tmp_dir, payload)
+        if os.path.isdir(target):
+            backup_dir = os.path.join(SKILLS_DIR,
+                                      BACKUP_PREFIX + time.strftime("%Y%m%d%H%M%S")
+                                      + "-" + uuid.uuid4().hex[:6])
+            os.replace(target, backup_dir)
+        os.replace(tmp_dir, target)
+    except Exception as e:                      # noqa: BLE001
+        _rollback(tmp_dir, backup_dir, slug)
+        if isinstance(e, SkillError):
+            raise
+        raise SkillError(f"安装失败（已回滚）：{type(e).__name__}: {e}") from e
+
+    prune_backups()
+    audit("skill_installed", slug=slug, files=len(payload), bytes=written,
+          overwrite=bool(overwrite), backup=os.path.basename(backup_dir))
+    return {"slug": slug, "files": sorted(payload.keys()), "bytes": written,
+            "path": target, "backup": os.path.basename(backup_dir),
+            "overwritten": bool(backup_dir), "name": parsed["meta"].get("name")}
 
 
 def _rollback(tmp_dir: str, backup_dir: str, slug: str) -> None:
@@ -423,10 +501,15 @@ def _atomic_install(slug: str, files: Dict[str, str],
 def install_from_github(bundle: Dict[str, Any], slug: str = "",
                         overwrite: bool = False,
                         source: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """安装 `catalog.fetch_skill_bundle()` 的内存包（A1：catalog 只交字节）。
+    """安装 `catalog.fetch_skill_bundle()` / `fetch_skill_archive()` 的内存包。
+
+    A1：catalog 只交字节，落盘动作在此。自动按 `binary` 标志路由：
+      - `binary=True` 且 files 全为 bytes -> `_atomic_install_bytes`（SVG/WAV 等）
+      - 否则 -> `_atomic_install`（纯文本包，老路径向后兼容）
 
     Args:
-        bundle: `{slug, files:{rel:text}, repo, ref, dir, commit, has_scripts}`
+        bundle: `{slug, files:{rel:text|bytes}, binary, repo, ref, dir,
+                 commit, has_scripts, skipped}`
         slug: 覆盖目标 slug（为空则用 bundle 里的 slug）
         overwrite: 是否覆盖已存在技能
         source: 写进 `config.skill_sources` 的来源信息（可选）
@@ -434,7 +517,12 @@ def install_from_github(bundle: Dict[str, Any], slug: str = "",
     bundle = bundle or {}
     files = bundle.get("files") if isinstance(bundle.get("files"), dict) else {}
     target_slug = _slugify(slug or bundle.get("slug") or bundle.get("name") or "skill")
-    result = _atomic_install(target_slug, files, overwrite=overwrite)
+    is_binary = bool(bundle.get("binary")) and files and all(
+        isinstance(v, (bytes, bytearray)) for v in files.values())
+    if is_binary:
+        result = _atomic_install_bytes(target_slug, files, overwrite=overwrite)
+    else:
+        result = _atomic_install(target_slug, files, overwrite=overwrite)
     result.update({
         "commit": str(bundle.get("commit") or ""),
         "ref": str(bundle.get("ref") or ""),
@@ -458,7 +546,12 @@ def install_from_github(bundle: Dict[str, Any], slug: str = "",
 
 def install_from_dir(src: str, overwrite: bool = False,
                      slug: str = "") -> Dict[str, Any]:
-    """从本地文件夹安装（只读文本类文件；不跟随符号链接）。"""
+    """从本地文件夹安装（复制全部文件，含二进制；不执行脚本）。
+
+    与在线整包安装保持一致：SKILL.md + 任何附件（SVG / 图标 / 音效 / 脚本等）
+    原样落盘，不再按 `TEXT_SUFFIXES` 过滤而丢二进制。跳过 `.git` / `__pycache__`
+    等 VCS / 缓存目录，符号链接不跟随；总大小受 `MAX_INSTALL_BYTES` 约束。
+    """
     root = os.path.abspath(str(src or ""))
     if not os.path.isdir(root):
         raise SkillError(f"不是目录：{src}")
@@ -472,10 +565,12 @@ def install_from_dir(src: str, overwrite: bool = False,
         raise SkillError("SKILL.md 的 frontmatter 缺少 name，不是有效技能包")
     target_slug = _slugify(slug or parsed["meta"].get("name")
                            or os.path.basename(root))
-    files: Dict[str, str] = {"SKILL.md": md_text}
-    total = len(md_text.encode("utf-8", "replace"))
+    files: Dict[str, bytes] = {"SKILL.md": md_text.encode("utf-8", "replace")}
+    total = len(files["SKILL.md"])
     has_scripts = False
-    for dirpath, _dirs, filenames in os.walk(root):
+    for dirpath, dirs, filenames in os.walk(root):
+        # 原地裁剪，跳过 VCS / 缓存目录（不进技能包）
+        dirs[:] = [d for d in dirs if d not in BINARY_SKIP_DIRS]
         for fn in filenames:
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, root).replace("\\", "/")
@@ -485,20 +580,17 @@ def install_from_dir(src: str, overwrite: bool = False,
             if low.startswith("scripts/") or low.endswith((".py", ".sh", ".ps1",
                                                           ".bat", ".cmd", ".js")):
                 has_scripts = True
-            if not low.endswith(TEXT_SUFFIXES):
-                continue
             try:
-                if os.path.getsize(full) > MAX_SKILL_MD_BYTES:
+                if os.path.islink(full) or os.path.isfile(full) is False:
                     continue
-                with open(full, "r", encoding="utf-8", errors="replace") as f:
-                    text = f.read()
+                data = open(full, "rb").read()
             except OSError:
                 continue
-            if total + len(text.encode("utf-8", "replace")) > MAX_INSTALL_BYTES:
+            if total + len(data) > MAX_INSTALL_BYTES:
                 continue
-            total += len(text.encode("utf-8", "replace"))
-            files[rel] = text
-    result = _atomic_install(target_slug, files, overwrite=overwrite)
+            total += len(data)
+            files[rel] = data
+    result = _atomic_install_bytes(target_slug, files, overwrite=overwrite)
     result.update({"commit": "", "ref": "", "repo": root, "dir": "",
                    "has_scripts": has_scripts, "skipped": 0})
     return result

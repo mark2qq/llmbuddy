@@ -159,15 +159,12 @@ sequenceDiagram
     P->>P: 确认框：来源 owner/repo·dir / ⭐star / 文件数 /<br/>含 scripts 黄色警示 / 风险=medium
     U->>P: 确认 [安装]（若已存在则先问 覆盖/取消）
     P->>R: POST /catalog/skills/install {repo, ref, dir, slug, overwrite}
-    R->>C: fetch_skill_bundle(cfg, owner, repo, ref, dirpath)
-    C->>C: 读 gh_skills.json 缓存（TTL 7d）拿 tree
-    alt 缓存未命中
-        C->>C: GET /repos/{o}/{r}/git/trees/{ref}?recursive=1（trust_env=False+proxy）
-        C->>C: 找 **/SKILL.md；_cache_write("gh_skills.json")
-    end
-    C->>C: 取 SKILL.md + 同目录文本类附件<br/>（.md/.txt/.json/.yaml/.yml/.py；≤20 个；总 ≤2MB）
-    C->>C: parse_skill_md() 校验 frontmatter 有 name；>200KB 拒绝
-    C-->>R: {slug, files:{rel:text}, bytes, has_scripts, commit}<br/>●只在内存，不落盘
+    R->>C: fetch_skill_archive(cfg, owner, repo, ref, dirpath)
+    C->>C: 读 gh_skills.json 缓存（TTL 7d）拿 tree + commit + 确认 dir 存在
+    C->>C: 取 SKILL.md（codeload tarball 内）校验 frontmatter 有 name；>200KB 拒绝
+    C->>C: GET codeload.github.com/{o}/{r}/tar.gz/{ref}（整包，trust_env=False+proxy）<br/>content-length 超 ARCHIVE_MAX_DOWNLOAD(512MB) 拒收
+    C->>C: tarfile 抽取：剥离顶层目录、拒绝 ".."/绝对/盘符逃逸、拒绝符号/硬链接<br/>二进制（svg/wav/png/webp…）原样 bytes；预算 ARCHIVE_MAX_FILES=20000 / ARCHIVE_MAX_BYTES=256MB
+    C-->>R: {slug, files:{rel:bytes}, bytes, has_scripts, commit, skipped, binary:True}<br/>●二进制原样在内存，不执行任何脚本
     R->>SK: install_from_github(bundle, overwrite)
     SK->>SK: 校验 slug ∈ _SLUG_RE；dir 无 ".."/盘符/绝对路径
     SK->>FS: mkdir .installing-<uuid>   ●前缀 . 不被 list_skills 扫到（A8）
@@ -212,6 +209,7 @@ classDiagram
         +list_repos(q, force, per_page) dict
         +list_repo_skills(owner, repo, ref, force) dict
         +fetch_skill_bundle(owner, repo, ref, dirpath, max_files, max_bytes) dict
+        +fetch_skill_archive(owner, repo, ref, dirpath, max_files, max_bytes) dict  ★v1.0.8 大体积/二进制
         +refresh_all(force) dict
     }
 

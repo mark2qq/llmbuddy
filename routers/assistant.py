@@ -682,7 +682,12 @@ async def catalog_repo_skills(owner: str, repo: str, ref: str = "",
 
 @router.post("/catalog/skills/install")
 async def catalog_install_skill(body: Dict[str, Any]):
-    """在线安装技能：GitHub 拉包（内存）-> 原子落盘 -> 记 skill_sources。"""
+    """在线安装技能：GitHub 整包 tarball（含二进制/大体积）-> 原子落盘 -> 记 skill_sources。
+
+    走 `catalog.fetch_skill_archive`：下载技能目录的整棵子树 tarball，在内存里
+    抽取后交 `skills.install_from_github` 二进制安全落盘（SVG / 图标 / 音效等
+    不再被文本管线静默丢弃）。
+    """
     from fastapi.concurrency import run_in_threadpool
     body = body or {}
     repo = str(body.get("repo") or "").strip()
@@ -695,7 +700,7 @@ async def catalog_install_skill(body: Dict[str, Any]):
     overwrite = bool(body.get("overwrite"))
     cfg = _catalog_cfg()
     try:
-        bundle = await run_in_threadpool(catalog_mod.fetch_skill_bundle,
+        bundle = await run_in_threadpool(catalog_mod.fetch_skill_archive,
                                          cfg, owner, name, ref, dirpath)
         result = await run_in_threadpool(
             skills_mod.install_from_github, bundle, slug, overwrite,
@@ -712,7 +717,8 @@ async def catalog_install_skill(body: Dict[str, Any]):
     audit("skill_installed_online", slug=result.get("slug"), repo=repo,
           ref=result.get("ref") or ref, dir=dirpath,
           commit=result.get("commit") or "", bytes=result.get("bytes") or 0,
-          has_scripts=bool(result.get("has_scripts")), overwrite=overwrite)
+          has_scripts=bool(result.get("has_scripts")), overwrite=overwrite,
+          skipped=int(result.get("skipped") or 0))
     return ok(result)
 
 

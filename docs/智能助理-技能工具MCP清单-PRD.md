@@ -328,13 +328,16 @@
   → [取消] / [安装]
   → 后端 POST /assistant/catalog/skills/install
        {repo, ref, dir, slug}
-     1. 拉 SKILL.md（raw.githubusercontent.com），校验 frontmatter 有 name
-     2. 拉同目录文件清单（tree 结果已缓存），只取文本类（.md/.txt/.json/.yaml/.py ≤ 20 个）
-     3. 写入临时目录 SKILLS_DIR/.installing-<uuid>/
-     4. 校验通过后原子 rename 到 SKILLS_DIR/<slug>/
-     5. 若 <slug> 已存在：按 overwrite 参数决定覆盖（旧目录先移到 .backup-<ts>）
-     6. audit("skill_installed_online", ...)
-     7. 失败：删除临时目录，返回错误，不留半成品
+     1. 拉 SKILL.md（codeload tarball 整包抽取；先校验 frontmatter 有 name）
+     2. 走 codeload.github.com/{owner}/{repo}/tar.gz/{ref} 整包下载
+        —— 一次性拿全目录（含二进制 / 大体积），不受旧「纯文本 20 文件 / 2MB」管线限制
+     3. 抽取时做安全校验：剥离顶层目录、拒绝 .. / 绝对路径 / 盘符逃逸、拒绝符号链接 / 硬链接
+     4. 二进制（svg/wav/png/webp…）原样 bytes 落盘；文本类同前
+     5. 写入临时目录 SKILLS_DIR/.installing-<uuid>/
+     6. 校验通过后原子 rename 到 SKILLS_DIR/<slug>/
+     7. 若 <slug> 已存在：按 overwrite 参数决定覆盖（旧目录先移到 .backup-<ts>）
+     8. audit("skill_installed_online", ..., skipped=N)
+     9. 失败：删除临时目录，返回错误，不留半成品
   → 客户端刷新清单 + /state，状态栏「已安装 X」
 ```
 
@@ -488,7 +491,7 @@
 | **GitHub 403 限流** | 30 次/分钟的未授权限额；退避 60s，只读缓存 | 「GitHub 接口限流（未登录每小时 60 次），请 {N} 秒后重试，或先使用缓存」 |
 | **安装失败（网络中断）** | 临时目录 `.installing-<uuid>` 整个删除，`SKILLS_DIR` 不留残渣；已有同名技能时旧目录保持在 `.backup-<ts>` 并**自动回滚** | 「安装失败：{原因}，已回滚到安装前状态」 |
 | **重名（slug 冲突）** | 确认框：「已存在技能 X（内置 / 在线）。覆盖会替换其全部文件，原技能备份在 `.backup-<ts>」 → [覆盖]/[取消] | — |
-| **超大包** | 单技能文件总大小 ≤ 2MB、文件数 ≤ 20（超出则只装 `SKILL.md` + 提示「已跳过 N 个附件」）；MCP 无下载概念，不涉及 | — |
+| **超大包 / 二进制技能** | v1.0.8 起改为 **codeload tarball 整包下载**：不受 20 文件 / 2MB 限制，支持大体积（实测 PPT Master ≈13030 文件 / 39MB）与二进制（svg/wav/png/webp…）。抽取预算：`ARCHIVE_MAX_FILES=20000` / `ARCHIVE_MAX_BYTES=256MB`（落盘）/`ARCHIVE_MAX_DOWNLOAD=512MB`（按 content-length 预检）；超出则拒收。仍排除 `.git`/`__pycache__`/`node_modules` 等；SKILL.md > 200KB 仍拒收 | — |
 | **技能正文含巨长内容** | SKILL.md > 200KB 拒绝 | 「SKILL.md 过大（{n}KB > 200KB），疑似非技能文件」 |
 | **URL 不是技能地址** | 校验 host ∈ {`raw.githubusercontent.com`, `github.com`, `gitee.com`, `raw.gitmirror.com`} | 「只支持 GitHub / Gitee 的 SKILL.md 直链（可粘贴网页链接，会自动转 raw）」 |
 | **MCP 必填 env 缺失** | 安装对话框逐项标红，确定按钮禁用 | 「该服务器需要 GCS_BUCKET，请填写后再安装」 |

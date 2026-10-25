@@ -103,7 +103,7 @@ PRD 估 9 人日（附录切分 T01–T10）。定案见 §0.1 / §0.2：交付 
 │    ├─ /catalog/mcp              → catalog.list_mcp()                              │
 │    ├─ /catalog/skills           → catalog.list_repos()                            │
 │    ├─ /catalog/skills/{o}/{r}   → catalog.list_repo_skills()                      │
-│    ├─ /catalog/skills/install   → catalog.fetch_skill_bundle() + skills.install_from_github()
+│    ├─ /catalog/skills/install   → catalog.fetch_skill_archive() + skills.install_from_github()
 │    ├─ /catalog/mcp/install      → catalog.build_mcp_config()  + mcp.add_server()
 │    ├─ /catalog/refresh          → catalog.refresh_all()
 │    ├─ /catalog/skills/from_dir  → skills.install_from_dir()                       │
@@ -164,6 +164,13 @@ def list_repo_skills(cfg, owner, repo, ref="", force=False) -> dict
 def fetch_skill_bundle(cfg, owner, repo, ref, dirpath, max_files=20, max_bytes=2*1024*1024) -> dict
     # {slug, files: {rel: text}, bytes, has_scripts, commit}
     # 只取文本类 .md/.txt/.json/.yaml/.yml/.py；超限只取 SKILL.md + skipped 计数
+    # （纯文本管线，保留兼容；大体积 / 二进制走下面的 fetch_skill_archive）
+def fetch_skill_archive(cfg, owner, repo, ref, dirpath,
+                        max_files=ARCHIVE_MAX_FILES, max_bytes=ARCHIVE_MAX_BYTES) -> dict
+    # codeload.tarball 整包抽取；返回 {slug, files: {rel: bytes}, bytes, has_scripts,
+    #   commit, ref, repo, dir, skipped, total_files, binary: True}
+    # 二进制原样 bytes 落盘；路径逃逸 / 符号链接 / 硬链接拒绝；预算超 ARCHIVE_MAX_DOWNLOAD 拒收
+    # ARCHIVE_MAX_FILES=20000 / ARCHIVE_MAX_BYTES=256MB / ARCHIVE_MAX_DOWNLOAD=512MB / ARCHIVE_TIMEOUT=120s
 
 # ---- URL 归一 ----
 def url_to_raw(url) -> dict                   # {raw_url, owner, repo, ref, path}；非法抛 CatalogError(2026)
@@ -424,7 +431,7 @@ def _import_skill_from_dir(self) -> None:
 | **MCP 配置持久化 + 连接** | **`mcp.py:add_server/connect`** | 已有 `save_servers` 原子写 |
 | 审计 | 路由层调 `store.audit`（安装成功后） | 与现状一致（`routers/assistant.py:528`）|
 
-**关键约束**：`fetch_skill_bundle()` 返回**内存里的 `{rel: text}`**，不落盘。这样 `_atomic_install` 的回滚只需处理一个临时目录，且 `install_from_url` 与 `install_from_github` 共享同一条落盘路径。
+**关键约束**：`fetch_skill_bundle()` 返回**内存里的 `{rel: text}`**，不落盘。这样 `_atomic_install` 的回滚只需处理一个临时目录，且 `install_from_url` 与 `install_from_github` 共享同一条落盘路径。v1.0.8 起新增 `fetch_skill_archive()` 返回 `{rel: bytes}`（二进制原样），由 `skills._atomic_install_bytes` / `_write_files_bytes` 落盘，与文本路径共享 `_safe_rel` 路径校验与原子回滚机制。
 
 ### A2 · 工具裁剪在哪一层：**`ToolRegistry` 内部存 filter，`agent.py` 传入**
 
@@ -667,7 +674,7 @@ emit({"type": "start", "session_id": session_id,
 |---|---|---|---|
 | R-S1 | **首屏空白** | 缓存也没有 + 网络不可达 | 列表区空态文案（PRD §7）；`GET` 先返缓存、**永不抛**（`_cache_read` 失败返回 `{}`） |
 | R-S2 | **`refresh` 卡 12s+** | 三源都超时 | `ThreadPoolExecutor(3)` + 单源 `timeout=5.0` + 总 `12s` 上限；`routers` 用 `run_in_threadpool`（`:260` 已有用法），不阻塞事件循环 |
-| R-S3 | **安装大包卡死 UI** | GitHub 仓库 20 文件 × 2MB | `max_files=20` / `max_bytes=2MB` 硬限；超限只取 `SKILL.md` + 提示「已跳过 N 个附件」；`POST` 客户端 `timeout=120`（`assistant_client.py:55` 已支持） |
+| R-S3 | **安装大包卡死 UI** | GitHub 仓库 20 文件 × 2MB（旧管线） | ✅ **v1.0.8 已修复**：改为 codeload tarball 整包下载，支持大体积（实测 PPT Master ≈13030 文件 / 39MB）与二进制；抽取预算 `ARCHIVE_MAX_FILES=20000` / `ARCHIVE_MAX_BYTES=256MB`，下载预检 `ARCHIVE_MAX_DOWNLOAD=512MB`；二进制 bytes 原样落盘；`POST` 客户端 `timeout=120`（`assistant_client.py:55` 已支持） |
 | R-S4 | **`/state` 变慢** | `state()` 里新增计算（下发计数） | 下发计数从 `select_schemas()` 的**长度**取，不重复算；`state` 已 `list_sessions(500)`（`agent.py:114`），不要在里面加 IO |
 | R-S5 | **菜单超屏** | `[+]` 加到 12 项，200% 下高约 480px | `[+]` 按 §6.1 保留 4 段 + `addSeparator`，管理类压缩成一组 |
 
