@@ -30,9 +30,33 @@ from core.assistant.store import audit, load_config, save_config
 PROTOCOL_VERSION = "2024-11-05"
 CALL_TIMEOUT = 90.0
 
+#: 允许作为 MCP stdio 启动命令的白名单（安全红线，任务分解 §4.7）。
+#: 与 `catalog.COMMAND_WHITELIST` 同源：catalog 层在线安装从这里导入，避免
+#: 两处各维护一套规则（曾经 catalog 有白名单、手动 add_server 没有）。
+COMMAND_WHITELIST = ("npx", "uvx", "python", "node", "docker")
+
 
 class MCPError(RuntimeError):
     pass
+
+
+def is_allowed_command(command: str) -> bool:
+    """stdio 启动命令是否在白名单内（按 basename 比对，容忍绝对路径 exe）。
+
+    - `npx` / `uvx` / `python` / `node` / `docker` 直接放行；
+    - 绝对路径的 exe（用户在手动添加里显式写了 `C:/.../python.exe`）按
+      `os.path.basename` 归一化后比对，去掉 `.exe/.cmd/.bat` 后缀；
+    - 其余（curl / rm / bash / powershell / 空）一律拒绝。
+    """
+    raw = str(command or "").strip()
+    if not raw:
+        return False
+    base = os.path.basename(raw.replace("\\", "/")).lower()
+    for suf in (".exe", ".cmd", ".bat", ".com"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    return base in COMMAND_WHITELIST
 
 
 # ----------------------------------------------------------------------------
@@ -298,6 +322,15 @@ class MCPManager:
         cfg.setdefault("transport", "stdio")
         cfg.setdefault("enabled", True)
         cfg.setdefault("risk", "medium")
+        # 安全红线：stdio 服务器的 command 必须在白名单内。手动 `POST /mcp`
+        # 与在线 `install_from_registry` 共用同一份规则（这里兜底，防止有人
+        # 绕过 catalog.build_mcp_config 直接写任意命令，如 curl / rm）。
+        if str(cfg.get("transport") or "").lower() != "http":
+            command = str(cfg.get("command") or "").strip()
+            if not is_allowed_command(command):
+                raise MCPError(
+                    f"不支持的启动命令：{command or '（空）'}，"
+                    f"只允许 {'/'.join(COMMAND_WHITELIST)}")
         items = [s for s in self.servers() if s.get("id") != cfg["id"]]
         items.append(cfg)
         self.save_servers(items)

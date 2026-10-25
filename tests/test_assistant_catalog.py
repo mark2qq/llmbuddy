@@ -242,6 +242,21 @@ def _http_raw():
     }
 
 
+def _http_required_header_raw():
+    """远程 streamable-http，但 header 有必填项 -> need_register（PRD §5.3）。"""
+    return {
+        "name": "com.example/remote-auth",
+        "title": "Remote Auth",
+        "description": "需要授权 token 的远程 MCP",
+        "version": "1.0.0",
+        "remotes": [{"type": "streamable-http",
+                     "url": "https://api.example.com/mcp",
+                     "headers": [{"name": "Authorization",
+                                  "description": "Bearer token",
+                                  "isRequired": True}]}],
+    }
+
+
 def test_normalize_mcp_server_stdio():
     item = catalog_mod.normalize_mcp_server(_npm_raw())
     assert item["transport"] == "stdio"
@@ -276,8 +291,34 @@ def test_free_class():
     raw = _npm_raw()
     raw["packages"][0]["environmentVariables"] = []
     assert catalog_mod.free_class_of(raw) == "zero_config"
-    assert catalog_mod.free_class_of(_http_raw()) == "need_register"
+    # P2-2：无必填 header 的 streamable-http 是「零配置、一键可连」（PRD §5.3）
+    assert catalog_mod.free_class_of(_http_raw()) == "zero_config"
+    # 只有 header 有必填项才判 need_register
+    assert catalog_mod.free_class_of(_http_required_header_raw()) == "need_register"
     assert catalog_mod.free_class_of({"name": "empty"}) == "unknown"
+
+
+def test_zero_config_streamable_http_not_hidden():
+    """P2-2：零配置远程 MCP 不应落入客户端默认隐藏的分类。
+
+    客户端 `CATALOG_HIDDEN_CLASSES` 含 need_register；若把无 headers 的
+    streamable-http 判成 need_register，用户「抓全部免费 MCP」会漏掉这类
+    一键可连的服务器。断言其 free_class 不在隐藏集合内。
+    """
+    hidden = ("need_key", "need_register")     # 与 assistant_page 同口径
+    fc = catalog_mod.free_class_of(_http_raw())
+    assert fc == "zero_config"
+    assert fc not in hidden
+
+
+def test_zero_config_http_installable_via_build_config():
+    """P2-2：zero_config 远程条目能经 build_mcp_config 落成 http 配置（可装）。"""
+    item = catalog_mod.normalize_mcp_server(_http_raw())
+    assert item["free_class"] == "zero_config"
+    conf = catalog_mod.build_mcp_config(item, existing_ids=[])
+    assert conf["transport"] == "http"
+    assert conf["url"] == "https://mcp.example.com/v1"
+    assert conf["command"] == ""              # http 分支不写 command（不是 stdio）
 
 
 def test_build_mcp_config_stdio_and_env_required():

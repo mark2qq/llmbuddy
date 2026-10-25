@@ -61,8 +61,10 @@ REFRESH_TOTAL_TIMEOUT = 12.0
 #: refresh_all 预热 gh_skills 的仓库数上限（GitHub 配额不可控）
 WARM_REPOS = 3
 
-#: MCP 在线安装时允许的启动命令白名单（安全红线，任务分解 §4.7）
-COMMAND_WHITELIST = ("npx", "uvx", "python", "node", "docker")
+#: MCP 启动命令白名单（安全红线，任务分解 §4.7）。
+#: 与 `mcp.COMMAND_WHITELIST` 同源——单一事实来源，避免在线安装与手动添加
+#: 各维护一套规则而漂移（mcp.py 不再反向 import catalog，无循环依赖）。
+from core.assistant.mcp import COMMAND_WHITELIST  # noqa: E402  (常量区导入)
 
 #: 技能包只收文本类附件（脚本永不执行，但 .py 允许落盘供人工审阅）
 TEXT_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml", ".py", ".toml", ".cfg")
@@ -258,19 +260,66 @@ def _stale_payload(cache: Dict[str, Any], error: str, **extra: Any) -> Dict[str,
 # ----------------------------------------------------------------------------
 # 上游请求小工具
 # ----------------------------------------------------------------------------
+#: 连接类/超时/TLS 抖动的最大重试次数（不含首次）。仅对传输层异常重试，
+#: 4xx/5xx/解析失败不重试（那是确定性的上游语义，重试无益且拖时间）。
+RETRY_MAX = 2
+#: 退避间隔（秒）：首败 0.4s、二败 1.0s。总耗时上限见 RETRY_BUDGET_NOTE。
+RETRY_BACKOFF = (0.4, 1.0)
+
+
+def _is_retryable_transport(exc: BaseException) -> bool:
+    """是否为「连接/超时/TLS 抖动」这类可重试的传输层异常。
+
+    httpx 把网络层错误都归到 `httpx.TransportError`（含 ConnectError /
+    ConnectTimeout / ReadTimeout / RemoteProtocolError / SSL 握手失败）。
+    明确排除 4xx/5xx（`HTTPStatusError` 不在此路径——我们用的是 `c.get`
+    非 `raise_for_status`，状态码在调用方判断）。
+    """
+    return isinstance(exc, httpx.TransportError)
+
+
+def _do_get(cfg: Optional[Dict[str, Any]], url: str,
+            params: Optional[Dict[str, Any]],
+            timeout: float) -> httpx.Response:
+    """发一次 GET（含传输层重试）。最终失败抛原始异常，由调用方包 CatalogError。
+
+    重试策略（P2-4）：最多 `RETRY_MAX` 次，仅 `httpx.TransportError` 重试，
+    退避 `RETRY_BACKOFF`。为避免把 `force=1` 的同步路径拖死：每次尝试沿用
+    调用方 `timeout`，总最坏耗时 ≈ (1+RETRY_MAX)*timeout，故对 5s 预算
+    实际最坏 3×5s——因此只在**单次 timeout ≤ 5s** 时启用满额重试；大超时
+    （如 list_repo_skills 用的 2×5s）降为最多 1 次重试，防止用户等太久。
+    """
+    proxy = _proxy(cfg)
+    attempts = 1 + RETRY_MAX
+    if timeout > CLIENT_TIMEOUT:          # 大超时请求少重试，别拖死同步路径
+        attempts = 1 + 1
+    last: Optional[BaseException] = None
+    for i in range(attempts):
+        try:
+            with _client(cfg, timeout=timeout) as c:
+                return c.get(url, params=params or None)
+        except Exception as e:                    # noqa: BLE001
+            last = e
+            if not _is_retryable_transport(e) or i >= attempts - 1:
+                raise
+            delay = RETRY_BACKOFF[min(i, len(RETRY_BACKOFF) - 1)]
+            time.sleep(delay)
+    assert last is not None
+    raise last
+
+
 def _get_json(cfg: Optional[Dict[str, Any]], url: str,
               params: Optional[Dict[str, Any]] = None,
               timeout: float = CLIENT_TIMEOUT) -> Tuple[Any, Dict[str, str]]:
     """发一次 GET 并解析 JSON。返回 (data, headers)。
 
     失败语义：
-        连接异常 / 超时   -> CatalogError(2020)
+        连接异常 / 超时   -> CatalogError(2020)（传输层抖动已内部重试）
         非 200            -> CatalogError(2021)（含 GitHub 403 限流）
     """
     proxy = _proxy(cfg)
     try:
-        with _client(cfg, timeout=timeout) as c:
-            resp = c.get(url, params=params or None)
+        resp = _do_get(cfg, url, params, timeout)
     except Exception as e:                       # noqa: BLE001
         raise CatalogError(
             ERR_UNREACHABLE,
@@ -298,11 +347,10 @@ def _get_json(cfg: Optional[Dict[str, Any]], url: str,
 
 def _get_text(cfg: Optional[Dict[str, Any]], url: str,
               timeout: float = CLIENT_TIMEOUT) -> str:
-    """取纯文本（raw.githubusercontent.com）。2020/2021 语义同上。"""
+    """取纯文本（raw.githubusercontent.com）。2020/2021 语义同上（含重试）。"""
     proxy = _proxy(cfg)
     try:
-        with _client(cfg, timeout=timeout) as c:
-            resp = c.get(url)
+        resp = _do_get(cfg, url, None, timeout)
     except Exception as e:                       # noqa: BLE001
         raise CatalogError(
             ERR_UNREACHABLE,
@@ -320,38 +368,50 @@ def _get_text(cfg: Optional[Dict[str, Any]], url: str,
 def free_class_of(raw: Dict[str, Any]) -> str:
     """免费/易用分级：zero_config | need_key | need_register | unknown。
 
-    zero_config  = 无必填环境变量、有可直接启动的包  -> 一键装
-    need_key     = 有 isRequired 的 env / header     -> 需用户填密钥
-    need_register= 远程传输但无必填项（多半要先注册账号拿地址）
-    unknown      = 既无 packages 也无 remotes        -> 不给安装按钮
+    zero_config  = 无必填项，且有可直接启动的包（stdio）或可直接连的远程
+                   （streamable-http 且无必填 header）  -> 一键装
+    need_key     = 有 isRequired 的 env（stdio 包）      -> 需用户填密钥
+    need_register= 远程传输且 header 有必填项（先注册/授权拿 token）
+    unknown      = 既无 packages 也无 remotes           -> 不给安装按钮
+
+    规则对齐 PRD §5.3：`remotes[0].type == "streamable-http"` 且 headers 无
+    必填项 → `zero_config`（真正免安装、免密钥，点一下就能连）。只有 header
+    存在必填项才判 `need_register`——否则这类一键可连的服务器会被默认隐藏
+    （客户端 CATALOG_HIDDEN_CLASSES 含 need_register），用户「抓全部免费 MCP」
+    就只能拿到半张清单。
     """
     raw = raw or {}
     packages = [p for p in (raw.get("packages") or []) if isinstance(p, dict)]
     remotes = [r for r in (raw.get("remotes") or []) if isinstance(r, dict)]
-    has_required = False
+    pkg_required = False
     for p in packages:
         for ev in (p.get("environmentVariables") or []):
             if isinstance(ev, dict) and (ev.get("isRequired")
                                          or ev.get("required")):
-                has_required = True
+                pkg_required = True
                 break
-        if has_required:
+        if pkg_required:
             break
-    if not has_required:
+    remote_required = False
+    if not pkg_required:
         for r in remotes:
             for hd in (r.get("headers") or []):
                 if isinstance(hd, dict) and (hd.get("isRequired")
                                              or hd.get("required")):
-                    has_required = True
+                    remote_required = True
                     break
-            if has_required:
+            if remote_required:
                 break
-    if has_required:
+    if pkg_required:
         return "need_key"
+    if remote_required:
+        # 远程 header 有必填项：需先注册/授权拿 token（PRD §5.3）
+        return "need_register"
     if packages:
         return "zero_config"
     if remotes:
-        return "need_register"
+        # 无必填 header 的 streamable-http / sse 远程服务 = 零配置，一键可连
+        return "zero_config"
     return "unknown"
 
 

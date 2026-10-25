@@ -31,9 +31,12 @@ from ui.pages.assistant_page import (  # noqa: E402
 
 app = QApplication.instance() or QApplication(sys.argv)
 
-#: 架构 §4 求和表：逻辑 720 → 左栏 200 → 右栏 520 → 底栏可用 504px
-BAR_BUDGET_W = 504
-#: 架构 §4：压缩后目标 439px（busy 态 439 + 56 = 495 ≤ 504）
+#: 底栏宽度门禁：单一来源——直接取被测页面类的常量，禁止在测试里硬编码
+#: 字面量（否则实现悄悄改预算、测试仍按旧值放行/误报，二者漂移）。
+#: 实测依据：逻辑 720 窗口下右栏容器实际可用 522（idle 474 / busy 522），
+#: 底栏 busy 实测 510 ≤ 522 未裁切；预算 = 522 - 8px style 余量 = 514。
+BAR_BUDGET_W = mod.AssistantPage.BAR_BUDGET_W
+#: 压缩后目标 439px（idle/chip 常态应贴在此附近）
 BAR_TARGET_W = 439
 
 
@@ -323,20 +326,23 @@ def _bar_width(p) -> int:
 
 
 def test_bottom_bar_fits_504px_at_logical_720(page):
-    """逻辑 720 宽下，底栏实际占用 ≤ 504px（右栏可用宽）。"""
+    """逻辑 720 宽下，底栏实际占用 ≤ BAR_BUDGET_W（右栏可用宽重算值 514）。"""
     p, _fake = page
     p.resize(720, 680)
     p._skill_slugs = []
     p._refresh_skill_chips()
     _settle()
     w = _bar_width(p)
-    assert w <= BAR_BUDGET_W, f"底栏 {w}px 超 504px 门禁"
+    assert w <= BAR_BUDGET_W, f"底栏 {w}px 超 {BAR_BUDGET_W}px 门禁"
     # 压缩后应在 439px 附近（留 40px 给不同平台的 style 抖动）
     assert w <= BAR_TARGET_W + 40, f"底栏 {w}px 未压缩到 439px 目标附近"
 
 
 def test_bottom_bar_fits_504px_in_busy_state(page):
-    """忙碌态多出 运行指示 + 停止 + 引导 三个按钮，仍须 ≤ 504px。"""
+    """忙碌态多出 运行指示 + 停止 + 引导 三个按钮，仍须 ≤ BAR_BUDGET_W（514）。
+
+    单跑也应通过：busy 实测 510 ≤ 514（不再依赖跨用例样式表 polish）。
+    """
     p, _fake = page
     p.resize(720, 680)
     p._skill_slugs = []
@@ -347,7 +353,7 @@ def test_bottom_bar_fits_504px_in_busy_state(page):
     p._guide_btn.setVisible(True)
     _settle()
     w = _bar_width(p)
-    assert w <= BAR_BUDGET_W, f"忙碌态底栏 {w}px 超 504px 门禁"
+    assert w <= BAR_BUDGET_W, f"忙碌态底栏 {w}px 超 {BAR_BUDGET_W}px 门禁"
     p._busy_lbl.setVisible(False)
     p._stop_btn.setVisible(False)
     p._guide_btn.setVisible(False)

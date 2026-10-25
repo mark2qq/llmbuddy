@@ -57,7 +57,7 @@ from core.assistant import store as store_mod
 from core.assistant import tools as tools_mod
 from core.assistant.agent import get_assistant
 from core.assistant.approval import get_approval_manager
-from core.assistant.mcp import get_mcp_manager
+from core.assistant.mcp import MCPError, get_mcp_manager
 from core.assistant.queue import (ERR_GUIDED_READONLY, ERR_ITEM_DISPATCHED,
                                   ERR_ITEM_NOT_FOUND, ERR_QUEUE_EMPTY,
                                   ERR_SESSION_BUSY, EV_DEQUEUED, EV_GUIDED,
@@ -533,7 +533,11 @@ async def mcp_list():
 @router.post("/mcp")
 async def mcp_add(body: Dict[str, Any]):
     mgr = get_mcp_manager()
-    cfg = mgr.add_server(body or {})
+    try:
+        cfg = mgr.add_server(body or {})
+    except MCPError as e:
+        # 安全红线：command 不在白名单（mcp.add_server 兜底校验）
+        return fail(2022, str(e))
     audit("mcp_added", server=cfg.get("id"))
     result: Dict[str, Any] = {"server": cfg, "connected": False, "error": ""}
     if body.get("connect", True) and cfg.get("enabled", True):
@@ -661,12 +665,16 @@ async def catalog_skills(q: str = "", force: bool = False):
 
 
 @router.get("/catalog/skills/{owner}/{repo}")
-async def catalog_repo_skills(owner: str, repo: str, ref: str = ""):
-    """枚举单仓库里的技能目录（`**/SKILL.md`）。"""
+async def catalog_repo_skills(owner: str, repo: str, ref: str = "",
+                              force: bool = False):
+    """枚举单仓库里的技能目录（`**/SKILL.md`）。
+
+    `force=1` 跳过缓存强制刷新（客户端 `catalog_repo_skills(..., force=True)`）。
+    """
     from fastapi.concurrency import run_in_threadpool
     try:
         data = await run_in_threadpool(catalog_mod.list_repo_skills,
-                                       _catalog_cfg(), owner, repo, ref)
+                                       _catalog_cfg(), owner, repo, ref, force)
     except catalog_mod.CatalogError as e:
         return _catalog_fail(e)
     return ok(data)

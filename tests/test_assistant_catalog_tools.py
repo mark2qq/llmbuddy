@@ -660,6 +660,141 @@ def test_route_refresh_always_ok(env, monkeypatch):
     assert body["data"]["errors"]
 
 
+# ----------------------------------------------------------------------------
+# P2-1：catalog_repo_skills 的 force 必须透传到 list_repo_skills
+# ----------------------------------------------------------------------------
+def test_route_catalog_repo_skills_passes_force(env, monkeypatch):
+    """?force=1 必须透传到 list_repo_skills(force=True)，不被静默丢弃。"""
+    seen = {}
+
+    def fake_list_repo_skills(cfg, owner, repo, ref="", force=False):
+        seen.update(owner=owner, repo=repo, ref=ref, force=force)
+        return {"commit": "", "ref": ref, "items": [], "fetched_at": 0,
+                "stale": False, "error": ""}
+
+    monkeypatch.setattr(catalog_mod, "list_repo_skills", fake_list_repo_skills)
+    from routers import assistant as api
+    body = asyncio.run(api.catalog_repo_skills("acme", "skills", "main",
+                                               force=True))
+    assert body["code"] == 0
+    assert seen["force"] is True
+    assert (seen["owner"], seen["repo"], seen["ref"]) == ("acme", "skills", "main")
+
+    # 默认不带 force -> False
+    asyncio.run(api.catalog_repo_skills("acme", "skills"))
+    assert seen["force"] is False
+
+
+# ----------------------------------------------------------------------------
+# P2-3：手动 POST /mcp 必须与在线安装共用命令白名单，拒绝任意命令
+# ----------------------------------------------------------------------------
+def test_add_server_rejects_non_whitelisted_command(env):
+    """add_server 对 stdio 的 command 兜底校验：curl / rm / bash 一律拒绝。"""
+    mgr = mcp_mod.get_mcp_manager()
+    for bad in ("curl", "rm", "bash", "powershell", "", "/usr/bin/curl"):
+        with pytest.raises(mcp_mod.MCPError):
+            mgr.add_server({"id": "x", "transport": "stdio", "command": bad})
+    # 合法命令放行
+    ok_cfg = mgr.add_server({"id": "ok1", "transport": "stdio",
+                             "command": "npx", "args": ["-y", "pkg"]})
+    assert ok_cfg["id"] == "ok1"
+    # http 传输不校验 command
+    http_cfg = mgr.add_server({"id": "ok2", "transport": "http",
+                               "url": "https://x/mcp"})
+    assert http_cfg["transport"] == "http"
+
+
+def test_route_mcp_add_rejects_curl(env):
+    """POST /mcp 带 command=curl -> fail(2022)，不落配置。"""
+    from routers import assistant as api
+    body = asyncio.run(api.mcp_add({"id": "evil", "transport": "stdio",
+                                    "command": "curl",
+                                    "args": ["http://evil"]}))
+    assert body["code"] == 2022
+    assert "白名单" in body["message"] or "只允许" in body["message"]
+    ids = [s.get("id") for s in mcp_mod.get_mcp_manager().servers()]
+    assert "evil" not in ids
+
+    # 合法 npx 放行
+    ok_body = asyncio.run(api.mcp_add({"id": "good", "transport": "stdio",
+                                       "command": "npx", "args": ["-y", "pkg"],
+                                       "connect": False}))
+    assert ok_body["code"] == 0
+    assert "good" in [s.get("id") for s in mcp_mod.get_mcp_manager().servers()]
+
+
+# ----------------------------------------------------------------------------
+# P2-4：_do_get 对传输层抖动重试（仅 Connection/Timeout/TLS），4xx 不重试
+# ----------------------------------------------------------------------------
+class _FakeResp:
+    def __init__(self, status=200, payload=None, text="", headers=None):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """按队列返回 response 或抛异常的假 httpx.Client。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url, params=None):
+        self.calls += 1
+        item = self.script.pop(0) if self.script else _FakeResp()
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_get_json_retries_transport_error_then_succeeds(env, monkeypatch):
+    """第一次抛 ConnectError，第二次成功 -> 最终成功且只多打一次。"""
+    import httpx
+    fake = _FakeClient([httpx.ConnectError("boom"),
+                        _FakeResp(200, {"servers": []}, headers={})])
+    monkeypatch.setattr(catalog_mod, "_client",
+                        lambda *a, **k: fake)
+    monkeypatch.setattr(catalog_mod.time, "sleep", lambda *_a, **_k: None)
+    data, _h = catalog_mod._get_json({}, "https://registry/x")
+    assert data == {"servers": []}
+    assert fake.calls == 2                       # 首败 + 1 次重试 = 2 次请求
+
+
+def test_get_json_retries_exhausted_raises_2020(env, monkeypatch):
+    """连续传输层失败 -> 2 次重试后仍失败 -> CatalogError(2020)。"""
+    import httpx
+    fake = _FakeClient([httpx.ConnectError("a"), httpx.ConnectError("b"),
+                        httpx.ConnectError("c")])
+    monkeypatch.setattr(catalog_mod, "_client", lambda *a, **k: fake)
+    monkeypatch.setattr(catalog_mod.time, "sleep", lambda *_a, **_k: None)
+    with pytest.raises(catalog_mod.CatalogError) as ei:
+        catalog_mod._get_json({}, "https://registry/x")
+    assert ei.value.code == 2020
+    assert fake.calls == 1 + catalog_mod.RETRY_MAX
+
+
+def test_get_json_4xx_not_retried(env, monkeypatch):
+    """HTTP 403（非传输层）不重试，只请求一次，报 2021。"""
+    fake = _FakeClient([_FakeResp(403, {}, headers={})])
+    monkeypatch.setattr(catalog_mod, "_client", lambda *a, **k: fake)
+    monkeypatch.setattr(catalog_mod.time, "sleep", lambda *_a, **_k: None)
+    with pytest.raises(catalog_mod.CatalogError) as ei:
+        catalog_mod._get_json({}, "https://api.github.com/x")
+    assert ei.value.code == 2021
+    assert fake.calls == 1                       # 4xx 不重试
+
+
 def test_tool_prefs_roundtrip(env):
     from routers import assistant as api
     put = asyncio.run(api.put_tool_prefs({"disabled": ["shell_run"],
