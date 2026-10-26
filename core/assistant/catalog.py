@@ -196,7 +196,7 @@ def _client(cfg: Optional[Dict[str, Any]] = None,
     `trust_env=False` 是硬约束：环境变量里残留的坏代理会让 httpx 在任何请求前
     就抛异常，且报错信息与真实原因无关；统一由 `_proxy()` / 候选链决定代理。
     """
-    headers = {"User-Agent": "llmBuddy-assistant/1.0.8"}
+    headers = {"User-Agent": "llmBuddy-assistant/1.0.9"}
     token = _github_token(cfg)
     if token:
         headers["Authorization"] = f"Bearer {token}"

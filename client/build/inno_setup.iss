@@ -16,7 +16,7 @@
 
 ; 产品显示名（快捷方式 / 开始菜单 / 控制面板卸载项都显示这个）
 #define MyAppName "llmBuddy"
-#define MyAppVersion "1.0.8"
+#define MyAppVersion "1.0.9"
 #define MyAppPublisher "llmBuddy"
 ; 可执行文件名与产品名一致：llmBuddy.exe（内部以 sys.executable 自拉起，无外部依赖旧名）
 #define MyAppExeName "llmBuddy.exe"

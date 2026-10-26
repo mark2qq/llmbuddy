@@ -26,11 +26,13 @@
     🎤 语音        本机暂无语音能力，不做假按钮
 
 能力（全部走本机后端 /api/v1/assistant/*）：
-    - 操作本机文件、执行命令、抓网页（工具卡片可视化每次调用）
+    - 操作本机文件、执行命令、抓网页（1.0.9 起调用细节不上屏，只改底栏状态；
+      明细在管理面板「审计」页可查）
     - MCP 服务器增删、连接/断开，工具自动进白名单
     - 技能包 SKILL.md 的新建/编辑/导入(zip)/导出(zip)/删除
     - 高危动作审批卡片（允许 / 本任务允许同类 / 拒绝）
     - 本地模型 / 硅基流动 / 自定义 OpenAI 兼容端点切换
+      （1.0.9 起任务进行中切模型挂起，当前任务结束/终止后才真正生效）
     - 任务历史保存与回看（左栏「任务 / 空间」两区 + 管理面板）
     - 引导会话（1.0.9）：执行中插话排队 / 立即引导发送 / 队列可改可删可排序 /
       跨轮次自动消费 / 停止后暂停+继续（详见 docs/智能助理-引导会话-架构设计.md）
@@ -58,7 +60,7 @@ from core import model_info, model_pricing, local_endpoints
 from core.task_runner import Worker
 from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
-                                        StepLine, ThinkingBlock, ToolCard)
+                                        StepLine, ThinkingBlock)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
 from ui.widgets.context_meter import ContextMeter
 from ui.widgets.image_composer import (IMAGE_EXTS, AttachmentBar, PasteImageEdit,
@@ -291,7 +293,10 @@ class AssistantPage(QWidget):
         self._state: Dict[str, Any] = {}
         self._bubble: Optional[ChatBubble] = None
         self._thinking: Optional[ThinkingBlock] = None
-        self._tool_cards: List[ToolCard] = []
+        #: 1.0.9：本轮已执行的工具步数（仅底栏状态提示用，不渲染卡片）
+        self._tools_used = 0
+        #: 1.0.9：忙碌期间的待生效模型切换 (label, apply_fn)；任务结束/终止后应用
+        self._pending_model: Optional[tuple] = None
         self._approvals: Dict[str, ApprovalCard] = {}
         self._busy = False
         self._loading = False
@@ -2419,6 +2424,16 @@ class AssistantPage(QWidget):
 
     def _refresh_model_btn(self) -> None:
         """模型按钮只显短名（宽度压缩规则 ②：90 → 66px），全名进 tooltip。"""
+        pend = getattr(self, "_pending_model", None)
+        if pend:
+            # 1.0.9：忙碌期间选了新模型——显示待生效目标，旧模型仍在跑
+            # 标记放最前：模型名会被底栏宽度截断，⏳ 必须始终看得见
+            text = _ellipsis(pend[0], max(2, self.MODEL_LABEL_MAX - 2))
+            self._model_btn.setText(f"⏳ {text}")
+            self._model_btn.setMaximumWidth(self.MODEL_BTN_MAX)
+            self._model_btn.setToolTip(
+                f"已选择：{pend[0]}\n当前任务结束后自动生效（也可先停止当前任务）")
+            return
         names = self._model_cache.get(self._active_provider) or []
         model = self._active_model or (names[0] if names else "")
         provider = next((p for p in (self._state.get("providers") or [])
@@ -2998,7 +3013,7 @@ class AssistantPage(QWidget):
         self._set_status("助理正在工作…")
         self._bubble = None
         self._thinking = None
-        self._tool_cards = []
+        self._tools_used = 0
 
     def _end_streaming(self) -> None:
         self._busy = False
@@ -3011,6 +3026,8 @@ class AssistantPage(QWidget):
         if self._bubble is not None:
             self._bubble.end_stream()      # 收尾贴合宽度
         self._scroll_bottom(force=True)    # 答完了，回到底部看全文
+        # 1.0.9：本轮完成或被终止 → 现在才真正应用忙碌期间挂起的模型切换
+        self._apply_pending_model()
 
     def _stop(self) -> None:
         """停止 = 本地断流 + 取消当前轮 + 队列暂停（1.0.9：不出队、不清空）。
@@ -3110,31 +3127,15 @@ class AssistantPage(QWidget):
                 self._thinking.set_text(ev.get("text") or "")
                 self._scroll_bottom()
         elif kind == "tool_call":
+            # 1.0.9（参照 WorkBuddy）：工具的加载与调用细节不再暴露在对话流里。
+            # 只把流式气泡定稿（工具后模型会另起一段正文），底栏状态给一句
+            # 不含调用细节的提示；卡片、参数、结果全部不渲染（审计页仍可查）。
             self._finish_bubble()
-            card = ToolCard(ev.get("name") or "", ev.get("summary") or "",
-                            ev.get("risk") or "low", ev.get("args") or {},
-                            index=ev.get("index"))
-            self._tool_cards.append(card)
-            self._append_widget(card)
-            self._scroll_bottom()
+            self._tools_used += 1
+            self._set_status(f"正在使用工具处理（第 {self._tools_used} 步）…")
         elif kind == "tool_result":
-            # 优先按并行执行的调用序号（index）精确回填，避免同名/乱序串卡；
-            # 旧事件不带 index 时回退到按名称匹配。
-            idx = ev.get("index")
-            target = None
-            if idx is not None:
-                for card in self._tool_cards:
-                    if card._index == idx and card._result is None:
-                        target = card
-                        break
-            if target is None:
-                for card in reversed(self._tool_cards):
-                    if card._name == ev.get("name") and card._result is None:
-                        target = card
-                        break
-            if target is not None:
-                target.set_result(bool(ev.get("ok")), ev.get("content") or "")
-            self._scroll_bottom()
+            # 结果同样不上屏；等下一段 delta / done 自己开新气泡
+            self._set_status("助理正在工作…")
         elif kind == "approval_request":
             card = ApprovalCard(ev.get("id") or "", ev.get("tool") or "",
                                 ev.get("reason") or "", ev.get("risk") or "medium",
@@ -3148,7 +3149,8 @@ class AssistantPage(QWidget):
             if card is not None:
                 card.mark_closed("已放行" if ev.get("approve") else "已拒绝")
         elif kind == "skill_step":
-            self._add_step(f"技能[{ev.get('skill')}] {ev.get('phase')}：{ev.get('detail')}")
+            # 1.0.9：技能执行阶段同样只进审计，不在对话流里暴露细节
+            self._set_status("正在执行技能…")
         elif kind == "title":
             self._fill_sessions()
         elif kind == "note":
@@ -3208,33 +3210,13 @@ class AssistantPage(QWidget):
 
     # ---------------- 自动加载（1.0.8，P0-6） ----------------
     def _on_auto_loaded(self, info: Dict[str, Any]) -> None:
-        """`start.auto_loaded` → 插入一条可关闭的 StepLine（同任务同 profile 一次）。
+        """`start.auto_loaded` → 1.0.9 起不再在对话流里提示。
 
-        字段（架构接缝 S3，已定稿）：`profile` / `name` / `skills[]` / `tools`。
-        不参与模型上下文（纯 UI）：只在对话流里插一个 widget，不发回后端。
+        参照 WorkBuddy：技能 / 工具的加载过程对用户不可见（后台静默装配，
+        细节在管理面板与审计页可查）。这里保留接缝与 `_auto_off` 语义，
+        但不渲染任何 widget、不打扰对话流。
         """
-        if not isinstance(info, dict) or not info.get("profile"):
-            return
-        profile = str(info.get("profile") or "")
-        if self._auto_off:
-            # 本会话已点过「关闭自动加载」：后端可能还在同一轮里回旧值，
-            # 客户端立即失效，不再提示（PRD §5.4.3 第 1 条）
-            return
-        key = (str(self._session_id or ""), profile)
-        if key in self._auto_tips:
-            return                    # 同一任务同一 profile 只提示一次
-        self._auto_tips.add(key)
-        skills = [str(s) for s in (info.get("skills") or []) if s]
-        n_tools = int(info.get("tools") or 0)
-        name = str(info.get("name") or profile)
-        parts = [f"已自动加载：{name}"]
-        if skills:
-            parts.append("技能 " + " · ".join(skills))
-        if n_tools:
-            parts.append(f"工具 {n_tools} 个")
-        # 「运行时会请求你确认」让用户在弹审批卡前有预期（架构 §7 体验缓解）
-        text = " · ".join(parts) + "（运行时会请求你确认）"
-        self._add_step_with_action(text, "关闭自动加载", self._disable_auto_load)
+        return
 
     def _auto_load_on(self) -> bool:
         """自动加载是否开启（本会话 _auto_off 优先，其次 GET /profiles 快照）。"""
@@ -3589,7 +3571,7 @@ class AssistantPage(QWidget):
                 wid.deleteLater()
         self._bubble = None
         self._thinking = None
-        self._tool_cards = []
+        self._tools_used = 0
         self._approvals.clear()
         self._follow = True
         # 新任务：待发送的图片与上下文占用都不再属于这个任务
@@ -3804,6 +3786,15 @@ class AssistantPage(QWidget):
             return
         custom.update(patch)
         custom["enabled"] = True
+        if self._busy:
+            self._defer_model(model or "自定义",
+                              lambda ps=providers, m=model:
+                              self._apply_custom_provider(ps, m))
+            return
+        self._apply_custom_provider(providers, model)
+        self._set_status("自定义模型已启用")
+
+    def _apply_custom_provider(self, providers, model: str) -> None:
         # 本地状态先更新，界面立即切过去；后端保存异步跟进
         self._state["providers"] = providers
         self._active_provider = "custom"
@@ -3814,14 +3805,39 @@ class AssistantPage(QWidget):
                    {"providers": providers, "active_provider": "custom"})
         w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
         w.start()
-        self._set_status(f"自定义模型已启用：{base}")
+
+    # ---------------- 模型切换（1.0.9：忙碌期间延后生效） ----------------
+    def _defer_model(self, label: str, apply_fn) -> None:
+        """任务进行中选了模型：只记账，等本轮结束/终止后由 `_end_streaming` 应用。
+
+        参照 WorkBuddy：切换立即改的是「下一轮用哪个模型」，正在跑的这一轮
+        不能被打断换模型 —— 所以后端设置（save_settings）也要等任务结束才写，
+        否则下一轮流（队列续跑）就用了新模型。
+        """
+        self._pending_model = (label, apply_fn)
+        self._refresh_model_btn()
+        self._set_status(f"{label}：将在当前任务结束后生效")
+
+    def _apply_pending_model(self) -> None:
+        """任务结束（完成或被终止）后应用挂起的模型切换。"""
+        pend = self._pending_model
+        self._pending_model = None
+        self._refresh_model_btn()          # 先摘掉「待生效」标记
+        if pend:
+            label, apply_fn = pend
+            self._set_status(f"模型已切换：{label}")
+            apply_fn()
 
     def _set_provider(self, pid: str) -> None:
         if not pid or pid == self._active_provider:
             return
-        self._active_provider = pid
         provider = next((p for p in (self._state.get("providers") or [])
                          if p.get("id") == pid), {})
+        if self._busy:
+            self._defer_model(str(provider.get("label") or pid),
+                              lambda p=pid: self._set_provider(p))
+            return
+        self._active_provider = pid
         self._active_model = str(provider.get("model") or "")
         self._refresh_model_btn()
         self._fill_models(pid)
@@ -3833,6 +3849,9 @@ class AssistantPage(QWidget):
     def _set_model(self, name: str) -> None:
         name = (name or "").strip()
         if not name or name == self._active_model:
+            return
+        if self._busy:
+            self._defer_model(name, lambda n=name: self._set_model(n))
             return
         self._active_model = name
         self._refresh_model_btn()

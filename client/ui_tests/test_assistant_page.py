@@ -469,6 +469,61 @@ def test_switch_model_persists_provider(page):
     assert p._active_provider == "siliconflow"
 
 
+def test_model_switch_deferred_while_busy(page):
+    """1.0.9（参照 WorkBuddy）：任务进行中切模型不立即生效。
+
+    本轮继续用旧模型（active 不变、设置不写），按钮显示「待生效」；
+    任务结束（或被终止 → _end_streaming）后才真正切换并落盘。
+    注意：`_fill_models` 会把首个本地模型（qwen3-4b）自动填进
+    `_active_model`，所以这里的「新模型」必须用别的名字。
+    """
+    p, fake = page
+    fake.saved.clear()
+    p._begin_streaming()
+    old = p._active_model
+    # 同一提供商内换模型
+    p._set_model("qwen3-32b")
+    assert p._active_model == old       # 旧模型仍在跑
+    assert fake.saved == {}             # 设置未写
+    assert "⏳" in p._model_btn.text()
+    assert p._model_btn.text().startswith("⏳")   # 标记前置，截断也看得见
+    assert "生效" in p._model_btn.toolTip()
+    # 换提供商同样被挂起（最后一次选择生效）
+    p._set_provider("siliconflow")
+    assert p._active_provider == "local"
+    assert fake.saved == {}
+    # 任务完成 → 立即应用最后挂起的切换
+    p._end_streaming()
+    assert p._pending_model is None
+    assert p._active_provider == "siliconflow"
+    assert p._active_model == "Qwen/Qwen3-8B"   # 提供商默认模型
+    assert _pump(lambda: fake.saved.get("active_provider") == "siliconflow")
+    assert "⏳" not in p._model_btn.text()
+
+
+def test_model_switch_applies_after_stop(page):
+    """任务被终止（停止按钮 → _end_streaming）后挂起的切换同样生效。"""
+    p, fake = page
+    fake.saved.clear()
+    p._begin_streaming()
+    old = p._active_model
+    p._set_model("qwen3-32b")
+    assert p._active_model == old
+    p._end_streaming()                  # _stop() 内部也走这里
+    assert p._active_model == "qwen3-32b"
+    assert _pump(lambda: fake.saved.get("providers"), 2.0)
+
+
+def test_model_switch_immediate_when_idle(page):
+    """空闲时切模型保持原行为：立即生效并落盘。"""
+    p, fake = page
+    fake.saved.clear()
+    p._set_model("qwen3-32b")
+    assert p._active_model == "qwen3-32b"
+    assert _pump(lambda: fake.saved.get("providers"), 2.0)
+    assert "⏳" not in p._model_btn.text()
+
+
 def test_multi_skill_mount_renders_chips_without_touching_input(page):
     """多技能挂载：每个技能一个可移除 chip，且不改写输入框。"""
     p, _fake = page
@@ -1513,19 +1568,31 @@ def test_workspace_error_from_backend_shows_status(page):
 # 对话渲染
 # ---------------------------------------------------------------------------
 def test_sse_events_render(page):
+    """1.0.9：工具调用细节不再上屏——不建卡片、不进对话流，只改底栏状态。"""
     p, _fake = page
     p._begin_streaming()
     p._on_event({"type": "delta", "text": "我先看一下目录。"})
     p._on_event({"type": "tool_call", "name": "fs_read",
                  "args": {"path": "a.txt"}, "risk": "low", "summary": "读取 a.txt"})
-    assert len(p._tool_cards) == 1
+    # 工具卡片不再创建（含调用名 / 参数 / 结果的细节一律不暴露）
+    from ui.widgets.assistant_cards import ToolCard
+    assert p.findChildren(ToolCard) == []
+    assert p._tools_used == 1
+    assert "工具" in p._status.text()
+    # 流式气泡已定稿：下一段正文由新气泡承载
+    assert p._bubble is None
     p._on_event({"type": "tool_result", "name": "fs_read", "ok": True,
                  "content": "hello"})
-    assert p._tool_cards[0]._result[1] == "hello"
+    assert p.findChildren(ToolCard) == []
+    p._on_event({"type": "skill_step", "skill": "repo-digest",
+                 "phase": "run", "detail": "读取 SKILL.md"})
+    before = p._msg_layout.count()
     p._on_event({"type": "done", "content": "**结果**：a.txt 里有 hello"})
     p._end_streaming()
     assert p._bubble is None
     assert p._busy is False
+    # 全程只进了用户那条 delta 气泡 + 最终答复，没有任何工具/技能过程行
+    assert p._msg_layout.count() == before + 1
 
 
 def test_approval_card_resolves(page):
@@ -1574,7 +1641,7 @@ def test_done_after_tool_call_still_renders_answer(page):
                  "content": "[]"})
     p._on_event({"type": "done", "content": "工作区是空的。"})
     p._end_streaming()
-    assert p._msg_layout.count() == before + 2      # 工具卡 + 最终答复气泡
+    assert p._msg_layout.count() == before + 1      # 仅最终答复气泡（无工具卡）
     assert p._bubble is None
 
 
@@ -2427,43 +2494,26 @@ def test_queue_snapshot_from_other_session_is_dropped(page):
 
 
 # ---------------------------------------------------------------------------
-# 1.0.11 修复：工具卡片长标题不得把内容列顶到视口之外
+# 1.0.9：工具调用细节不上屏——长标题卡片整类消失，横滚问题随之不复存在
 # ---------------------------------------------------------------------------
-def test_long_tool_card_head_does_not_overflow_column(page):
-    """长标题必须省略显示。
-
-    缺陷（用户截图）：卡片标题是不可折行、不可压缩的 QLabel，最小宽度直接
-    决定内容列最小宽度。标题一长，内容列就比视口宽 → 对话区出现横向溢出，
-    被滚走后**所有行首文字**都被裁掉（截图里「ob 查找 …」）。
-    """
+def test_tool_call_events_never_render_widgets(page):
+    """tool_call / tool_result 一律不产生任何 widget（含 ToolCard）。"""
     p, _fake = page
     p.resize(720, 680)
     p._show_thread = None
     long_summary = ("查找 **/ppt-master/workflows/routing.md（在 12 个目录里递归"
                     "匹配，命中 3 处，已按修改时间排序）")
+    before = p._msg_layout.count()
     for i in range(3):
         p._on_event({"type": "tool_call", "name": "fs_glob",
                      "summary": long_summary, "risk": "low",
                      "args": {}, "index": i})
+    p._on_event({"type": "tool_result", "name": "fs_glob", "ok": True,
+                 "index": 0, "content": "x"})
     _pump(lambda: False, 0.2)
-    from PySide6.QtWidgets import QSizePolicy
-
     from ui.widgets.assistant_cards import ToolCard
-    cards = p.findChildren(ToolCard)
-    assert cards
-    card = cards[0]
-    # ① 标题可压缩：水平策略必须是 Ignored（Preferred 会把卡片最小宽度顶到全宽）
-    assert card.head_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
-    assert card.head_label.fullText().startswith("工具 · fs_glob")
-    # ② 压窄后真的省略（不全称铺开）
-    card.resize(320, 60)
-    _pump(lambda: False, 0.2)
-    shown = card.head_label.text()
-    assert shown != card.head_label.fullText()
-    assert shown.endswith("…")
-    # ③ 卡片最小宽度不再由标题全称决定
-    assert card.minimumSizeHint().width() < 400
-    # ④ 内容列不超出视口 → 横向量程为 0 → 不可能被横向滚走
-    assert p._col.minimumSizeHint().width() <= max(
-        p._scroll.viewport().width(), 1)
+    assert p.findChildren(ToolCard) == []
+    assert p._msg_layout.count() == before      # 对话流一行未增
+    assert p._tools_used == 3
+    # 内容列不超出视口 → 横向量程为 0
     assert p._scroll.horizontalScrollBar().maximum() == 0

@@ -250,7 +250,7 @@ class MCPClient:
         res = self._send("initialize", {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
-            "clientInfo": {"name": "llmBuddy-assistant", "version": "1.0.8"},
+            "clientInfo": {"name": "llmBuddy-assistant", "version": "1.0.9"},
         }, timeout=60)
         self.server_info = (res or {}).get("serverInfo") or {}
         if self.transport != "http":

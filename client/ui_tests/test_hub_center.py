@@ -775,7 +775,7 @@ def test_manager_dialog_folds_detail_below_720(page):
 
 
 # --------------------------------------------------------------------------- #
-# T04 ⑦：自动加载提示（start.auto_loaded → StepLine + 关闭按钮）
+# T04 ⑦（1.0.9 修订）：自动加载细节不再在对话流里提示（参照 WorkBuddy）
 # --------------------------------------------------------------------------- #
 def test_step_line_signature_unchanged():
     """架构 §6 裁定：`StepLine.__init__` 签名不动，新组件用组合实现。"""
@@ -804,42 +804,30 @@ def _auto_prompts(p) -> list:
     return out
 
 
-def test_auto_loaded_event_renders_prompt(page):
-    """收到 start.auto_loaded 时渲染提示行 + 关闭按钮。"""
+def test_auto_loaded_event_renders_nothing(page):
+    """1.0.9：start.auto_loaded 不再渲染任何提示行（加载细节不暴露）。"""
     p, _fake = page
     p._auto_tips.clear()
+    before = p._msg_layout.count()
     p._on_event({"type": "start", "session_id": "s1",
                  "auto_loaded": {"profile": "file-organize", "name": "文件整理",
                                  "skills": ["workspace-organizer"], "tools": 7}})
     _settle()
-    prompts = _auto_prompts(p)
-    assert prompts, "自动加载没有渲染提示行"
-    text = prompts[-1].step.label.text()
-    assert "已自动加载" in text, text
-    assert "文件整理" in text, text
-    assert "workspace-organizer" in text, text
-    assert "7" in text, text
-    # 提示行右侧必须有「关闭自动加载」按钮
-    assert prompts[-1].btn.text() == "关闭自动加载"
-    assert prompts[-1].btn.objectName() == "MiniBtn"
+    assert _auto_prompts(p) == []
+    assert p._msg_layout.count() == before
 
 
-def test_auto_loaded_prompts_only_once_per_profile(page):
-    """同一 profile 只提示一次，避免每轮刷屏。"""
+def test_auto_loaded_repeated_events_still_silent(page):
+    """重复收到 auto_loaded 同样不渲染（不刷屏、不累计）。"""
     p, _fake = page
     p._auto_tips.clear()
     ev = {"type": "start", "session_id": "s1",
           "auto_loaded": {"profile": "file-organize", "name": "文件整理",
                           "skills": [], "tools": 3}}
     p._on_event(dict(ev))
-    _settle()
-    first = len(_auto_prompts(p))
-    p._on_event(dict(ev))
     p._on_event(dict(ev))
     _settle()
-    second = len(_auto_prompts(p))
-    assert first == 1
-    assert second == first, f"重复提示：{first} → {second}"
+    assert _auto_prompts(p) == []
 
 
 def test_disable_auto_load_calls_backend_and_silences(page):
