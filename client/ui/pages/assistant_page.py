@@ -60,7 +60,7 @@ from core import model_info, model_pricing, local_endpoints
 from core.task_runner import Worker
 from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
-                                        StepLine, ThinkingBlock)
+                                        ProcessLine, StepLine, ThinkingBlock)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
 from ui.widgets.context_meter import ContextMeter
 from ui.widgets.image_composer import (IMAGE_EXTS, AttachmentBar, PasteImageEdit,
@@ -295,6 +295,9 @@ class AssistantPage(QWidget):
         self._thinking: Optional[ThinkingBlock] = None
         #: 1.0.9：本轮已执行的工具步数（仅底栏状态提示用，不渲染卡片）
         self._tools_used = 0
+        #: 1.0.9：进程呈现行（WorkBuddy 式聚合摘要 + 可展开明细）
+        self._proc: Optional[ProcessLine] = None
+        self._proc_steps: List[Dict[str, Any]] = []
         #: 1.0.9：忙碌期间的待生效模型切换 (label, apply_fn)；任务结束/终止后应用
         self._pending_model: Optional[tuple] = None
         self._approvals: Dict[str, ApprovalCard] = {}
@@ -3014,6 +3017,8 @@ class AssistantPage(QWidget):
         self._bubble = None
         self._thinking = None
         self._tools_used = 0
+        self._proc = None
+        self._proc_steps = []
 
     def _end_streaming(self) -> None:
         self._busy = False
@@ -3127,27 +3132,31 @@ class AssistantPage(QWidget):
                 self._thinking.set_text(ev.get("text") or "")
                 self._scroll_bottom()
         elif kind == "tool_call":
-            # 1.0.9（参照 WorkBuddy）：工具的加载与调用细节不再暴露在对话流里。
-            # 只把流式气泡定稿（工具后模型会另起一段正文），底栏状态给一句
-            # 不含调用细节的提示；卡片、参数、结果全部不渲染（审计页仍可查）。
+            # 1.0.9（参照 WorkBuddy）：工具调用不再铺开成卡片，而是收进一行
+            # 「进程呈现」（聚合摘要 + 可展开明细）。默认只看到一行摘要，
+            # 调用参数与结果要点开才有。
             self._finish_bubble()
             self._tools_used += 1
+            self._on_tool_call(ev)
             self._set_status(f"正在使用工具处理（第 {self._tools_used} 步）…")
         elif kind == "tool_result":
-            # 结果同样不上屏；等下一段 delta / done 自己开新气泡
+            # 结果回填到进程行（不进对话流正文）
+            self._on_tool_result(ev)
             self._set_status("助理正在工作…")
         elif kind == "approval_request":
             card = ApprovalCard(ev.get("id") or "", ev.get("tool") or "",
                                 ev.get("reason") or "", ev.get("risk") or "medium",
                                 ev.get("args") or {})
             card.resolved.connect(self._resolve_approval)
+            card.closed.connect(self._on_approval_closed)
             self._approvals[ev.get("id") or ""] = card
             self._append_widget(card)
             self._scroll_bottom()
         elif kind == "approval_result":
+            # 1.0.9：审批有结果后这张卡不再留在对话流里 —— 直接关掉
             card = self._approvals.get(ev.get("id") or "")
             if card is not None:
-                card.mark_closed("已放行" if ev.get("approve") else "已拒绝")
+                card.close_now()
         elif kind == "skill_step":
             # 1.0.9：技能执行阶段同样只进审计，不在对话流里暴露细节
             self._set_status("正在执行技能…")
@@ -3414,6 +3423,102 @@ class AssistantPage(QWidget):
         w.error.connect(lambda m: self._set_status(f"审批提交失败：{m}"))
         w.start()
 
+    # ---------------- 进程呈现（1.0.9，参照 WorkBuddy） ----------------
+    #: 工具名 → 人话动作短语（WorkBuddy 的「运行命令 / 查看文件：x」那种）
+    @staticmethod
+    def _tool_action(name: str, args: Dict[str, Any]) -> str:
+        n = (name or "").strip().lower()
+        a = args if isinstance(args, dict) else {}
+
+        def g(*keys: str) -> str:
+            for k in keys:
+                v = str(a.get(k) or "").strip()
+                if v:
+                    return v
+            return ""
+
+        if n == "fs_read":
+            return f"查看文件：{g('path', 'file')}" if g("path", "file") else "查看文件"
+        if n in ("fs_write", "fs_create", "fs_append"):
+            return f"写入文件：{g('path', 'file')}" if g("path", "file") else "写入文件"
+        if n in ("fs_edit", "fs_patch", "fs_replace", "fs_apply_patch"):
+            return f"修改文件：{g('path', 'file')}" if g("path", "file") else "修改文件"
+        if n == "fs_list":
+            return f"查看目录：{g('path')}" if g("path") else "查看目录"
+        if n == "fs_glob":
+            return f"查找文件：{g('pattern', 'glob')}" if g("pattern", "glob") else "查找文件"
+        if n == "fs_delete":
+            return f"删除文件：{g('path', 'file')}" if g("path", "file") else "删除文件"
+        if n == "fs_move":
+            return f"移动文件：{g('src', 'source', 'from')}" if g("src", "source", "from") else "移动文件"
+        if n == "fs_copy":
+            return f"复制文件：{g('src', 'source', 'from')}" if g("src", "source", "from") else "复制文件"
+        if n == "shell_run":
+            return "运行命令"
+        if n == "web_fetch":
+            return f"访问网络：{g('url')}" if g("url") else "访问网络"
+        if n == "skill_run":
+            return f"执行技能：{g('skill', 'slug')}" if g("skill", "slug") else "执行技能"
+        if n == "skill_list":
+            return "读取技能列表"
+        if n.startswith("mcp__"):
+            return f"调用工具：{n.split('__')[-1]}"
+        return f"执行 {n}" if n else "执行工具"
+
+    def _on_tool_call(self, ev: Dict[str, Any]) -> None:
+        """一次工具调用 → 并入当前「进程呈现」行（WorkBuddy 的分组口径）。
+
+        分组规则：**上一组已经全部返回结果**时另起一组（模型又调了一轮工具），
+        否则并入当前组（同一轮里的并行调用合并成一行摘要）。
+        """
+        action = self._tool_action(ev.get("name") or "", ev.get("args") or {})
+        done_all = bool(self._proc_steps) and all(s.get("done") for s in self._proc_steps)
+        if self._proc is None or done_all:
+            self._proc = ProcessLine()
+            self._proc_steps = []
+            self._append_widget(self._proc)
+            self._scroll_bottom()
+        pos = self._proc.add_step(action)
+        self._proc_steps.append({"pos": pos, "name": ev.get("name") or "",
+                                 "index": ev.get("index"), "done": False})
+
+    def _on_tool_result(self, ev: Dict[str, Any]) -> None:
+        """工具结果 → 回填到进程行（按 index 优先，其次按名称）。"""
+        if self._proc is None or not self._proc_steps:
+            return
+        idx = ev.get("index")
+        name = ev.get("name") or ""
+        target = None
+        for s in self._proc_steps:
+            if s.get("done"):
+                continue
+            if idx is not None and s.get("index") is not None and s.get("index") == idx:
+                target = s
+                break
+        if target is None:
+            for s in self._proc_steps:
+                if not s.get("done") and s.get("name") == name:
+                    target = s
+                    break
+        if target is None:
+            return
+        target["done"] = True
+        self._proc.set_result(int(target.get("pos") or 0), bool(ev.get("ok")))
+
+    def _on_approval_closed(self, aid: str) -> None:
+        """审批卡关闭：从对话流里摘掉，别留一张点过的卡在那儿。"""
+        card = self._approvals.pop(aid, None)
+        if card is None:
+            return
+        lay = self._msg_layout
+        for i in range(lay.count()):
+            if lay.itemAt(i).widget() is card:
+                lay.takeAt(i)
+                break
+        card.setParent(None)
+        card.deleteLater()
+        self._scroll_bottom()
+
     # ---------------- 消息渲染 ----------------
     def _ensure_bubble(self) -> ChatBubble:
         if self._bubble is None:
@@ -3572,6 +3677,8 @@ class AssistantPage(QWidget):
         self._bubble = None
         self._thinking = None
         self._tools_used = 0
+        self._proc = None
+        self._proc_steps = []
         self._approvals.clear()
         self._follow = True
         # 新任务：待发送的图片与上下文占用都不再属于这个任务

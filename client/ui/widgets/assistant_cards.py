@@ -5,6 +5,7 @@
     ChatBubble     用户/助手气泡（助手支持 Markdown 渐进渲染）
     ToolCard       工具调用卡片（可展开看参数与结果）
     ApprovalCard   高危动作审批卡片（允许 / 本任务允许 / 拒绝）
+    ProcessLine    进程呈现行（WorkBuddy 式：一行聚合摘要 + 可展开明细）
     StepLine       技能阶段提示（plan/act/review 的细线文字）
     AutoLoadPrompt 自动加载提示行：StepLine 文案 + 行尾 MiniBtn（1.0.8，不改 StepLine）
     ThinkingBlock  模型思考过程（WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠）
@@ -15,7 +16,7 @@ from typing import Any, Dict, Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
-                               QSizePolicy, QVBoxLayout, QWidget)
+                               QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 RISK_LABEL = {"low": "只读", "medium": "写入", "high": "高危"}
 RISK_OBJ = {"low": "RiskLow", "medium": "RiskMedium", "high": "RiskHigh"}
@@ -381,10 +382,98 @@ class ToolCard(_Collapsible):
         self._render()
 
 
+class ProcessLine(QWidget):
+    """WorkBuddy 式「进程呈现」：一行聚合摘要 + 可展开的步骤明细。
+
+    对应 WorkBuddy 对话流里那种「⊠ 运行命令、查看文件：x.png ›」的紧凑条目：
+    **默认只显示一行聚合摘要**（不铺开调用参数与结果），点一下才展开每一步。
+    这样「系统在干活」一眼可见，又不会把原始调用细节堆在对话流里。
+
+    用法：页面侧按「一批连续工具调用」建一个 ProcessLine，逐条 `add_step()`，
+    出结果时 `set_result()` 回填；`toggle()` 展开/收起。
+    """
+
+    MAX_ITEMS = 3          # 摘要里最多列几项，超出折成「等 N 项」
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ProcessLine")
+        self._steps = []            # [{"action": str, "ok": Optional[bool]}]
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 1, 0, 1)
+        v.setSpacing(1)
+
+        self.head = QToolButton(self)
+        self.head.setObjectName("ProcessHead")
+        self.head.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.head.setCursor(Qt.PointingHandCursor)
+        self.head.setAutoRaise(True)
+        self.head.setText("⚡ 正在处理")
+        self.head.setToolTip("点击展开这一步的过程")
+        self.head.clicked.connect(self.toggle)
+        v.addWidget(self.head, 0, Qt.AlignLeft)
+
+        self.body = QWidget(self)
+        self.body.setObjectName("ProcessBody")
+        self._body_lay = QVBoxLayout(self.body)
+        self._body_lay.setContentsMargins(14, 0, 0, 0)
+        self._body_lay.setSpacing(1)
+        self.body.setVisible(False)
+        v.addWidget(self.body, 0)
+        self._expanded = False        # 自己记展开态：父控件不可见时 isVisible() 恒 False
+
+    # ---------------- 步骤 ----------------
+    def add_step(self, action: str) -> int:
+        """追加一步，返回它的序号（页面侧用它回填结果）。"""
+        self._steps.append({"action": action, "ok": None})
+        self._refresh()
+        return len(self._steps) - 1
+
+    def set_result(self, pos: int, ok: bool) -> None:
+        if 0 <= pos < len(self._steps):
+            self._steps[pos]["ok"] = bool(ok)
+        self._refresh()
+
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        self.body.setVisible(self._expanded)
+        self._refresh()
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
+
+    # ---------------- 渲染 ----------------
+    def _refresh(self) -> None:
+        acts = [s["action"] for s in self._steps] or ["正在处理"]
+        shown = acts[:self.MAX_ITEMS]
+        if len(acts) > self.MAX_ITEMS:
+            shown.append(f"等 {len(acts)} 项")
+        arrow = "▾" if self._expanded else "›"
+        self.head.setText(f"⚡ {'、'.join(shown)} {arrow}")
+        self.head.setToolTip("点击展开这一步的过程" if not self._expanded
+                             else "点击收起")
+
+        while self._body_lay.count():
+            item = self._body_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for s in self._steps:
+            mark = "·" if s["ok"] is None else ("✓" if s["ok"] else "✗")
+            lbl = QLabel(f"{mark} {s['action']}")
+            lbl.setObjectName("ProcessStep")
+            lbl.setWordWrap(True)
+            lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+            self._body_lay.addWidget(lbl)
+
+
 class ApprovalCard(QFrame):
     """高危动作审批卡片。"""
 
     resolved = Signal(str, bool, bool)      # approval_id, approve, remember
+    closed = Signal(str)                     # approval_id：卡片已关闭（确认后自动收起）
 
     def __init__(self, approval_id: str, tool: str, summary: str,
                  risk: str, args: Optional[Dict[str, Any]] = None, parent=None):
@@ -433,10 +522,16 @@ class ApprovalCard(QFrame):
     def _done(self, approve: bool, remember: bool) -> None:
         for b in (self.btn_allow, self.btn_allow_once, self.btn_deny):
             b.setEnabled(False)
-        note = QLabel("已允许" if approve else "已拒绝")
-        note.setObjectName("CardBody")
-        self.layout().addWidget(note)
         self.resolved.emit(self.approval_id, approve, remember)
+        # 1.0.9（用户截图）：确认后这张卡片不再留在对话流里 —— 关闭它
+        self.close_now()
+
+    def close_now(self) -> None:
+        """关闭审批卡：先通知外部摘掉，再从布局里移除并销毁。"""
+        self.closed.emit(self.approval_id)
+        self.hide()
+        self.setParent(None)
+        self.deleteLater()
 
     def mark_closed(self, text: str = "该审批已失效") -> None:
         for b in (self.btn_allow, self.btn_allow_once, self.btn_deny):

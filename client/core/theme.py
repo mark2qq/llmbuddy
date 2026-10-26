@@ -303,6 +303,10 @@ QTabBar::tab:selected { color: #1b3a8f; border-bottom: 2px solid #4a6cf7; }
 #RiskLow { color: #1f6b8f; }
 #MiniBtn { background-color: #eef1f7; color: #3b4354; border: 1px solid #d5dbe7; }
 #MiniBtn:hover { background-color: #e2e7f0; color: #12161f; }
+/* 进程呈现（1.0.9） */
+#ProcessHead { color: #5a6275; }
+#ProcessHead:hover { color: #1f2430; }
+#ProcessStep { color: #6b7385; }
 
 /* 输入容器与胶囊控件：浅色 */
 #Composer { background-color: #ffffff; border: 1px solid #dbe0ea; }

@@ -578,6 +578,26 @@ QTabBar::tab:hover { color: #d6dbe8; }
     font-family: "Consolas", "Cascadia Mono", monospace;
 }
 
+/* 进程呈现（1.0.9，WorkBuddy 式：一行聚合摘要 + 可展开明细） */
+#ProcessLine { background: transparent; border: none; }
+#ProcessHead {
+    color: #8f98ab;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+    padding: 1px 0;
+    text-align: left;
+}
+#ProcessHead:hover { color: #cfd6e6; }
+#ProcessBody { background: transparent; border: none; }
+#ProcessStep {
+    color: #7b8496;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
 /* 思考过程（WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠） */
 #ThinkingBlock {
     background: transparent;

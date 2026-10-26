@@ -1568,7 +1568,7 @@ def test_workspace_error_from_backend_shows_status(page):
 # 对话渲染
 # ---------------------------------------------------------------------------
 def test_sse_events_render(page):
-    """1.0.9：工具调用细节不再上屏——不建卡片、不进对话流，只改底栏状态。"""
+    """1.0.9：工具调用收进「进程呈现」一行——不建卡片、不铺开细节。"""
     p, _fake = page
     p._begin_streaming()
     p._on_event({"type": "delta", "text": "我先看一下目录。"})
@@ -1591,7 +1591,7 @@ def test_sse_events_render(page):
     p._end_streaming()
     assert p._bubble is None
     assert p._busy is False
-    # 全程只进了用户那条 delta 气泡 + 最终答复，没有任何工具/技能过程行
+    # 对话流只多了最终答复气泡（进程行在 before 之前已计入，没有工具卡）
     assert p._msg_layout.count() == before + 1
 
 
@@ -1605,6 +1605,85 @@ def test_approval_card_resolves(page):
     assert card is not None
     card._done(True, True)
     assert _pump(lambda: fake.approvals == [("ap1", True, True)])
+
+
+def test_approval_card_closes_after_confirm(page):
+    """1.0.9（用户截图）：点「允许」后这张审批卡要从对话流里消失。"""
+    p, fake = page
+    p._begin_streaming()
+    p._on_event({"type": "approval_request", "id": "ap9", "tool": "web_fetch",
+                 "args": {"url": "https://www.google.com"}, "risk": "medium",
+                 "reason": "访问网络 https://www.google.com"})
+    card = p._approvals.get("ap9")
+    assert card is not None
+    from ui.widgets.assistant_cards import ApprovalCard
+    assert p.findChildren(ApprovalCard)          # 审批前在对话流里
+    card._done(True, False)
+    assert _pump(lambda: fake.approvals == [("ap9", True, False)])
+    # 确认后：卡片被摘掉、字典里也不留
+    assert _pump(lambda: "ap9" not in p._approvals)
+    _pump(lambda: False, 0.2)
+    assert p.findChildren(ApprovalCard) == []
+
+
+def test_approval_result_event_closes_card(page):
+    """后端回审批结果（超时拒绝等）时，卡片同样关掉，不留在流里。"""
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "approval_request", "id": "ap8", "tool": "fs_delete",
+                 "args": {"path": "a.txt"}, "risk": "high",
+                 "reason": "删除 a.txt"})
+    from ui.widgets.assistant_cards import ApprovalCard
+    assert p.findChildren(ApprovalCard)
+    p._on_event({"type": "approval_result", "id": "ap8", "approve": False})
+    assert _pump(lambda: "ap8" not in p._approvals)
+    _pump(lambda: False, 0.2)
+    assert p.findChildren(ApprovalCard) == []
+
+
+def test_process_line_groups_and_expands(page):
+    """1.0.9：进程呈现——一批调用合并成一行摘要，可展开看明细。"""
+    p, _fake = page
+    from ui.widgets.assistant_cards import ProcessLine
+    p._begin_streaming()
+    # 同一批并行调用 → 合并成一行
+    p._on_event({"type": "tool_call", "name": "fs_read",
+                 "args": {"path": "a.txt"}, "risk": "low", "index": 0})
+    p._on_event({"type": "tool_call", "name": "shell_run",
+                 "args": {"command": "dir"}, "risk": "high", "index": 1})
+    lines = p.findChildren(ProcessLine)
+    assert len(lines) == 1
+    line = lines[0]
+    head = line.head.text()
+    assert "查看文件：a.txt" in head
+    assert "运行命令" in head
+    assert line.expanded is False                 # 默认折叠，不铺开细节
+    # 结果回填（ok / 失败）
+    p._on_event({"type": "tool_result", "name": "fs_read", "ok": True, "index": 0})
+    p._on_event({"type": "tool_result", "name": "shell_run", "ok": False, "index": 1})
+    # 展开后能看到每一步
+    line.toggle()
+    assert line.expanded is True
+    steps = [w.text() for w in line.body.findChildren(QLabel)]
+    assert any("查看文件：a.txt" in s for s in steps)
+    assert any("运行命令" in s for s in steps)
+    # 上一批全部返回后，再来一批 → 另起一行进程呈现
+    p._on_event({"type": "tool_call", "name": "web_fetch",
+                 "args": {"url": "https://x.com"}, "risk": "medium", "index": 0})
+    assert len(p.findChildren(ProcessLine)) == 2
+
+
+def test_tool_action_phrases_match_workbuddy_style(page):
+    """工具名 → 人话动作短语（WorkBuddy 口径：运行命令 / 查看文件：x）。"""
+    p, _fake = page
+    f = p._tool_action
+    assert f("shell_run", {"command": "dir"}) == "运行命令"
+    assert f("fs_read", {"path": "a.txt"}) == "查看文件：a.txt"
+    assert f("fs_write", {"path": "b.txt"}) == "写入文件：b.txt"
+    assert f("fs_edit", {"path": "c.txt"}) == "修改文件：c.txt"
+    assert f("web_fetch", {"url": "https://x.com"}) == "访问网络：https://x.com"
+    assert f("skill_run", {"skill": "repo-digest"}) == "执行技能：repo-digest"
+    assert f("mcp__fs__read", {}) == "调用工具：read"
 
 
 def test_load_session_renders_history(page):
@@ -1641,7 +1720,7 @@ def test_done_after_tool_call_still_renders_answer(page):
                  "content": "[]"})
     p._on_event({"type": "done", "content": "工作区是空的。"})
     p._end_streaming()
-    assert p._msg_layout.count() == before + 1      # 仅最终答复气泡（无工具卡）
+    assert p._msg_layout.count() == before + 2      # 进程呈现行 + 最终答复气泡
     assert p._bubble is None
 
 
@@ -2497,7 +2576,7 @@ def test_queue_snapshot_from_other_session_is_dropped(page):
 # 1.0.9：工具调用细节不上屏——长标题卡片整类消失，横滚问题随之不复存在
 # ---------------------------------------------------------------------------
 def test_tool_call_events_never_render_widgets(page):
-    """tool_call / tool_result 一律不产生任何 widget（含 ToolCard）。"""
+    """tool_call / tool_result 只进「进程呈现」行，不产生工具卡片。"""
     p, _fake = page
     p.resize(720, 680)
     p._show_thread = None
@@ -2511,9 +2590,11 @@ def test_tool_call_events_never_render_widgets(page):
     p._on_event({"type": "tool_result", "name": "fs_glob", "ok": True,
                  "index": 0, "content": "x"})
     _pump(lambda: False, 0.2)
-    from ui.widgets.assistant_cards import ToolCard
+    from ui.widgets.assistant_cards import ProcessLine, ToolCard
     assert p.findChildren(ToolCard) == []
-    assert p._msg_layout.count() == before      # 对话流一行未增
+    assert p._msg_layout.count() == before + 1      # 只多了一行进程呈现
+    lines = p.findChildren(ProcessLine)
+    assert len(lines) == 1
     assert p._tools_used == 3
     # 内容列不超出视口 → 横向量程为 0
     assert p._scroll.horizontalScrollBar().maximum() == 0
