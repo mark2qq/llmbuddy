@@ -40,7 +40,12 @@ from core.assistant.store import (audit, delete_session, ensure_dirs, get_provid
 from core.assistant.tools import ToolRegistry
 
 MAX_HISTORY_MESSAGES = 24
-MAX_TOOL_ROUNDS = 12
+#: 单轮对话「模型→工具→模型」循环轮次上限。**0 = 不限制**（默认）。
+#: 本地小模型跑多步任务（如从 GitHub 列目录→取 SKILL.md→取附属文件→安装→
+#: 验证）轻松超过十几轮，写死小值会把任务中途掐断（历史上 12 次上限就掐过
+#: 「下载安装 PPT Master 技能」）。不设上限后，真正的兜底是
+#: MAX_TURN_SECONDS 墙钟 + 用户随时点「停止」。
+DEFAULT_MAX_TOOL_ROUNDS = 0
 #: 单轮自动挂载的技能上限（profile.skills + mounted_skills 合并后）
 MAX_AUTO_SKILLS = 5
 #: 未命中 profile 时写进 system 的可用技能条数上限
@@ -329,7 +334,15 @@ class Assistant:
 
         try:
             turn_started = time.time()
-            while rounds < MAX_TOOL_ROUNDS:
+            # 工具轮次上限：config.max_tool_rounds，0/缺省 = 不限制
+            # （仅受 MAX_TURN_SECONDS 墙钟与用户「停止」约束）。
+            try:
+                max_rounds = int(cfg.get("max_tool_rounds")
+                                 or DEFAULT_MAX_TOOL_ROUNDS)
+            except (TypeError, ValueError):
+                max_rounds = DEFAULT_MAX_TOOL_ROUNDS
+            max_rounds = max(0, max_rounds)
+            while max_rounds <= 0 or rounds < max_rounds:
                 if self._cancelled(session_id):
                     emit({"type": "stopped"})
                     break
@@ -426,8 +439,9 @@ class Assistant:
                     emit({"type": "stopped"})
                     break
             else:
+                # 仅在设置了正数上限时才会走到这里（0 = 不限制，循环不会因条件退出）
                 emit({"type": "error",
-                      "message": f"已达到单轮工具调用上限（{MAX_TOOL_ROUNDS} 次），已中止"})
+                      "message": f"已达到单轮工具调用上限（{max_rounds} 次），已中止"})
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             emit({"type": "error", "message": error})

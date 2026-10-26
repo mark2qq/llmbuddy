@@ -586,7 +586,7 @@ async def get_settings():
 async def put_settings(body: Dict[str, Any]):
     allowed = {"policy", "active_provider", "providers", "workspace",
                "max_steps", "approval_timeout", "temperature", "max_tokens",
-               "skill_timeout", "auto_load"}
+               "skill_timeout", "auto_load", "max_tool_rounds"}
     patch = {k: v for k, v in (body or {}).items() if k in allowed}
     if "providers" in patch:
         # 按 id 合并：客户端拿到的 providers 不含 api_key（state 不下发密钥），

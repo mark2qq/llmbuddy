@@ -9,7 +9,7 @@ LangGraph 技能编排（core/assistant/orchestrator.py）。
                                  └→ finish → END
 
     plan   让模型把任务拆成 3-6 个可执行步骤（JSON）
-    act    逐步执行：模型可调用工具，最多 3 轮工具调用/步
+    act    逐步执行：模型可调用工具，最多 12 轮工具调用/步
     review 判定目标是否达成，未达成就回到 act 继续
     finish 汇总产出（Markdown）
 
@@ -32,11 +32,15 @@ except Exception:                               # pragma: no cover
     START = END = None
     HAS_LANGGRAPH = False
 
-MAX_STEPS = 5
-MAX_TOOL_ROUNDS_PER_STEP = 3
+#: 计划步数上限。config.max_steps 默认 12，此前被 clamp 到 5（潜在 bug）；
+#: PPT 生成这类任务的计划轻松超过 5 步，抬到与配置默认一致。
+MAX_STEPS = 12
+#: 单步内「模型→工具」轮次上限。3 轮对真实任务（读模板→生成→转换→校验）
+#: 远远不够，抬到 12；整体仍受 skill_timeout（默认 240s）墙钟约束。
+MAX_TOOL_ROUNDS_PER_STEP = 12
 MAX_SKILL_DEPTH = 2
 
-_PLAN_PROMPT = """你是任务规划器。请把用户任务拆成 {n}~6 个可执行的步骤（每步一句话，
+_PLAN_PROMPT = """你是任务规划器。请把用户任务拆成 3~12 个可执行的步骤（每步一句话，
 动宾结构，可通过工具完成）。只输出 JSON 数组，不要任何解释：
 ["步骤1", "步骤2", ...]"""
 

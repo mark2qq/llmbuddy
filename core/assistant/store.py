@@ -107,7 +107,11 @@ def _default_config() -> Dict[str, Any]:
              "enabled": False, "base_url": "", "api_key": "", "model": ""},
         ],
         "workspace": DEFAULT_WORKSPACE,
-        "max_steps": 12,             # 单轮最多工具调用轮次
+        "max_steps": 12,             # 技能编排的计划步数上限（orchestrator）
+        # 单轮对话「模型→工具→模型」循环轮次上限：**0 = 不限制**（默认）。
+        # 多步任务（列目录→取文件→安装→验证）常超十几轮；兜底靠 900s 墙钟 +
+        # 用户停止。要恢复上限就改成正整数（如 12）。
+        "max_tool_rounds": 0,
         "skill_timeout": 240,        # 单个技能的整体时限（秒），超时强制收尾
         "approval_timeout": 300,     # 审批等待上限（秒），超时按拒绝处理
         "temperature": 0.3,

@@ -328,6 +328,50 @@ def test_agent_turn_runs_tool_and_reports(env, monkeypatch):
     assert saved["title"].startswith("在工作区")
 
 
+def test_agent_tool_rounds_unlimited_by_default(env, monkeypatch):
+    """默认 max_tool_rounds=0：超过旧 12 次上限也不中止（用户要求工具调用不限次）。
+
+    旧实现写死 MAX_TOOL_ROUNDS=12，多步任务（列目录→取文件→安装→验证）
+    会被中途掐断；现在 0=不限制，兜底靠 900s 墙钟 + 用户停止。
+    """
+    from core.assistant import agent as agent_mod
+    replies = [ChatReply(content="", tool_calls=[{"id": f"c{i}", "name": "fs_list",
+                                                  "arguments": {"path": "."}}])
+               for i in range(20)]                       # 20 轮，旧的 12 上限必杀
+    replies.append(ChatReply(content="列了 20 次，收工"))
+    provider = FakeProvider(replies)
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})            # max_tool_rounds 缺省 → 0
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "反复列目录", emit=events.append)
+    assert res["ok"], res
+    assert res["content"] == "列了 20 次，收工"
+    assert not any("上限" in str(e.get("message") or "") for e in events)
+    assert len(provider.calls) == 21                     # 20 轮工具 + 1 轮收尾
+
+
+def test_agent_tool_rounds_positive_cap_still_enforced(env, monkeypatch):
+    """设了正数上限就仍然生效——不搞一刀切，配置可调。"""
+    from core.assistant import agent as agent_mod
+    replies = [ChatReply(content="", tool_calls=[{"id": f"c{i}", "name": "fs_list",
+                                                  "arguments": {"path": "."}}])
+               for i in range(10)]                       # 永远调工具，不会自己收尾
+    provider = FakeProvider(replies)
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo", "max_tool_rounds": 3})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "反复列目录", emit=events.append)
+    assert not res["ok"]
+    assert any("上限（3 次）" in str(e.get("message") or "") for e in events)
+    assert len(provider.calls) == 3
+
+
 def test_agent_approval_denied_path(env, monkeypatch):
     from core.assistant import agent as agent_mod
     provider = FakeProvider([
