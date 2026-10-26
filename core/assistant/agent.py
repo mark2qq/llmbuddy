@@ -134,6 +134,9 @@ class Assistant:
             "providers": [{"id": p.get("id"), "label": p.get("label"),
                            "kind": p.get("kind"), "enabled": p.get("enabled"),
                            "base_url": p.get("base_url"), "model": p.get("model"),
+                           # 免 Key 端点（Pollinations / 本机 Ollama / LM Studio）：
+                           # 界面据此显示「免 Key」而不是「尚未配置 API Key」
+                           "keyless": bool(p.get("keyless")),
                            # 密钥不下发，只告知是否已配置
                            "has_key": bool(p.get("api_key"))}
                           for p in cfg.get("providers") or []],

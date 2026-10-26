@@ -15,12 +15,61 @@
 """
 import json
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
+
+
+#: 本机代理存活探测结果缓存：{url: (检查时刻, 是否可用)}
+_PROXY_ALIVE: Dict[str, tuple] = {}
+_PROXY_LOCK = threading.Lock()
+
+
+def env_proxy_usable() -> bool:
+    """环境变量里的 HTTP 代理是否真的活着（1.0.10）。
+
+    为什么需要：本机/CI 常残留指向**已退出**代理进程的 `HTTPS_PROXY`
+    （实测见过 `127.0.0.1:64422`）。httpx 默认 trust_env=True 会把请求全打进
+    那个死端口，表现出来是「连不上服务商 / 一直转圈」，排查时极易误判成
+    模型或网络问题。这里只对 **本机代理**做端口探测（远端代理探测代价太高，
+    交给 httpx 自己处理）；死代理就返回 False，调用方改走直连。
+
+    结果缓存 60s，避免每次请求都开 socket。
+    """
+    raw = ""
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        raw = os.environ.get(key) or ""
+        if raw:
+            break
+    if not raw:
+        return True                     # 没配代理：trust_env 无影响
+    try:
+        parts = urlsplit(raw if "//" in raw else f"http://{raw}")
+        host = (parts.hostname or "").lower()
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except Exception:
+        return True
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return True                     # 远端代理不探测
+    now = time.time()
+    with _PROXY_LOCK:
+        hit = _PROXY_ALIVE.get(raw)
+        if hit and now - hit[0] < 60:
+            return hit[1]
+    ok = False
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            ok = True
+    except OSError:
+        ok = False
+    with _PROXY_LOCK:
+        _PROXY_ALIVE[raw] = (now, ok)
+    return ok
 
 
 @dataclass
@@ -142,8 +191,11 @@ class Provider:
         return h
 
     def _client(self, timeout: float = 300.0) -> httpx.Client:
-        # 本机：绕过代理；外网：走系统代理（本机 7897 代理是访问硅基流动的前提）
-        return httpx.Client(trust_env=not self.is_local, timeout=timeout,
+        # 本机：绕过代理；外网：走系统代理。
+        # 1.0.10：环境里的代理**死掉**时自动改直连——否则所有外网请求都打在
+        # 一个没人监听的端口上，用户看到的是「一直转圈」而不是明确报错。
+        trust = (not self.is_local) and env_proxy_usable()
+        return httpx.Client(trust_env=trust, timeout=timeout,
                             headers=self.headers())
 
     # ------------------------------------------------------------------ #

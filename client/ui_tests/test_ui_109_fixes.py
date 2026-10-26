@@ -110,19 +110,38 @@ def test_thinking_block_clear():
 
 # --------------------------------------------------------------------------- #
 # ④ 免费标识 + 悬停提示
+#
+# 1.0.10 修正了判定口径：免费 = 官方价格页里输入与输出都为 0 元。
+# 旧实现手工维护 KNOWN_FREE，把 Qwen3-14B（¥0.5→¥2）、DeepSeek-R1（¥4→¥16）
+# 都标成了免费，用户拿价格页截图反馈后改掉。以下断言按**真实价格**写。
 # --------------------------------------------------------------------------- #
 def test_known_free_detection():
-    assert model_info.is_free("Qwen/Qwen3-8B")
-    assert model_info.is_free("deepseek-ai/DeepSeek-R1")
+    assert model_info.is_free("Qwen/Qwen3-8B")                  # 0 / 0
+    assert model_info.is_free("zai-org/GLM-5.3-Flash")          # 0 / 0
+    assert model_info.is_free("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B")
+    # 用户反馈的错标：Qwen3-14B 官方 ¥0.5 输入 / ¥2 输出，不是免费
+    assert not model_info.is_free("Qwen/Qwen3-14B")
+    assert model_info.price_of("Qwen/Qwen3-14B") == (0.5, 2)
+    # DeepSeek-R1 / V3 一直是收费的（¥4→16 / ¥2→8），旧清单也标错了
+    assert not model_info.is_free("deepseek-ai/DeepSeek-R1")
+    assert not model_info.is_free("deepseek-ai/DeepSeek-V3")
     assert not model_info.is_free("deepseek-ai/DeepSeek-V4-Flash")
-    assert model_info.is_free("some-vendor/model-FREE")
+    # 不再用「名字里带 free 就算免费」的启发式（那是误标来源之一）
+    assert not model_info.is_free("some-vendor/model-FREE")
+    # 价格表没收录 → 保守按收费处理
+    assert not model_info.is_free("unknown/model-xyz")
 
 
 def test_menu_label_marks_free():
     assert "免费" in model_info.menu_label("Qwen/Qwen3-8B")
-    assert "免费" not in model_info.menu_label("deepseek-ai/DeepSeek-V4-Flash")
-    # 本地模型不计费，但也不该标「免费」（语义是本地/不计费）
-    assert "免费" not in model_info.menu_label("Qwen/Qwen3-8B", local=True)
+    # 收费模型显示真实单价，一眼可辨，不用点开 tooltip
+    paid_label = model_info.menu_label("Qwen/Qwen3-14B")
+    assert "免费" not in paid_label
+    assert "¥0.5" in paid_label and "2" in paid_label
+    # 本地模型：标「本地·免费」（确实不计费，且与线上免费的语义区分开）
+    assert "本地" in model_info.menu_label("Qwen/Qwen3-8B", local=True)
+    # 免 Key 端点
+    assert "免 Key" in model_info.menu_label("openai-fast", keyless=True)
 
 
 def test_tooltip_has_intro_and_price():
@@ -130,12 +149,20 @@ def test_tooltip_has_intro_and_price():
     tip = info["tooltip"]
     assert "能力：" in tip and "收费：" in tip
     assert "推理" in info["desc"]
-    assert info["free"] is True
+    # R1 是 ¥4→¥16，不是免费
+    assert info["free"] is False
+    assert "按量计费" in info["price"]
+    assert "4" in info["price"] and "16" in info["price"]
+    free = model_info.describe("Qwen/Qwen3-8B")
+    assert free["free"] is True
+    assert "免费" in free["price"]
     paid = model_info.describe("deepseek-ai/DeepSeek-V4-Flash")
     assert paid["free"] is False
     assert "按量计费" in paid["price"]
     local = model_info.describe("qwen3-4b", local=True)
     assert "不计费" in local["price"]
+    keyless = model_info.describe("openai-fast", keyless=True)
+    assert "无需 API Key" in keyless["price"]
 
 
 def test_unknown_model_falls_back_gracefully():

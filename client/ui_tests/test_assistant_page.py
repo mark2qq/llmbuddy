@@ -585,7 +585,10 @@ def test_model_menu_overflow_into_submenu(page):
     sub = more_action.menu()
     assert sub is not None
     sub_names = [a.text() for a in sub.actions()]
-    assert sub_names == [f"model-{i:02d}" for i in range(20, 25)]
+    # 1.0.10：本地模型标「本地·免费」，比对时只取模型名部分
+    sub_models = [t.split()[0] for t in sub_names]
+    assert sub_models == [f"model-{i:02d}" for i in range(20, 25)]
+    assert all("本地" in t for t in sub_names)
 
 
 def test_model_menu_has_custom_model_entry(page):
@@ -1918,3 +1921,99 @@ def test_siliconflow_key_sync_only_once(page):
                         if isinstance(pr, dict))]
     assert len(key_saves) == 1, f"Key 回写应只发生一次，实际 {len(key_saves)} 次"
     assert p._sf_key_synced is True
+
+
+# ---------------------------------------------------------------------------
+# 1.0.10 免费/收费标识 + 免 Key 端点
+# ---------------------------------------------------------------------------
+def test_model_menu_shows_price_tag_for_paid_model(page):
+    """收费模型在菜单里带真实单价，免费模型标「免费」。
+
+    用户反馈「Qwen3-14B 收费却标免费，我看这个不是免费的呀」——修法是把
+    「免费」改成由官方价格页推导，并在菜单里直接显示单价。
+    """
+    p, _fake = page
+    p._active_provider = "siliconflow"
+    p._model_cache["siliconflow"] = ["Qwen/Qwen3-8B", "Qwen/Qwen3-14B",
+                                     "some-vendor/unknown-model"]
+    menu = p._build_model_menu()
+    texts = [a.text() for a in menu.actions()]
+    free_item = next(t for t in texts if t.startswith("Qwen/Qwen3-8B"))
+    paid_item = next(t for t in texts if t.startswith("Qwen/Qwen3-14B"))
+    assert "免费" in free_item
+    assert "免费" not in paid_item
+    assert "¥0.5" in paid_item and "2" in paid_item
+    # 价格未收录：既不标免费也不编价格
+    unknown = next(t for t in texts if t.startswith("some-vendor/unknown-model"))
+    assert "免费" not in unknown and "¥" not in unknown
+
+
+def test_model_menu_has_pricing_refresh_entry(page):
+    """菜单里有「更新价格与免费标识…」入口（服务商调价后不用等新版本）。"""
+    p, _fake = page
+    menu = p._build_model_menu()
+    texts = [a.text() for a in menu.actions() if a.text()]
+    assert "更新价格与免费标识…" in texts
+    assert "检测本机免 Key 端点…" in texts
+
+
+def test_refresh_pricing_result_reports_counts(page, monkeypatch):
+    """价格刷新回来后在状态栏给「N 个模型 / M 个免费 + 时间」，不静默。"""
+    p, _fake = page
+    p._apply_pricing_result({"count": 62, "free": ["a", "b"],
+                             "fetched_at": "2026-10-26 16:00"})
+    msg = p._status.text()
+    assert "62" in msg and "2" in msg and "2026-10-26 16:00" in msg
+
+
+def test_keyless_provider_shows_no_key_needed(page):
+    """免 Key 提供商：来源菜单标「（免 Key）」，提示里写「无需 API Key」。"""
+    p, _fake = page
+    provs = p._state.setdefault("providers", [])
+    provs.append({"id": "pollinations", "label": "Pollinations 免 Key",
+                  "kind": "openai", "enabled": True, "keyless": True,
+                  "base_url": "https://text.pollinations.ai",
+                  "model": "openai-fast", "has_key": False})
+    menu = p._build_model_menu()
+    src = next(a for a in menu.actions() if a.text() == "模型来源")
+    labels = [a.text() for a in src.menu().actions()]
+    assert any("Pollinations" in t and "免 Key" in t for t in labels)
+    tip = p._provider_tooltip(provs[-1])
+    assert "无需 API Key" in tip
+    assert "尚未配置 API Key" not in tip
+
+
+def test_keyless_models_labelled_in_menu(page):
+    """免 Key 来源下，模型项标「免 Key」而不是「免费 / 价格」。"""
+    p, _fake = page
+    p._active_provider = "pollinations"
+    p._state.setdefault("providers", []).append(
+        {"id": "pollinations", "label": "Pollinations 免 Key", "kind": "openai",
+         "enabled": True, "keyless": True, "model": "openai-fast"})
+    p._model_cache["pollinations"] = ["openai-fast"]
+    menu = p._build_model_menu()
+    item = next(a.text() for a in menu.actions() if a.text().startswith("openai-fast"))
+    assert "免 Key" in item
+
+
+def test_detect_local_endpoints_none_gives_actionable_hint(page, monkeypatch):
+    """本机没装/没启动 → 状态栏给出可执行提示，而不是静默。"""
+    p, _fake = page
+    p._apply_local_endpoints([])
+    msg = p._status.text()
+    assert "未发现" in msg and ("Ollama" in msg or "ollama" in msg)
+
+
+def test_detect_local_endpoints_saves_into_providers(page):
+    """发现本机端点 → 以同一次 save 写入 enabled/base_url/model（免 Key）。"""
+    p, fake = page
+    before = len(fake.save_calls)
+    p._apply_local_endpoints([
+        {"id": "ollama", "label": "Ollama", "base_url": "http://127.0.0.1:11434/v1",
+         "models": ["qwen3:4b", "llama3:8b"]}])
+    assert _pump(lambda: len(fake.save_calls) > before)
+    saved = fake.save_calls[-1]
+    provs = {x["id"]: x for x in saved.get("providers") or []}
+    assert provs["ollama"]["enabled"] is True
+    assert provs["ollama"]["keyless"] is True
+    assert provs["ollama"]["model"] == "qwen3:4b"

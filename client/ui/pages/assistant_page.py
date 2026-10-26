@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QWidget)
 
 from core.assistant_client import AssistantApi, AssistantStream
-from core import model_info
+from core import model_info, model_pricing, local_endpoints
 from core.task_runner import Worker
 from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
@@ -3321,12 +3321,16 @@ class AssistantPage(QWidget):
         menu.setToolTipsVisible(True)
 
         is_local = self._active_provider == "local"
+        keyless = self._provider_keyless(self._active_provider)
         src = menu.addMenu("模型来源")
         src.setToolTipsVisible(True)
         for p in (self._state.get("providers") or []):
             if not p.get("enabled", True):
                 continue
-            act = src.addAction(p.get("label") or p.get("id"))
+            label = p.get("label") or p.get("id")
+            if p.get("keyless"):
+                label = f"{label}（免 Key）"
+            act = src.addAction(label)
             act.setCheckable(True)
             act.setChecked(p.get("id") == self._active_provider)
             act.setToolTip(self._provider_tooltip(p))
@@ -3338,13 +3342,13 @@ class AssistantPage(QWidget):
         names = self._model_cache.get(self._active_provider) or []
         if names:
             for n in names[:20]:
-                self._add_model_action(menu, n, is_local)
+                self._add_model_action(menu, n, is_local, keyless)
             if len(names) > 20:
                 # 超出部分收进可点开的子菜单（之前是禁用的一行字，用户找不到入口）
                 more = menu.addMenu(f"还有 {len(names) - 20} 个模型 ▸")
                 more.setToolTipsVisible(True)
                 for n in names[20:]:
-                    self._add_model_action(more, n, is_local)
+                    self._add_model_action(more, n, is_local, keyless)
         else:
             act = menu.addAction("（暂无可用模型，点下面刷新）")
             act.setEnabled(False)
@@ -3352,6 +3356,16 @@ class AssistantPage(QWidget):
         menu.addSeparator()
         act = menu.addAction("刷新模型列表")
         act.triggered.connect(lambda: self._fill_models(self._active_provider))
+        # 1.0.10：价格/免费标识在线刷新（服务商调价后不用等新版本）
+        act = menu.addAction("更新价格与免费标识…")
+        act.setToolTip("从官方价格页重新拉取每个模型的输入/输出单价（24 小时缓存），"
+                       "刷新后菜单里的「免费 / ¥x→y」才是最新的")
+        act.triggered.connect(lambda: self._refresh_pricing())
+        # 1.0.10：本机免 Key 端点（Ollama / LM Studio）一键接入
+        act = menu.addAction("检测本机免 Key 端点…")
+        act.setToolTip("探测本机 Ollama(11434) / LM Studio(1234)，发现即自动接入；"
+                       "这类模型完全跑在本机，不需要任何 Key")
+        act.triggered.connect(lambda: self._detect_local_endpoints())
         if self._active_provider != "local":
             act = menu.addAction("配置密钥与端点…")
             act.triggered.connect(self._edit_provider)
@@ -3363,26 +3377,62 @@ class AssistantPage(QWidget):
         act.triggered.connect(self._configure_custom_provider)
         return menu
 
-    def _add_model_action(self, menu: QMenu, name: str, local: bool = False) -> None:
-        """往模型菜单加一项：免费模型带「免费」标识 + 悬停提示（介绍/收费）。"""
-        act = menu.addAction(model_info.menu_label(name, local=local))
+    def _provider_keyless(self, provider_id: str) -> bool:
+        """该提供商是否「无需 API Key」（本地引擎 / 公益聚合端点）。"""
+        if provider_id == "local":
+            return False        # 本地另有「本地·免费」标，不重复
+        for p in (self._state.get("providers") or []):
+            if p.get("id") == provider_id:
+                return bool(p.get("keyless"))
+        return False
+
+    def _refresh_pricing(self) -> None:
+        """从官方价格页刷新模型单价（后台线程，24h 缓存）。"""
+        self._set_status("正在从官方价格页更新模型价格…")
+        w = Worker(model_pricing.refresh)
+        w.result.connect(self._apply_pricing_result)
+        w.error.connect(lambda m: self._set_status(f"价格更新失败：{m}"))
+        w.start()
+
+    def _apply_pricing_result(self, res: Any) -> None:
+        res = res if isinstance(res, dict) else {}
+        n = int(res.get("count") or 0)
+        nf = len(res.get("free") or [])
+        at = str(res.get("fetched_at") or "")
+        self._set_status(f"已更新 {n} 个模型的价格（其中 {nf} 个免费）· {at}")
+        # 菜单是每次点开重建的，这里只需刷新按钮 tooltip；模型清单本身没变
+        self._refresh_model_btn()
+
+    def _add_model_action(self, menu: QMenu, name: str, local: bool = False,
+                          keyless: bool = False) -> None:
+        """往模型菜单加一项：免费/单价标识 + 悬停提示（介绍/收费）。"""
+        act = menu.addAction(
+            model_info.menu_label(name, local=local, keyless=keyless))
         act.setCheckable(True)
         act.setChecked(name == self._active_model)
-        info = model_info.describe(name, local=local)
+        info = model_info.describe(name, local=local, keyless=keyless)
         act.setToolTip(str(info.get("tooltip") or name))
         act.triggered.connect(lambda _c=False, m=name: self._set_model(m))
 
     @staticmethod
     def _provider_tooltip(p: Dict[str, Any]) -> str:
         """模型来源的悬停提示：类型 + 端点 + 当前默认模型。"""
-        kind = "本地引擎（免费）" if p.get("kind") == "local" else "线上 OpenAI 兼容端点"
+        if p.get("kind") == "local":
+            kind = "本地引擎（免费）"
+        elif p.get("keyless"):
+            kind = "线上 OpenAI 兼容端点（无需 API Key）"
+        else:
+            kind = "线上 OpenAI 兼容端点"
         lines = [str(p.get("label") or p.get("id") or "")]
         lines.append(f"类型：{kind}")
         if p.get("base_url"):
             lines.append(f"端点：{p.get('base_url')}")
         if p.get("model"):
             lines.append(f"默认模型：{p.get('model')}")
-        if p.get("kind") != "local" and not p.get("has_key"):
+        if p.get("keyless") and p.get("kind") != "local":
+            lines.append("无需 Key：直接可用；第三方公益聚合服务，"
+                         "限流较低、可能随时调整，勿传敏感内容")
+        elif p.get("kind") != "local" and not p.get("has_key"):
             lines.append("尚未配置 API Key（选中后会提示配置）")
         return "\n".join(lines)
 
@@ -3468,6 +3518,43 @@ class AssistantPage(QWidget):
         w = Worker(self._assist.save_settings, {"providers": providers})
         w.result.connect(lambda _r: self.refresh())
         w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
+        w.start()
+
+    # ---------------- 免 Key 端点（1.0.10） ----------------
+    def _detect_local_endpoints(self) -> None:
+        """探测本机 Ollama / LM Studio：发现即自动接入（都无需 API Key）。"""
+        self._set_status("正在探测本机免 Key 端点（Ollama 11434 / LM Studio 1234）…")
+        w = Worker(local_endpoints.probe)
+        w.result.connect(self._apply_local_endpoints)
+        w.error.connect(lambda m: self._set_status(f"探测失败：{m}"))
+        w.start()
+
+    def _apply_local_endpoints(self, found: Any) -> None:
+        found = [f for f in (found or []) if isinstance(f, dict) and f.get("id")]
+        if not found:
+            self._set_status(
+                "未发现本机免 Key 端点：装并启动 Ollama（ollama serve）或 "
+                "LM Studio 的 Local Server 后重试；也可直接用「Pollinations 免 Key」")
+            return
+        providers = [dict(p) for p in (self._state.get("providers") or [])]
+        names = []
+        for f in found:
+            pid = str(f.get("id"))
+            models = [str(m) for m in (f.get("models") or []) if m]
+            target = next((p for p in providers if p.get("id") == pid), None)
+            if target is None:
+                target = {"id": pid, "label": f.get("label") or pid,
+                          "kind": "openai", "api_key": "", "keyless": True}
+                providers.append(target)
+            target.update({"enabled": True, "keyless": True,
+                           "base_url": f.get("base_url") or "",
+                           "model": models[0] if models else ""})
+            names.append(f"{f.get('label') or pid}（{len(models)} 个模型）")
+        w = Worker(self._assist.save_settings, {"providers": providers})
+        w.result.connect(
+            lambda _r, t="、".join(names): (self._set_status(f"已接入本机免 Key 端点：{t}"),
+                                           self.refresh()))
+        w.error.connect(lambda m: self._set_status(f"接入失败：{m}"))
         w.start()
 
     def _edit_provider(self) -> None:

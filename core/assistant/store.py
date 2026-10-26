@@ -39,6 +39,25 @@ CATALOG_DIR = os.path.join(ASSISTANT_DIR, "catalog")
 # 硅基流动 OpenAI 兼容端点（与客户端 chat_page.SILICONFLOW_BASE_URL 保持一致）
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
+#: 免 Key 的在线 OpenAI 兼容端点（1.0.10 用户需求：找「完全免费、不用 Key」的模型）。
+#:
+#: Pollinations 公开可用、无需鉴权，实测可返回标准 chat.completion
+#: （2026-10-26 验证：`/v1/chat/completions` 与 `/openai` 都 200；
+#: model=openai-fast 背后是 GPT-OSS-20B，tools=true、reasoning=true）。
+#: 匿名档只有这一个模型，且限流较低。
+#:
+#: 注意 base_url 只写到域名：`Provider.endpoint()` 会拼 `/v1/chat/completions`
+#: （已实测可用）。不要写 `.../openai`——那样会被拼成 `/openai/v1/chat/...`。
+#: 该站的 `/v1/models` 不是模型清单（会返回一段聊天文本），所以**别依赖它列模型**，
+#: 默认模型写死 `POLLINATIONS_MODEL`。
+#:
+#: 边界（必须如实告诉用户，别把它当生产通道）：
+#:   · 第三方公益聚合服务，不是模型官方；可能哪天关停或改协议 → 失败可切回本机；
+#:   · 内容会经过第三方服务器，**不要发敏感/隐私内容**；
+#:   · 匿名档限流，忙时 429/503 属正常。
+POLLINATIONS_BASE_URL = "https://text.pollinations.ai"
+POLLINATIONS_MODEL = "openai-fast"
+
 # 审批策略：
 #   readonly_auto  只读动作直接放行，写入/删除/命令/外发需审批（默认，安全与体验平衡）
 #   ask_all        所有工具调用都要审批（最严）
@@ -109,6 +128,23 @@ def _default_config() -> Dict[str, Any]:
             {"id": "siliconflow", "label": "硅基流动", "kind": "openai", "enabled": True,
              "base_url": SILICONFLOW_BASE_URL, "api_key": "",
              "model": "Qwen/Qwen3-8B"},
+            # 1.0.10：免 Key 提供商（选中即用，无需配置密钥）。
+            # `keyless` 是给 UI / 提示用的标记，后端 Provider 本来就不强制 Key
+            # （headers() 里 key 为空就不发 Authorization）——加这个字段是为了
+            # 界面上不再提示「尚未配置 API Key」，并由 UI 自动补「（免 Key）」后缀。
+            # 所以 label 这里**不要**再写「免 Key」，否则会显示成「免 Key（免 Key）」。
+            {"id": "pollinations", "label": "Pollinations",
+             "kind": "openai", "enabled": True, "keyless": True,
+             "base_url": POLLINATIONS_BASE_URL, "api_key": "",
+             "model": POLLINATIONS_MODEL},
+            # 本机已装 Ollama / LM Studio 时，可用菜单「检测本机免 Key 端点」一键接入。
+            # 默认关闭：没跑起来时模型列表为空，摆着反而让人以为坏了。
+            {"id": "ollama", "label": "Ollama 本机", "kind": "openai",
+             "enabled": False, "keyless": True,
+             "base_url": "http://127.0.0.1:11434/v1", "api_key": "", "model": ""},
+            {"id": "lmstudio", "label": "LM Studio 本机", "kind": "openai",
+             "enabled": False, "keyless": True,
+             "base_url": "http://127.0.0.1:1234/v1", "api_key": "", "model": ""},
             {"id": "custom", "label": "自定义（OpenAI 兼容）", "kind": "openai",
              "enabled": False, "base_url": "", "api_key": "", "model": ""},
         ],

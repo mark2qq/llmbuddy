@@ -30,7 +30,7 @@ from PySide6.QtGui import (QPixmap, QPainter, QColor, QPolygon,
                            QIcon)
 
 from core.task_runner import Worker
-from core import model_info
+from core import model_info, model_pricing
 from ui.widgets.custom_model_dialog import (CustomModelDialog,
                                             load_custom_models,
                                             save_custom_models)
@@ -40,19 +40,26 @@ from ui.widgets.progress_dialog import ProgressDialog
 # 线上免费模型统一的 OpenAI 兼容端点（SiliconFlow）
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
-# SiliconFlow 官方标注「免费」的模型 ID 清单（2026-10 整理）。
-# 背景：GET /models 接口的响应只含 id/created/owned_by，不带免费标记，
-# 因此用这份清单给拉取到的模型打「免费」标并在菜单置顶；未命中的模型仍
-# 可选择（按量付费，余额不足时发送会报错，用户可自行判断）。
-# 1.0.9：清单与「模型介绍 / 收费提示」统一收敛到 core/model_info.py，
-# 智能助理的模型菜单也用同一份数据，避免两处清单各自漂移。
+# 免费 / 收费的判定口径统一在 core/model_info.py（1.0.10 改为「价格表推导」：
+# 输入与输出都为 0 元才算免费）。`GET /models` 只回 id/owned_by 不带价格，
+# 所以价格来自 core/model_pricing.py 抓的官方价格页，24h 缓存，失败回退快照。
+# 1.0.9 那份手工维护的 KNOWN_FREE 曾把 Qwen3-14B（¥0.5/¥2）标成免费，
+# 用户看到价格页贴图后反馈——不要再手工加名单，改价就刷新价格。
 SILICONFLOW_KNOWN_FREE = model_info.KNOWN_FREE
 
-# 内置云端模型清单：首次「获取最新模型」前的默认值（取已知免费模型）。
-# 走云端路由：选中后直连 SiliconFlow，复用 chat_stream_custom。
-CLOUD_FREE_MODELS: List[Dict[str, str]] = [
-    {"name": m, "tag": "免费"} for m in SILICONFLOW_KNOWN_FREE
-]
+
+def default_cloud_models() -> List[Dict[str, str]]:
+    """内置云端模型清单：首次「获取最新模型」前的默认值（当前判定免费的）。
+
+    做成函数而非模块常量：`model_info` 的价格表可能在运行期被在线数据覆盖，
+    模块级常量会把它冻在 import 那一刻（就是旧实现「清单过期」的老毛病）。
+    """
+    return [{"name": m, "tag": "免费"} for m in model_info.free_models()]
+
+
+#: 兼容旧引用（测试与外部脚本用）。**内部逻辑不要读它**——它是 import 时
+#: 的快照，运行期价格更新后不会跟着变；要现行清单请调 `default_cloud_models()`。
+CLOUD_FREE_MODELS: List[Dict[str, str]] = default_cloud_models()
 
 # 云端模型列表的 QSettings 缓存键（动态拉取结果 + 拉取时间）
 CLOUD_MODELS_KEY = "chat/cloud_models"
@@ -62,13 +69,21 @@ CLOUD_MODELS_FETCHED_AT_KEY = "chat/cloud_models_fetched_at"
 def fetch_cloud_models(api_key: str) -> List[Dict[str, str]]:
     """后台拉取 SiliconFlow 最新 chat 模型列表（GET /models?sub_type=chat）。
 
-    返回 [{name, tag}, ...]：已知免费模型 tag 为「免费」并置顶（组内保持
-    接口返回顺序），其余 tag 为「SiliconFlow」。失败抛异常（由 Worker 以
-    字符串回传）。trust_env=False 必须保留——本机有系统代理。
+    返回 [{name, tag}, ...]：免费模型 tag 为「免费」并置顶（组内保持接口
+    返回顺序），收费模型 tag 为真实单价（如 `¥0.5→2` 元/百万 tokens），
+    价格未收录的退化为「SiliconFlow」。失败抛异常（由 Worker 以字符串回传）。
+    trust_env=False 必须保留——本机有系统代理。
+
+    1.0.10：拉模型的同时顺手刷新官方价格（best-effort，失败不影响列表）——
+    否则「免费」标识会一直停留在上次的快照上，又回到「明明收费却标免费」。
     """
     api_key = str(api_key or "").strip()
     if not api_key:
         raise RuntimeError("未配置 SiliconFlow API Key")
+    try:
+        model_pricing.refresh()
+    except Exception:
+        pass                    # 价格刷新失败不算错误：用缓存/快照的标识继续
     url = f"{SILICONFLOW_BASE_URL}/models?sub_type=chat"
     with httpx.Client(trust_env=False, timeout=15.0,
                       headers={"Authorization": f"Bearer {api_key}",
@@ -92,7 +107,7 @@ def fetch_cloud_models(api_key: str) -> List[Dict[str, str]]:
             continue
         seen.add(mid)
         out.append({"name": mid,
-                    "tag": "免费" if mid in SILICONFLOW_KNOWN_FREE else "SiliconFlow"})
+                    "tag": model_info.price_tag(mid) or "SiliconFlow"})
     if not out:
         raise RuntimeError("接口未返回任何 chat 模型")
     free = [m for m in out if m["tag"] == "免费"]
@@ -373,7 +388,7 @@ class ChatPage(QWidget):
                                 "tag": str(it.get("tag") or "SiliconFlow")})
                 if out:
                     return out
-        return [dict(m) for m in CLOUD_FREE_MODELS]
+        return default_cloud_models()
 
     def _save_cloud_models(self, models: List[Dict[str, str]]) -> None:
         """缓存拉取到的云端模型列表并记录拉取时间。"""

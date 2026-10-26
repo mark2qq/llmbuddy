@@ -313,6 +313,14 @@ def main() -> None:
     # 先载入配置：主题背景色需要它（Config.load 无副作用，可安全提前）
     config = Config.load()
     _startup_log("config loaded")
+    # 模型「免费 / 收费」标识：优先用上次在线抓取的价格（本地缓存，不联网），
+    # 没有缓存就用内置快照。1.0.10 修「Qwen3-14B 收费却标免费」时加。
+    try:
+        from core import model_pricing
+        n_priced = model_pricing.apply_cached()
+        _startup_log("model pricing applied=%s" % n_priced)
+    except Exception as e:
+        _startup_log("model pricing skipped: %r" % (e,))
     style = load_stylesheet(config.background_color)
     if style:
         app.setStyleSheet(style)
