@@ -27,6 +27,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
+from core.assistant import context as context_mod
 from core.assistant import mcp as mcp_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
@@ -39,6 +40,8 @@ from core.assistant.store import (audit, delete_session, ensure_dirs, get_provid
                                  update_session as patch_session)
 from core.assistant.tools import ToolRegistry
 
+#: 未压缩时的历史条数上限。压缩生效后由 `context.DEFAULT_KEEP` 决定保留窗口，
+#: 这个值只在「还没触发压缩」阶段兜底（防止极端情况下一次性塞太长的历史）。
 MAX_HISTORY_MESSAGES = 24
 #: 单轮对话「模型→工具→模型」循环轮次上限。**0 = 不限制**（默认）。
 #: 本地小模型跑多步任务（如从 GitHub 列目录→取 SKILL.md→取附属文件→安装→
@@ -217,12 +220,18 @@ class Assistant:
 
     def start_turn(self, session_id: str, text: str, provider_id: str = "",
                    model: str = "", emit: Optional[Callable[[Dict], None]] = None,
-                   mounted_skills: Optional[List[str]] = None) -> Dict[str, Any]:
+                   mounted_skills: Optional[List[str]] = None,
+                   attachments: Optional[List[str]] = None) -> Dict[str, Any]:
         """执行一轮对话（阻塞）。事件通过 emit(dict) 实时推送。
 
         `mounted_skills` 是**尾参且带默认值**：既有位置参数调用（测试、路由的
         非流式/流式两条路径）完全不受影响（架构 §5 A4）。传的是「用户在底栏
         挂载的技能 slug」，落库的 message 仍是**原文**（不再拼「用 xx 技能：」）。
+
+        `attachments`（2026-10-26）：用户粘贴进输入框的图片在本机的绝对路径。
+        落库时挂在 message 的 `images` 上（回看历史能看到消息带图），构造
+        messages 时再把路径以文本形式补进这一轮，模型可用 fs_read / OCR 技能
+        打开。**不塞 base64**：会污染历史并瞬间吃满上下文窗口。
         """
         emit = emit or (lambda ev: None)
         cfg = load_config()
@@ -247,14 +256,18 @@ class Assistant:
             return {"ok": False, "error": "empty"}
 
         mounted = [str(s) for s in (mounted_skills or []) if str(s).strip()]
+        images = [str(p) for p in (attachments or []) if str(p).strip()]
 
         # ---- 按需求自动加载（架构 §5 A3 + A4，PRD §5.4）----
         profile = self._match_profile(cfg, text, registry)
         auto_loaded = self._auto_loaded_payload(profile, registry, cfg)
 
-        # 记录用户消息（原文，无前缀）
-        session["messages"].append({"role": "user", "content": text,
-                                    "time": time.time()})
+        # 记录用户消息（原文，无前缀）；粘贴的图片挂在 images 上供历史回看
+        user_msg: Dict[str, Any] = {"role": "user", "content": text,
+                                    "time": time.time()}
+        if images:
+            user_msg["images"] = list(images)
+        session["messages"].append(user_msg)
         # 占位标题（新建时还没说话）才自动用首句当标题；用户改过名的绝不动
         if session.get("title") in ("", "新会话", "新任务", "未命名任务"):
             session["title"] = text.strip().replace("\n", " ")[:24]
@@ -263,10 +276,28 @@ class Assistant:
               "provider": provider_cfg.get("id"), "label": provider_cfg.get("label"),
               "auto_loaded": auto_loaded})
 
+        # ---- 上下文压缩（WorkBuddy 同款：超阈值就把较早对话压成摘要）----
+        # 放在 build_messages 之前，压完直接用新窗口；失败绝不影响本轮。
+        try:
+            cur = context_mod.usage(session, cfg)
+            emit({"type": "context", "used": cur["used"], "limit": cur["limit"],
+                  "ratio": cur["ratio"], "compressed": False})
+            if cur["used"] > cur["limit"] * context_mod.TRIGGER_RATIO:
+                emit({"type": "compact", "phase": "start",
+                      "message": "上下文接近上限，正在压缩较早的对话…"})
+                ev = context_mod.maybe_compress(session, cfg, provider)
+                if ev:
+                    save_session(session)
+                    emit(ev)
+        except Exception as e:  # noqa: BLE001
+            emit({"type": "context", "used": 0, "limit": 0, "ratio": 0,
+                  "compressed": False, "note": f"上下文统计失败：{e}"})
+
         # ---- 同源（A3）：schemas 只算一次，provider 与系统提示共用同一份 ----
         schemas = self._select_schemas(cfg, registry, profile)
         messages = self._build_messages(session, registry, cfg, schemas,
-                                        mounted_skills=mounted, profile=profile)
+                                        mounted_skills=mounted, profile=profile,
+                                        attachments=images)
         final_text = ""
         error = ""
         rounds = 0
@@ -592,8 +623,9 @@ class Assistant:
                         cfg: Dict[str, Any],
                         schemas: Optional[List[Dict[str, Any]]] = None,
                         mounted_skills: Optional[List[str]] = None,
-                        profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """组装 messages（system + 历史）。
+                        profile: Optional[Dict[str, Any]] = None,
+                        attachments: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """组装 messages（system + 压缩摘要 + 历史）。
 
         **工具清单从 `schemas` 渲染**（架构 §5 A3）：`registry.list()` 返回的是
         `Tool.to_dict()`（没有 `function` 键），直接拿它渲染会和下发给模型的
@@ -602,6 +634,10 @@ class Assistant:
 
         `schemas` 为空时自己取一次 `select_schemas()`（向后兼容其他调用点），
         但 agent 主循环里始终传入同一份对象，保证同源。
+
+        1.0.11 上下文压缩：会话上有 `context.summary` 时，摘要以「user 说明 +
+        assistant 确认」两条置顶，后面只接 `context.keep` 条最近消息；否则沿用
+        老的「最近 MAX_HISTORY_MESSAGES 条」（未触发压缩的短会话行为零变化）。
         """
         if schemas is None:
             schemas = registry.select_schemas()
@@ -630,8 +666,33 @@ class Assistant:
         msgs: List[Dict[str, Any]] = [{"role": "system", "content": system}]
         history = [m for m in (session.get("messages") or [])
                    if m.get("role") in ("user", "assistant") and m.get("content")]
-        for m in history[-MAX_HISTORY_MESSAGES:]:
-            msgs.append({"role": m["role"], "content": m["content"]})
+
+        ctx = session.get("context") or {}
+        summary = str(ctx.get("summary") or "").strip()
+        if summary:
+            keep = max(0, int(ctx.get("keep") or context_mod.DEFAULT_KEEP))
+            # 摘要置顶：用 user + assistant 一问一答，兼容「只允许一条 system」的端点
+            msgs.append({"role": "user", "content":
+                         "（以下是本次任务较早对话的压缩摘要，请据此继续，"
+                         "不要重复已完成的步骤）\n" + summary})
+            msgs.append({"role": "assistant",
+                         "content": "收到，我已了解之前的目标、进展与结论，接着往下做。"})
+            for m in (history[-keep:] if keep else []):
+                msgs.append({"role": m["role"], "content": m["content"]})
+        else:
+            for m in history[-MAX_HISTORY_MESSAGES:]:
+                msgs.append({"role": m["role"], "content": m["content"]})
+
+        # 本轮附件（2026-10-26 粘贴的图片）：路径以文本形式补在最后一条 user 上，
+        # 模型可用 fs_read 打开、或用 OCR 技能识别。不塞 base64（会炸上下文）。
+        if attachments:
+            lines = "\n".join(f"- {p}" for p in attachments)
+            note = ("（用户本轮附带了以下图片文件，已保存在本机；需要看图时用 "
+                    f"fs_read 读取，或用 OCR 技能识别；不要凭文件名猜测内容）\n{lines}")
+            for m in reversed(msgs):
+                if m.get("role") == "user":
+                    m["content"] = f"{m.get('content') or ''}\n\n{note}"
+                    break
         return msgs
 
     def _skills_hint(self, cfg: Dict[str, Any],

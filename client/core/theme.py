@@ -18,12 +18,33 @@
     控件，因此保存设置后立即生效（无需重启客户端）。
 """
 import os
+import re
 from typing import Optional
 
 from app_config import resource_path
 
 # 默认（深色）背景色：与 styles.qss 的 QWidget 背景一致
 DEFAULT_DARK_BG = "#0f1117"
+
+# ---------------------------------------------------------------------------
+# 界面字号缩放（2026-10-26：用户反馈「字体太小，参考 workbuddy 调整」）
+# ---------------------------------------------------------------------------
+#: 字号放大倍数。作用方式是**只在渲染期**把 styles.qss 里的 `font-size: Npx`
+#: 统一乘这个倍数，不改 qss 源文件本身：
+#:
+#:   · 保留 qss 里的原始刻度（设计基准 13px 正文），改倍数即可整体调大/调小；
+#:   · 各个字号保持等比（10/11/12/13/18 不会互相挤在一起，层级不塌）；
+#:   · 不碰 padding / border-width / height，布局不会因为字号而错位。
+#:
+#: 默认 1.0（不缩放）。**2026-10-26 的结论：整体乘倍数会撑破控制台页的
+#: 一屏容量**（`test_dashboard_layout` 三个用例立刻出竖向滚动），所以字号
+#: 调整改为「在 styles.qss 末尾按选择器定向放大智能助理那套界面」，见文件
+#: 末尾「1.0.11 字号档位」段。这个倍数只留给将来做「全局字号」偏好设置用，
+#: 调之前先跑一遍 client/ui_tests/ 的布局门禁。
+FONT_SCALE = 1.0
+
+_FONT_SIZE_RE = re.compile(r"font-size:\s*(\d+)px")
+_scaled_cache: dict = {}
 
 # 设置页预设色块（名称, 颜色）——浅色系用于「不喜欢纯黑背景」的常见诉求
 PRESET_BACKGROUNDS = [
@@ -76,21 +97,43 @@ def is_light(color: str) -> bool:
     return luminance(color) >= 150.0
 
 
-def read_base_stylesheet() -> str:
-    """读取基线深色样式（带进程内缓存）。"""
+def scale_fonts(qss: str, scale: float = FONT_SCALE) -> str:
+    """把 qss 里所有 `font-size: Npx` 按倍数放大（含取整下限 9px）。
+
+    只替换 font-size，不碰任何尺寸/内外边距，因此布局不会错位。
+    """
+    if not qss or scale is None or abs(scale - 1.0) < 1e-6:
+        return qss
+
+    def _repl(m: "re.Match[str]") -> str:
+        px = int(m.group(1))
+        return f"font-size: {max(9, int(round(px * scale)))}px"
+
+    return _FONT_SIZE_RE.sub(_repl, qss)
+
+
+def read_base_stylesheet(scale: Optional[float] = None) -> str:
+    """读取基线深色样式（带进程内缓存）。scale 为空时用 FONT_SCALE。"""
     global _base_cache
-    if _base_cache is not None:
+    if _base_cache is None:
+        path = resource_path(os.path.join("resources", "styles.qss"))
+        text = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except Exception:
+                text = ""
+        _base_cache = text
+        _scaled_cache.clear()
+
+    factor = FONT_SCALE if scale is None else float(scale)
+    if abs(factor - 1.0) < 1e-6:
         return _base_cache
-    path = resource_path(os.path.join("resources", "styles.qss"))
-    text = ""
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except Exception:
-            text = ""
-    _base_cache = text
-    return text
+    key = round(factor, 4)
+    if key not in _scaled_cache:
+        _scaled_cache[key] = scale_fonts(_base_cache, factor)
+    return _scaled_cache[key]
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +415,15 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
                border: 1px solid #e1e6f0; border-radius: 6px;
                padding: 4px 8px; }
 #SkillChipsRow { background: transparent; }
+#AttachChip { background-color: #f7f9fd; border: 1px solid #dbe0ea; }
+#AttachChip:hover { border-color: #b9c6e4; }
+#AttachThumb { background-color: #ffffff; border: 1px solid #e3e8f2; }
+#AttachName { color: #3b4354; }
+#AttachDel { color: #7b8496; }
+#AttachDel:hover { color: #c02a55; }
+#ContextLine, #CtxMeter { color: #6b7385; }
+#ContextLine { border-top: 1px dashed #d5dbe7; }
+#CtxMeter[hot="true"] { color: #9a6a12; }
 """
 
 

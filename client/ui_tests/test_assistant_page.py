@@ -2017,3 +2017,284 @@ def test_detect_local_endpoints_saves_into_providers(page):
     assert provs["ollama"]["enabled"] is True
     assert provs["ollama"]["keyless"] is True
     assert provs["ollama"]["model"] == "qwen3:4b"
+
+
+# ---------------------------------------------------------------------------
+# 1.0.11：粘贴图片（截图直接进输入框）
+# ---------------------------------------------------------------------------
+def _clear_stream_instances():
+    _FakeStream.instances.clear()
+
+
+def _paste_image(p):
+    """模拟剪贴板里有一张截图后按 Ctrl+V（走 QTextEdit 的 MIME 入口）。"""
+    from PySide6.QtCore import QMimeData
+    from PySide6.QtGui import QImage
+
+    img = QImage(8, 6, QImage.Format_RGB32)
+    img.fill(0xFF3366CC)
+    md = QMimeData()
+    md.setImageData(img)
+    p._input.insertFromMimeData(md)
+
+
+def test_paste_image_saves_file_and_adds_chip(page, tmp_path, monkeypatch):
+    """Ctrl+V 一张截图 → 落盘成 PNG + 输入框上方出现缩略图条。"""
+    from ui.widgets import image_composer as ic
+
+    monkeypatch.setattr(ic, "attachments_dir", lambda: str(tmp_path))
+    p, _fake = page
+    assert not p._attach_bar.isVisible() or p._attach_bar.count() == 0
+
+    _paste_image(p)
+
+    paths = p._attach_bar.paths()
+    assert len(paths) == 1
+    assert os.path.isfile(paths[0])
+    assert paths[0].lower().endswith(".png")
+    assert "已添加图片" in p._status.text()
+
+
+def test_paste_same_image_twice_keeps_one_chip(page, tmp_path, monkeypatch):
+    """同一张图重复粘贴只留一张（否则发出去会是重复附件）。"""
+    from ui.widgets import image_composer as ic
+
+    monkeypatch.setattr(ic, "attachments_dir", lambda: str(tmp_path))
+    p, _fake = page
+    path = os.path.join(str(tmp_path), "one.png")
+    from PySide6.QtGui import QImage
+    QImage(4, 4, QImage.Format_RGB32).save(path, "PNG")
+
+    assert p._attach_bar.add(path) is True
+    assert p._attach_bar.add(path) is False
+    assert p._attach_bar.count() == 1
+
+
+def test_attachment_chip_can_be_removed(page, tmp_path):
+    p, _fake = page
+    from PySide6.QtGui import QImage
+    path = os.path.join(str(tmp_path), "x.png")
+    QImage(4, 4, QImage.Format_RGB32).save(path, "PNG")
+    p._attach_bar.add(path)
+    assert p._attach_bar.count() == 1
+    p._attach_bar.remove(path)
+    assert p._attach_bar.count() == 0
+
+
+def test_send_with_pasted_image_carries_attachment_payload(page, monkeypatch,
+                                                          tmp_path):
+    """发送时 attachments 进 payload、气泡下出现缩略图、附件条清空。"""
+    from ui.pages import assistant_page as mod
+    from PySide6.QtGui import QImage
+
+    _clear_stream_instances()
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    path = os.path.join(str(tmp_path), "shot.png")
+    QImage(4, 4, QImage.Format_RGB32).save(path, "PNG")
+
+    p._input.setPlainText("看这张图")
+    p._attach_bar.add(path)
+    p._on_send_clicked()
+
+    assert _FakeStream.instances, "没有发起对话流"
+    assert _FakeStream.instances[-1].payload.get("attachments") == [path]
+    assert p._attach_bar.count() == 0        # 发出去之后就清空
+    # 对话区里应该有缩略图行（AttachThumb 的 QLabel 带 imagePath 属性）
+    thumbs = [w for w in p._col.findChildren(QLabel)
+              if w.property("imagePath") == path]
+    assert thumbs, "气泡下方没有渲染缩略图"
+
+
+def test_send_image_only_uses_placeholder_text(page, monkeypatch, tmp_path):
+    """只贴图不打字也能发：正文用占位说明，不会因为「消息为空」发不出去。"""
+    from ui.pages import assistant_page as mod
+    from PySide6.QtGui import QImage
+
+    _clear_stream_instances()
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    path = os.path.join(str(tmp_path), "only.png")
+    QImage(4, 4, QImage.Format_RGB32).save(path, "PNG")
+
+    p._input.clear()
+    p._attach_bar.add(path)
+    p._on_send_clicked()
+
+    assert _FakeStream.instances
+    payload = _FakeStream.instances[-1].payload
+    assert payload["message"].strip()          # 非空
+    assert payload.get("attachments") == [path]
+
+
+def test_enqueue_with_image_keeps_path_in_text(page):
+    """忙碌时贴图入队：队列条目没有附件字段，路径必须拼进正文，不能丢。"""
+    p, fake = page
+    p._busy = True
+    path = os.path.join(os.path.dirname(__file__), "..", "resources", "llmbuddy.png")
+    path = os.path.abspath(path)
+    p._attach_bar.add(path)
+    p._input.setPlainText("排队这条带图")
+    p._on_send_clicked()
+
+    assert _pump(lambda: bool(fake.enqueued))
+    _sid, text, _guided = fake.enqueued[-1]
+    assert "排队这条带图" in text
+    assert path in text
+
+
+# ---------------------------------------------------------------------------
+# 1.0.11：上下文占用 + 「上下文已压缩」提示
+# ---------------------------------------------------------------------------
+def test_context_event_updates_meter(page):
+    """后端每轮上报的使用量 → 底部「上下文 33% · 2.6k/8k」。"""
+    p, _fake = page
+    p._apply_context({"used": 2640, "limit": 8000, "ratio": 0.33,
+                      "compressed": False})
+    text = p._ctx_label.text()
+    assert "上下文" in text and "33%" in text
+    assert "2.6k" in text and "8.0k" in text
+
+
+def test_context_meter_marks_hot_when_near_full(page):
+    p, _fake = page
+    p._apply_context({"used": 7000, "limit": 8000, "ratio": 0.875})
+    assert bool(p._ctx_label.property("hot")) is True
+    p._apply_context({"used": 800, "limit": 8000, "ratio": 0.1})
+    assert bool(p._ctx_label.property("hot")) is False
+
+
+def test_context_compressed_event_renders_line(page):
+    """压缩发生 → 对话流插一行「✓ 上下文已压缩」。"""
+    p, _fake = page
+    p._handle_event({"type": "context", "used": 1800, "limit": 4096,
+                     "ratio": 0.44, "compressed": True, "folded": 7,
+                     "saved": 5200, "via": "llm"})
+    texts = [w.text() for w in p._msg_layout.parentWidget().findChildren(QLabel)]
+    assert any("上下文已压缩" in t for t in texts)
+    assert any("折叠 7 条" in t for t in texts)
+
+
+def test_compact_start_shows_progress_step(page):
+    p, _fake = page
+    p._handle_event({"type": "compact", "phase": "start",
+                     "message": "上下文接近上限，正在压缩较早的对话…"})
+    texts = [w.text() for w in p._msg_layout.parentWidget().findChildren(QLabel)]
+    assert any("正在压缩" in t for t in texts)
+
+
+def test_context_usage_shown_when_loading_old_session(page):
+    """切到旧任务时用会话详情里的 context_usage 显示占用（不必等再发一条）。"""
+    p, _fake = page
+    p._apply_session_detail({
+        "id": "s-old", "workspace": r"E://tmp//ws",
+        "messages": [{"role": "user", "content": "你好"},
+                     {"role": "assistant", "content": "在"}],
+        "context_usage": {"used": 1200, "limit": 8192, "ratio": 0.15,
+                          "compressed": False}})
+    assert "15%" in p._ctx_label.text()
+
+
+def test_history_renders_pasted_image_thumbs(page):
+    """回看历史：message 上的 images 要渲染成缩略图。"""
+    p, _fake = page
+    path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "resources", "llmbuddy.png"))
+    p._apply_session_detail({
+        "id": "s-img", "workspace": r"E://tmp//ws",
+        "messages": [{"role": "user", "content": "看图", "images": [path]}]})
+    thumbs = [w for w in p._col.findChildren(QLabel)
+              if w.property("imagePath") == path]
+    assert thumbs
+
+
+# ---------------------------------------------------------------------------
+# 1.0.11：输出时自动跟随到底部
+# ---------------------------------------------------------------------------
+def test_scroll_follows_on_range_change(page):
+    """量程变化（内容变高）就贴底——这是「不用手动滚动」的核心契约。
+
+    只验证信号契约，不去依赖无头平台的真实布局（offscreen 下视口高度固定，
+    内容再长 maximum 也涨不起来，那种断言测的是平台不是代码）。
+    """
+    p, _fake = page
+    bar = p._scroll.verticalScrollBar()
+    p._follow = True
+    bar.setRange(0, 500)
+    bar.setRange(0, 900)          # 新内容撑高
+    assert bar.value() == 900
+
+
+def test_user_scrolling_up_stops_following(page):
+    """用户主动往上翻过就不再硬拽回底部（看历史时不打扰）。"""
+    p, _fake = page
+    bar = p._scroll.verticalScrollBar()
+    p._follow = True
+    bar.setRange(0, 500)
+    bar.setValue(0)               # 用户滚到顶部 → valueChanged → _follow=False
+    assert p._follow is False
+    bar.setRange(0, 900)          # 又来新内容
+    assert bar.value() == 0       # 没有被拽下去
+
+
+def test_force_scroll_bottom_after_send(page):
+    """刚发消息时强制回到底部（哪怕用户之前在看历史）。"""
+    p, _fake = page
+    bar = p._scroll.verticalScrollBar()
+    bar.setRange(0, 500)
+    bar.setValue(0)
+    assert p._follow is False
+    p._scroll_bottom(force=True)
+    p._do_scroll_bottom()
+    assert bar.value() == 500
+    assert p._follow is True
+
+
+# ---------------------------------------------------------------------------
+# 1.0.11：字号档位（参考 WorkBuddy）
+# ---------------------------------------------------------------------------
+def test_assistant_fonts_are_scaled_up():
+    """正文 15px / 步骤行 12px：字号档位段必须存在且生效于助理界面选择器。"""
+    from core.theme import read_base_stylesheet
+
+    qss = read_base_stylesheet()
+    assert "#UserBubble, #BotBubble { font-size: 15px; }" in qss
+    assert "#StepLine { font-size: 12px; }" in qss
+    assert "#NavButton { font-size: 15px; }" in qss
+    assert "#Composer QTextEdit#ComposerInput" in qss
+    # 字号覆盖段必须在文件末尾（后面定义的规则才压得住前面的旧值）
+    assert qss.rindex("#PageTitle { font-size: 20px; }") > len(qss) // 2
+
+
+def test_loading_compressed_session_adds_only_one_line(page):
+    """切到已压缩的旧任务：压缩提示只出现一次（详情行 + usage 不重复插）。"""
+    p, _fake = page
+    p._apply_session_detail({
+        "id": "s-c", "workspace": r"E://tmp//ws",
+        "messages": [{"role": "user", "content": "你好"}],
+        "context": {"summary": "之前的要点", "compressed": 9, "via": "llm"},
+        "context_usage": {"used": 900, "limit": 8192, "ratio": 0.11,
+                          "compressed": True, "compressed_count": 9}})
+    labels = [w.text() for w in p._col.findChildren(QLabel)]
+    assert sum("上下文已压缩" in t for t in labels) == 1
+
+
+# ---------------------------------------------------------------------------
+# 1.0.11：队列快照乱序防御
+# ---------------------------------------------------------------------------
+def test_stale_queue_snapshot_is_dropped(page):
+    """旧快照晚到不能覆盖新快照（曾导致「编辑队列后面板突然空了」的偶发失败）。"""
+    p, _fake = page
+    p._on_event({"type": "queue", "items": _queue_items(2), "paused": False})
+    assert set(p._queue_rows) == {"q0", "q1"}
+    p._queue_seq = int(p._queue_seq) + 1          # 又有一次更新的请求发出
+    p._on_queue_fetched({"items": []}, 1, p._session_id)   # seq 更小的旧结果
+    assert set(p._queue_rows) == {"q0", "q1"}
+
+
+def test_queue_snapshot_from_other_session_is_dropped(page):
+    """切了任务之后，旧任务的队列快照不许画到新任务上。"""
+    p, _fake = page
+    p._on_event({"type": "queue", "items": _queue_items(2), "paused": False})
+    p._on_queue_fetched({"items": []}, p._queue_seq, "another-session")
+    assert set(p._queue_rows) == {"q0", "q1"}

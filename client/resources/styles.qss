@@ -957,3 +957,107 @@ QComboBox#Pill QAbstractItemView { font-size: 12px; padding: 2px; }
     padding: 7px 10px;
     font-size: 12px;
 }
+
+/* ---------- 输入框附件缩略图条（2026-10-26：粘贴截图） ---------- */
+#AttachBar { background: transparent; border: none; }
+#AttachChip {
+    background-color: #1b1f2b;
+    border: 1px solid #2c3344;
+    border-radius: 8px;
+}
+#AttachChip:hover { border-color: #46527a; }
+#AttachThumb {
+    background-color: #0f1117;
+    border: 1px solid #262c3a;
+    border-radius: 5px;
+}
+#AttachName {
+    color: #a9b2c6;
+    font-size: 11px;
+    background: transparent;
+    border: none;
+}
+#AttachDel {
+    color: #8a93a8;
+    background: transparent;
+    border: none;
+    padding: 0px;
+    font-size: 13px;
+}
+#AttachDel:hover { color: #ff8fa8; }
+
+/* 上下文分隔行（WorkBuddy 观感：居中一行小字 + 上方虚线） */
+#ContextLine {
+    color: #8f98ab;
+    background: transparent;
+    border: none;
+    border-top: 1px dashed #2c3344;
+    font-size: 11px;
+    padding: 6px 0 2px 0;
+}
+#CtxMeter {
+    color: #7d8596;
+    background: transparent;
+    border: none;
+    font-size: 11px;
+}
+#CtxMeter[hot="true"] { color: #f0b862; }
+
+/* ================================================================
+ * 1.0.11 字号档位（2026-10-26，用户反馈「字体太小，参考 workbuddy」）
+ * ----------------------------------------------------------------
+ * 只针对智能助理这一套界面（本文件里 #PageTitle / #BotBubble / #Nav* 等
+ * 选择器只在这一套界面用），不动控制台/模型库/对话页，避免把那些页面的
+ * 一屏容量撑爆（有专门的布局门禁用例守着）。
+ *
+ * 集中在文件末尾用**同选择器覆盖**的方式给出，好处是：
+ *   · 想整体再放大/缩小，只改这一段；原始规则的排版意图仍可追溯；
+ *   · 不散落在原文里，review 时一眼能看完；
+ *   · 特异性相同 → 后定义生效，CSS 语义明确。
+ *
+ * 档位依据 WorkBuddy 桌面端：正文 15px、辅助 13px、标题 20px、微字 11px。
+ * ================================================================ */
+#PageTitle { font-size: 20px; }
+#PageSubtitle { font-size: 13px; }
+#NavTitleLabel { font-size: 19px; }
+#NavVersionLabel { font-size: 12px; }
+#NavButton { font-size: 15px; }
+#NavSubTitle { font-size: 13px; }
+#NavGroupTitle { font-size: 12px; }
+#NavTaskItem { font-size: 13px; }
+#NavSpaceItem { font-size: 13px; }
+#NavEmpty { font-size: 12px; }
+
+/* 对话区：气泡正文 15px（原来 13px），行距靠 padding 补 */
+#UserBubble, #BotBubble { font-size: 15px; }
+#UserBubble { padding: 9px 13px; }
+#BotBubble { padding: 11px 13px; }
+#StepLine { font-size: 12px; }
+#ErrorLine { font-size: 13px; }
+#BubbleTime { font-size: 11px; }
+#ContextLine { font-size: 12px; }
+#CtxMeter { font-size: 12px; }
+#ThinkingHead { font-size: 13px; }
+#ThinkingBody { font-size: 13px; }
+#CardHead { font-size: 13px; }
+#CardBody { font-size: 13px; }
+#ApprovalTitle { font-size: 14px; }
+
+/* 输入区 */
+#Composer QTextEdit#ComposerInput, #Composer QTextEdit#ComposerInput:focus { font-size: 15px; }
+#ComposerTip { font-size: 12px; }
+#AttachName { font-size: 12px; }
+/* 底栏胶囊保持 12px：底栏可用宽度只有 504px（720 逻辑宽 - 两侧留白），
+ * 这里跟着放大就会顶爆宽度门禁（test_bottom_bar_fits_504px_in_busy_state） */
+#BarChip { font-size: 12px; }
+#MiniBtn { font-size: 12px; }
+
+/* 队列 / 清单中心 / 在线目录弹窗 */
+#QueueTitle { font-size: 13px; }
+#QueueText { font-size: 13px; }
+#QueueIdx { font-size: 12px; }
+#HubToolName, #HubToolNameDim { font-size: 13px; }
+#HubToolDim { font-size: 12px; }
+#HubDetail { font-size: 13px; }
+#HubHeadCount { font-size: 13px; }
+#HubSearch, #HubCombo { font-size: 13px; }

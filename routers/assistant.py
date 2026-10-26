@@ -51,6 +51,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core.assistant import catalog as catalog_mod
+from core.assistant import context as context_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
 from core.assistant import store as store_mod
@@ -120,6 +121,13 @@ async def session_detail(sid: str):
     s = get_assistant().get_session(sid)
     if s is None:
         return fail(2001, "会话不存在")
+    # 附上上下文占用（2026-10-26）：客户端切到旧任务时也要能显示「上下文 xx%」，
+    # 否则只有发过消息之后才知道用量，看着像没这个功能。
+    try:
+        s = dict(s)
+        s["context_usage"] = context_mod.usage(s, load_config())
+    except Exception:  # noqa: BLE001 —— 统计失败不影响会话本身
+        pass
     return ok(s)
 
 
@@ -264,13 +272,17 @@ async def chat(body: Dict[str, Any]):
     mounted = body.get("mounted_skills")
     mounted_skills = ([str(s) for s in mounted if str(s).strip()]
                       if isinstance(mounted, list) else None)
+    # 粘贴的图片（2026-10-26）：客户端已落盘，这里只传绝对路径
+    raw_att = body.get("attachments")
+    attachments = ([str(p) for p in raw_att if str(p).strip()]
+                   if isinstance(raw_att, list) else None)
 
     if not stream:
         from fastapi.concurrency import run_in_threadpool
         events = []
         result = await run_in_threadpool(
             ass.start_turn, session_id, first_text, provider_id, model,
-            events.append, mounted_skills)
+            events.append, mounted_skills, attachments)
         return ok({"result": result, "events": events,
                    "session_id": session_id})
 
@@ -294,11 +306,16 @@ async def chat(body: Dict[str, Any]):
             yield _sse(_queue_snapshot_event(session_id))   # 起流即同步快照
 
             text_now = first_text
+            first_round = True
             while text_now:
-                def run(t: str = text_now) -> None:
+                # 附件只随第一轮下发：后续轮次是队列里的其它消息，不该重复带图
+                atts = attachments if first_round else None
+                first_round = False
+
+                def run(t: str = text_now, atts=atts) -> None:
                     try:
                         ass.start_turn(session_id, t, provider_id, model,
-                                       emit, mounted_skills)
+                                       emit, mounted_skills, atts)
                     except Exception as e:  # noqa: BLE001
                         emit({"type": "error",
                               "message": f"{type(e).__name__}: {e}"})

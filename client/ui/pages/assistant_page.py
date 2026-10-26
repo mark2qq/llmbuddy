@@ -42,9 +42,9 @@ import tempfile
 import traceback
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import (QColor, QIcon, QPainter, QPainterPath, QPixmap,
-                           QTextCursor)
+from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QPainter,
+                           QPainterPath, QPixmap, QTextCursor)
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -60,6 +60,8 @@ from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
                                         StepLine, ThinkingBlock, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
+from ui.widgets.image_composer import (IMAGE_EXTS, AttachmentBar, PasteImageEdit,
+                                       save_image)
 #: 在线目录徽标文案的单一来源在在线窗口模块（两边共用一套，避免文案漂移）
 from ui.widgets.online_catalog_dialog import CLASS_BADGE as CATALOG_CLASS_BADGE
 from ui.widgets.queue_item import QueueItemRow
@@ -398,6 +400,8 @@ class AssistantPage(QWidget):
         self._scroll = AutoHideScrollArea()
         self._scroll.setObjectName("ChatScroll")
         self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
+        # 量程变化（新内容撑高）时贴底：光靠 40ms 定时器会因布局未完成而差一截
+        self._scroll.verticalScrollBar().rangeChanged.connect(self._on_scroll_range)
         self._container = QWidget()
         row = QHBoxLayout(self._container)
         row.setContentsMargins(0, 0, 0, 0)
@@ -445,10 +449,22 @@ class AssistantPage(QWidget):
 
         il.addWidget(self._build_composer())
 
+        # 合规提示行：左侧顺带显示上下文占用（WorkBuddy 风格的一行小字）
+        meta = QHBoxLayout()
+        meta.setContentsMargins(6, 0, 6, 0)
+        meta.setSpacing(6)
+        self._ctx_label = QLabel("")
+        self._ctx_label.setObjectName("CtxMeter")
+        self._ctx_label.setToolTip(
+            "当前任务的上下文占用。接近上限时会自动把较早的对话压成摘要"
+            "（原始消息仍保留在本机任务记录里），压缩发生时会在这行上方提示")
+        meta.addWidget(self._ctx_label, 0)
+        meta.addStretch(1)
         tip = QLabel("内容由 AI 生成，请核实重要信息")
         tip.setObjectName("ComposerTip")
         tip.setAlignment(Qt.AlignCenter)
-        il.addWidget(tip)
+        meta.addWidget(tip, 0)
+        il.addLayout(meta)
 
         outer.addStretch(1)
         outer.addWidget(inner, 100)
@@ -536,13 +552,19 @@ class AssistantPage(QWidget):
         lay.setSpacing(2)
         self._composer_lay = lay
 
-        self._input = QTextEdit()
+        # 粘贴的图片：先落到本机文件，再在输入框上方显示缩略图条
+        # （用子类接住 MIME 里的图片，原生 QTextEdit 对 image/* 直接忽略）
+        self._attach_bar = AttachmentBar()
+        lay.addWidget(self._attach_bar)
+
+        self._input = PasteImageEdit()
         self._input.setObjectName("ComposerInput")
         self._input.setFrameShape(QFrame.NoFrame)
         self._input.setPlaceholderText(
             "今天帮你做些什么？（Enter 发送，Shift+Enter 换行）")
         self._input.setFixedHeight(66)
         self._input.installEventFilter(self)
+        self._input.image_pasted.connect(self._on_image_pasted)
         lay.addWidget(self._input)
 
         bar = QHBoxLayout()
@@ -832,10 +854,47 @@ class AssistantPage(QWidget):
                                accept_text="添加")
         if not path:
             return
+        # 选的是图片：走附件缩略图条（与粘贴图片一致），不再往正文塞 @路径
+        if os.path.splitext(path)[1].lower() in IMAGE_EXTS:
+            if self._attach_bar.add(path):
+                self._set_status(
+                    f"已添加图片 {os.path.basename(path)}（发送时随消息一起提交）")
+            else:
+                self._set_status("这张图片已经在待发送列表里了")
+            return
         cur = self._input.toPlainText().rstrip()
         self._input.setPlainText(f"{cur} @{path} ".strip() if cur else f"@{path} ")
         self._input.moveCursor(QTextCursor.End)
         self._input.setFocus()
+
+    # ---------------- 粘贴图片（2026-10-26） ----------------
+    def _on_image_pasted(self, img: Any) -> None:
+        """剪贴板里的图片：落盘 → 加进附件条 → 状态栏确认。
+
+        不能只塞内存 QImage：没有稳定路径，后端/模型无法引用；也不可能把
+        base64 写进正文（会炸上下文）。所以这里直接存成 PNG。
+        """
+        try:
+            path = save_image(img, "paste")
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"图片保存失败：{e}")
+            return
+        if not self._attach_bar.add(path):
+            self._set_status("这张图片已经在待发送列表里了")
+            return
+        self._set_status(
+            f"已添加图片 {os.path.basename(path)}（可继续 Ctrl+V 粘贴；"
+            "发送时随消息一起提交）")
+        self._input.setFocus()
+
+    def _attachment_paths(self) -> List[str]:
+        bar = getattr(self, "_attach_bar", None)
+        return bar.paths() if bar is not None else []
+
+    def _reset_attachments(self) -> None:
+        bar = getattr(self, "_attach_bar", None)
+        if bar is not None:
+            bar.clear()
 
     # ---------------- 底栏 [+] 菜单：添加附件 + 清单中心 + 添加类 + 刷新 + 管理类 ----------------
     def _build_attach_menu(self) -> "QMenu":
@@ -2647,9 +2706,20 @@ class AssistantPage(QWidget):
         for m in data.get("messages") or []:
             role = m.get("role")
             content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
+            imgs = [str(p) for p in (m.get("images") or []) if str(p).strip()]
+            if role in ("user", "assistant") and (content or imgs):
                 bubble = ChatBubble(role, content)
                 self._append_widget(bubble)
+                if imgs:
+                    self._add_image_row(imgs)
+        # 历史任务压缩过上下文：补一行分隔提示，让人知道「之前的对话被压过」
+        ctx = data.get("context") or {}
+        if isinstance(ctx, dict) and ctx.get("summary"):
+            self._add_context_line({"folded": int(ctx.get("compressed") or 0),
+                                    "via": ctx.get("via"), "at": ctx.get("at")})
+        usage = data.get("context_usage")
+        if isinstance(usage, dict):
+            self._apply_context(usage)
         self._add_step("已载入历史任务")
         self._sel_sid = str(self._session_id or "")
         self._fill_sessions()      # 同步左栏的选中态与「任务 / 空间」两区
@@ -2680,24 +2750,34 @@ class AssistantPage(QWidget):
                 box.setProperty("focus", on)
                 box.style().unpolish(box)
                 box.style().polish(box)
+        # 对话区里的图片缩略图：单击用系统看图程序打开原图
+        if isinstance(obj, QLabel) and event.type() == QEvent.Type.MouseButtonRelease:
+            path = str(obj.property("imagePath") or "")
+            if path and os.path.isfile(path):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                return True
         return super().eventFilter(obj, event)
 
     def _on_send_clicked(self) -> None:
         text = self._input.toPlainText().strip()
-        if not text:
+        images = self._attachment_paths()
+        if not text and not images:
             return
+        # 只贴了图没打字也允许发（截图提问是真实场景），给正文一个占位说明
+        if not text:
+            text = "（请看我发的图片）"
         slots = self._available_send_slots()
         if slots <= 0:
             # 1.0.8：后端按队列模型串行处理（同一时刻只有 1 个活跃流），
             # 所以忙碌态 Enter 一律走「排队」，不再丢弃消息（1.0.9 行为保持）
-            self._enqueue_message(text, guided=False)
+            self._enqueue_message(text, guided=False, images=images)
             return
         if not self._session_id:
             w = Worker(self._assist.new_session)
-            w.result.connect(lambda s: self._send_with_session(s, text))
+            w.result.connect(lambda s: self._send_with_session(s, text, images))
             w.start()
             return
-        self._send_with_session({"id": self._session_id}, text)
+        self._send_with_session({"id": self._session_id}, text, images)
 
     def _available_send_slots(self) -> int:
         """当前还能并发起几条对话流：忙碌中 0，空闲 1。
@@ -2712,32 +2792,46 @@ class AssistantPage(QWidget):
         if not self._busy:
             return
         text = self._input.toPlainText().strip()
-        if not text:
+        images = self._attachment_paths()
+        if not text and not images:
             return
-        self._enqueue_message(text, guided=True)
+        if not text:
+            text = "（请看我发的图片）"
+        self._enqueue_message(text, guided=True, images=images)
 
-    def _enqueue_message(self, text: str, guided: bool) -> None:
+    def _enqueue_message(self, text: str, guided: bool,
+                         images: Optional[List[str]] = None) -> None:
         """REST 入队 / 引导发送（短请求，不新开 SSE 流）。
 
         失败时输入框文本保留（不清空即不丢），状态栏说明原因；
         成功后的面板刷新等 queue 快照（SSE 广播或主动 GET）。
+
+        附件（2026-10-26）：队列条目只有 `text` 一个字段，图片无法作为结构化
+        附件存进去——这里把路径拼进正文，保证「粘的图不会丢」，并在状态栏
+        说清楚是路径形式。清空附件条要等入队成功之后。
         """
         sid = self._session_id
         if not sid:
             # 没有当前任务（忙碌必有流，正常走不到）：按普通发送兜底
             w = Worker(self._assist.new_session)
-            w.result.connect(lambda s: self._send_with_session(s, text))
+            w.result.connect(lambda s: self._send_with_session(s, text, images))
             w.start()
             return
+        payload_text = text
+        if images:
+            payload_text = (f"{text}\n\n（附图，已保存在本机：\n"
+                            + "\n".join(f"- {p}" for p in images) + "\n）")
         self._set_status("正在引导发出…" if guided else "正在排队…")
-        w = Worker(self._assist.enqueue, sid, text, guided)
-        w.result.connect(lambda _r: self._on_enqueued(guided))
+        w = Worker(self._assist.enqueue, sid, payload_text, guided)
+        w.result.connect(lambda _r: self._on_enqueued(guided, bool(images)))
         w.error.connect(lambda m: self._on_enqueue_failed(m, guided))
         w.start()
 
-    def _on_enqueued(self, guided: bool) -> None:
+    def _on_enqueued(self, guided: bool, had_images: bool = False) -> None:
         # 输入框清空；队列行等快照事件出现（单一事实来源，不局部加行）
         self._input.clear()
+        if had_images:
+            self._reset_attachments()
         self._set_status("已引导发出，本轮结束后自动处理" if guided
                          else "已排队，本轮结束后按序发送")
 
@@ -2746,13 +2840,18 @@ class AssistantPage(QWidget):
         self._set_status(
             f"{'引导' if guided else '排队'}失败：{msg}（消息保留在输入框）")
 
-    def _send_with_session(self, session: Any, text: str) -> None:
+    def _send_with_session(self, session: Any, text: str,
+                           images: Optional[List[str]] = None) -> None:
         if not isinstance(session, dict) or not session.get("id"):
             self._set_status("任务创建失败，请检查后端服务")
             return
         self._session_id = session["id"]
         self._input.clear()
+        images = [p for p in (images or []) if str(p).strip()]
         self._add_bubble("user", text)
+        if images:
+            self._add_image_row(images)
+        self._reset_attachments()
         self._scroll_bottom(force=True)   # 用户刚发消息：一定回到底部
         self._begin_streaming()
 
@@ -2768,6 +2867,10 @@ class AssistantPage(QWidget):
         }
         if self._skill_slugs:
             payload["mounted_skills"] = list(self._skill_slugs)
+        if images:
+            # 后端把路径挂到 message.images（历史可回看），并在本轮上下文里
+            # 以文本形式告诉模型「这些图片在本机，用 fs_read / OCR 处理」
+            payload["attachments"] = list(images)
         self._stream = AssistantStream(
             self.config.gateway_url(), self.config.api_key, payload)
         self._stream.event.connect(self._on_event)
@@ -2972,6 +3075,13 @@ class AssistantPage(QWidget):
         elif kind == "queue_state":
             self._on_queue_state(bool(ev.get("paused")),
                                  str(ev.get("reason") or ""))
+        elif kind == "compact":
+            # 后端正在压缩较早的上下文（WorkBuddy 同款提示）
+            if str(ev.get("phase") or "") == "start":
+                self._add_step(str(ev.get("message")
+                                    or "上下文接近上限，正在压缩较早的对话…"))
+        elif kind == "context":
+            self._apply_context(ev)
         elif kind == "done":
             # 单轮答复完成：收尾当前气泡，但**不结束忙碌态**——
             # 队列还有消息时 gen() 会在同一条连接里续跑（P0-2 前端关键点）
@@ -3169,17 +3279,28 @@ class AssistantPage(QWidget):
             self._fetch_queue(self._session_id)
 
     def _fetch_queue(self, sid: str) -> None:
-        """GET /queue：停止后 / 切换任务后 / 无流时的快照同步手段。"""
+        """GET /queue：停止后 / 切换任务后 / 无流时的快照同步手段。
+
+        会**乱序到达**：停止、切任务、行内编辑后都会各拉一次，慢的那个回来
+        时可能把新快照覆盖成旧的（历史现象之一：编辑完队列面板突然空了）。
+        用递增序号做「只认最新一次请求」。
+        """
         if not sid:
             return
+        self._queue_seq = int(getattr(self, "_queue_seq", 0) or 0) + 1
+        seq = self._queue_seq
         w = Worker(self._assist.queue, sid)
-        w.result.connect(self._on_queue_fetched)
+        w.result.connect(lambda d, s=seq: self._on_queue_fetched(d, s, sid))
         w.error.connect(lambda m: self._set_status(f"队列同步失败：{m}"))
         w.start()
 
-    def _on_queue_fetched(self, data: Any) -> None:
+    def _on_queue_fetched(self, data: Any, seq: int = 0, sid: str = "") -> None:
         if not isinstance(data, dict):
             return
+        if seq and seq < int(getattr(self, "_queue_seq", 0) or 0):
+            return                      # 已有更新的请求发出，这份是旧快照
+        if sid and self._session_id and sid != self._session_id:
+            return                      # 切了任务：旧任务的队列不能画到新任务上
         self._apply_queue(data.get("items") or [], bool(data.get("paused")))
 
     def _resume_queue(self) -> None:
@@ -3245,9 +3366,110 @@ class AssistantPage(QWidget):
         self._scroll_bottom()
         return b
 
+    def _add_image_row(self, paths: List[str]) -> None:
+        """用户消息下方的图片缩略图行（右对齐，点开看原图）。
+
+        单独一行而不是塞进气泡 label：ChatBubble 的宽度是「按文字估算后贴边」
+        的，混排图片会把宽度算乱；一行独立缩略图既不干扰文字排版，也方便
+        以后换多图网格。
+        """
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 6, 2)
+        lay.setSpacing(6)
+        lay.addStretch(1)
+        for path in paths[:6]:
+            lb = QLabel()
+            lb.setObjectName("AttachThumb")
+            lb.setFixedSize(96, 96)
+            lb.setAlignment(Qt.AlignCenter)
+            lb.setToolTip(f"{path}\n（点击用系统看图程序打开）")
+            lb.setCursor(Qt.PointingHandCursor)
+            pix = QPixmap(path)
+            if pix.isNull():
+                lb.setText("图片\n读取失败")
+            else:
+                lb.setPixmap(pix.scaled(96, 96, Qt.KeepAspectRatio,
+                                        Qt.SmoothTransformation))
+            lb.installEventFilter(self)
+            lb.setProperty("imagePath", path)
+            lay.addWidget(lb, 0, Qt.AlignTop)
+        if len(paths) > 6:
+            more = QLabel(f"+{len(paths) - 6}")
+            more.setObjectName("BubbleTime")
+            lay.addWidget(more, 0, Qt.AlignBottom)
+        self._append_widget(row)
+        self._scroll_bottom()
+
     def _add_step(self, text: str, error: bool = False) -> None:
         self._append_widget(StepLine(text, error=error))
         self._scroll_bottom()
+
+    # ---------------- 上下文占用 / 压缩提示（2026-10-26） ----------------
+    @staticmethod
+    def _fmt_tokens(n: Any) -> str:
+        try:
+            v = int(n or 0)
+        except (TypeError, ValueError):
+            return "0"
+        return f"{v / 1000:.1f}k" if v >= 1000 else str(v)
+
+    def _apply_context(self, ev: Dict[str, Any]) -> None:
+        """更新底部「上下文 32% · 2.6k/8k」，压缩时插入一行分隔提示。
+
+        事件来源：后端每轮开始发的 `context`，以及会话详情的 `context_usage`
+        （切到旧任务也能显示，不必等下次发言）。
+        """
+        lbl = getattr(self, "_ctx_label", None)
+        if lbl is None:
+            return
+        try:
+            used = int(ev.get("used") or 0)
+            limit = int(ev.get("limit") or 0)
+        except (TypeError, ValueError):
+            used = limit = 0
+        if limit <= 0:
+            lbl.setText("")
+            lbl.setVisible(True)
+            return
+        pct = max(0, min(100, int(round(used * 100.0 / limit))))
+        lbl.setText(f"上下文 {pct}% · {self._fmt_tokens(used)}/"
+                    f"{self._fmt_tokens(limit)}")
+        hot = pct >= 70
+        if bool(lbl.property("hot")) != hot:
+            lbl.setProperty("hot", hot)
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
+        if ev.get("compressed") and "folded" in ev:
+            # 只有真正的压缩事件才插提示行：`context_usage`（切旧任务时的
+            # 摘要统计）也带 compressed=True，这里再插就重复了
+            self._add_context_line(ev)
+
+    def _add_context_line(self, ev: Dict[str, Any]) -> None:
+        """对话流里的「✓ 上下文已压缩」分隔行（模仿 WorkBuddy）。"""
+        bits: List[str] = ["✓ 上下文已压缩"]
+        folded = int(ev.get("folded") or 0)
+        if folded:
+            bits.append(f"折叠 {folded} 条较早消息")
+        saved = int(ev.get("saved") or 0)
+        if saved > 0:
+            bits.append(f"省 {self._fmt_tokens(saved)} tokens")
+        if str(ev.get("via") or "") == "rule":
+            bits.append("规则摘要")
+        if ev.get("truncated"):
+            bits.append("仍超窗口，建议新建任务")
+        text = " · ".join(bits)
+        lab = QLabel(text)
+        lab.setObjectName("ContextLine")
+        lab.setAlignment(Qt.AlignCenter)
+        lab.setWordWrap(True)
+        lab.setToolTip(
+            "较早的对话已被压成一段要点摘要继续沿用（保留目标、已完成步骤、"
+            "文件路径与未决问题）；原始消息仍完整保存在本机任务记录里，"
+            "回看历史不受影响")
+        self._append_widget(lab)
+        self._scroll_bottom()
+        self._set_status(text)
 
     def _add_step_with_action(self, text: str, action_label: str, on_action,
                               error: bool = False) -> AutoLoadPrompt:
@@ -3277,9 +3499,19 @@ class AssistantPage(QWidget):
         self._tool_cards = []
         self._approvals.clear()
         self._follow = True
+        # 新任务：待发送的图片与上下文占用都不再属于这个任务
+        self._reset_attachments()
+        if getattr(self, "_ctx_label", None) is not None:
+            self._ctx_label.setText("")
+            if bool(self._ctx_label.property("hot")):
+                self._ctx_label.setProperty("hot", False)
+                self._ctx_label.style().unpolish(self._ctx_label)
+                self._ctx_label.style().polish(self._ctx_label)
         # 自动加载提示的去重表跟着对话清空（换任务重新提示一次）
         self._auto_tips.clear()
         # 队列面板跟随任务重置（新任务的快照由 _fetch_queue 拉回）
+        # 序号 +1 让「切任务前发出的在途快照」全部失效，不会画到新任务上
+        self._queue_seq = int(getattr(self, "_queue_seq", 0) or 0) + 1
         self._apply_queue([], False)
 
     def _scroll_bottom(self, force: bool = False) -> None:
@@ -3297,6 +3529,22 @@ class AssistantPage(QWidget):
         bar = self._scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
         self._follow = True
+
+    def _on_scroll_range(self, _minimum: int, maximum: int) -> None:
+        """内容高度变了就贴到底（用户反馈「要手动滚动才能看到最新输出」）。
+
+        根因：40ms 合并滚动可能在布局还没算完时就 `setValue(maximum())`，
+        那时 maximum 还是旧值 → 每次都差一截，且没有后续事件再滚一次，于是
+        表现成「输出在涨、视口不动，得自己往下拖」。
+
+        `rangeChanged` 是滚动条量程真正变化的那一刻，在这里贴底才是「停在最新
+        输出」。用户主动往上翻过（`_follow=False`）就完全不打扰。
+        """
+        if not self._follow:
+            return
+        bar = self._scroll.verticalScrollBar()
+        if bar.value() != maximum:
+            bar.setValue(maximum)
 
     def _on_scroll_value(self, value: int) -> None:
         """记录用户是否还贴着底部：往上翻就别再自动拽回去。"""

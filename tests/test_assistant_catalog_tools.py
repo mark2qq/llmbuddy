@@ -510,9 +510,10 @@ def test_chat_mounted_skills_passthrough(env, monkeypatch):
     # 注意：必须打在类上（打在实例上不会生效 —— run_in_threadpool 传参走的是
     # 类属性查找到的函数），且要接住隐式 self。这是本用例曾经 KeyError 的根因。
     def fake_start_turn(self_, sid, text, provider_id="", model="", emit=None,
-                        mounted_skills=None):
+                        mounted_skills=None, attachments=None):
         captured.update({"sid": sid, "text": text,
-                         "mounted": mounted_skills})
+                         "mounted": mounted_skills,
+                         "attachments": attachments})
         return {"ok": True, "content": "ok"}
 
     ass = agent_mod.get_assistant()
@@ -531,8 +532,9 @@ def test_chat_without_mounted_skills_is_none(env, monkeypatch):
     captured = {}
 
     def fake_start_turn(self_, sid, text, provider_id="", model="", emit=None,
-                        mounted_skills=None):
+                        mounted_skills=None, attachments=None):
         captured["mounted"] = mounted_skills
+        captured["attachments"] = attachments
         return {"ok": True, "content": ""}
 
     ass = agent_mod.get_assistant()
