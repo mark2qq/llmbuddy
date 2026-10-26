@@ -265,6 +265,61 @@ class AssistantApi:
     def save_settings(self, patch: Dict) -> Dict:
         return self.put("/api/v1/assistant/settings", patch) or {}
 
+    # ---------------- 并行多任务（core/assistant/parallel.py） ----------------
+    # 端点见 docs/智能助理-并行多任务-架构设计.md §5。业务错误 HTTP 200 +
+    # fail(code, message)，由 _unwrap 抛 RuntimeError。
+    def parallel_list(self, limit: int = 50) -> List[Dict]:
+        """GET /parallel：并行计划摘要列表。"""
+        return self.get("/api/v1/assistant/parallel",
+                        {"limit": int(limit)}) or []
+
+    def parallel_plan(self, goal: str, provider: str = "", model: str = "",
+                      max_tasks: int = 0, workspace: str = "",
+                      title: str = "",
+                      subtasks: Optional[List[Dict]] = None) -> Dict:
+        """POST /parallel/plan：把目标拆成子任务计划（只规划不执行）。
+
+        `subtasks` 给了就按它拆（不调模型，确定性路径）。
+        """
+        body: Dict[str, Any] = {"goal": goal or "", "provider": provider or "",
+                                "model": model or "", "workspace": workspace or "",
+                                "title": title or ""}
+        if max_tasks:
+            body["max_tasks"] = int(max_tasks)
+        if subtasks:
+            body["subtasks"] = list(subtasks)
+        return self.post("/api/v1/assistant/parallel/plan", body) or {}
+
+    def parallel_run(self, goal: str, provider: str = "", model: str = "",
+                     max_tasks: int = 0, workspace: str = "",
+                     title: str = "",
+                     subtasks: Optional[List[Dict]] = None) -> Dict:
+        """POST /parallel/run：拆分并在后台并行执行（立即返回计划快照）。"""
+        body: Dict[str, Any] = {"goal": goal or "", "provider": provider or "",
+                                "model": model or "", "workspace": workspace or "",
+                                "title": title or ""}
+        if max_tasks:
+            body["max_tasks"] = int(max_tasks)
+        if subtasks:
+            body["subtasks"] = list(subtasks)
+        return self.post("/api/v1/assistant/parallel/run", body,
+                         timeout=120.0) or {}
+
+    def parallel_detail(self, plan_id: str) -> Dict:
+        """GET /parallel/{id}：计划详情（含子任务状态与事件）。"""
+        return self.get(f"/api/v1/assistant/parallel/{plan_id}") or {}
+
+    def parallel_cancel(self, plan_id: str) -> Dict:
+        """POST /parallel/{id}/cancel：取消计划（停掉正在跑的子任务）。"""
+        return self.post(f"/api/v1/assistant/parallel/{plan_id}/cancel", {}) or {}
+
+    def parallel_resume(self, plan_id: str, provider: str = "",
+                        model: str = "") -> Dict:
+        """POST /parallel/{id}/resume：从断点续跑（可换模型）。"""
+        body: Dict[str, Any] = {"provider": provider or "", "model": model or ""}
+        return self.post(f"/api/v1/assistant/parallel/{plan_id}/resume", body,
+                         timeout=120.0) or {}
+
     def audit(self, limit: int = 100) -> List[Dict]:
         return self.get("/api/v1/assistant/audit", {"limit": limit}) or []
 

@@ -170,6 +170,12 @@ def _default_config() -> Dict[str, Any]:
         "profiles": _default_profiles(),
         "catalog": _default_catalog(),
         "skill_sources": {},         # slug -> {kind, repo, ref, dir, commit, ...}
+        # ---- 并行多任务（core/assistant/parallel.py）----
+        # 必须在这里声明，否则 load_config() 的 `if k in cfg` 过滤会丢掉，
+        # 老 config.json 读不到这三个字段（与上面 1.0.8 的坑同源）。
+        "parallel_max_workers": 4,       # 同时跑几个子任务（硬上限 8）
+        "parallel_max_retries": 1,       # 单个子任务最大重试次数（不含首次）
+        "parallel_subtask_timeout": 300,  # 单个子任务时限（秒）
     }
 
 

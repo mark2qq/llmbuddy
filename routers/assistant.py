@@ -59,6 +59,9 @@ from core.assistant import tools as tools_mod
 from core.assistant.agent import get_assistant
 from core.assistant.approval import get_approval_manager
 from core.assistant.mcp import MCPError, get_mcp_manager
+from core.assistant.parallel import (ERR_NOTHING_TO_RESUME, ERR_PARAM,
+                                     ERR_PLAN_BUSY, ERR_PLAN_NOT_FOUND,
+                                     MAX_TASKS, ParallelError, get_runner)
 from core.assistant.queue import (ERR_GUIDED_READONLY, ERR_ITEM_DISPATCHED,
                                   ERR_ITEM_NOT_FOUND, ERR_QUEUE_EMPTY,
                                   ERR_SESSION_BUSY, EV_DEQUEUED, EV_GUIDED,
@@ -603,7 +606,9 @@ async def get_settings():
 async def put_settings(body: Dict[str, Any]):
     allowed = {"policy", "active_provider", "providers", "workspace",
                "max_steps", "approval_timeout", "temperature", "max_tokens",
-               "skill_timeout", "auto_load", "max_tool_rounds", "catalog"}
+               "skill_timeout", "auto_load", "max_tool_rounds", "catalog",
+               "parallel_max_workers", "parallel_max_retries",
+               "parallel_subtask_timeout"}
     patch = {k: v for k, v in (body or {}).items() if k in allowed}
     if "catalog" in patch:
         # catalog 只允许改白名单字段，且**按字段合并**（save_config 是浅合并，
@@ -964,3 +969,123 @@ async def put_profiles(body: Dict[str, Any]):
         audit("auto_load_updated", auto_load=patch.get("auto_load"),
               profiles=[p.get("id") for p in (patch.get("profiles") or [])])
     return ok(_profiles_payload(cfg))
+
+
+# ----------------------------------------------------------------------------
+# 并行多任务（core/assistant/parallel.py）
+#
+# 约定与既有接口一致：业务错误 HTTP 200 + fail(code, message, data)，
+# 错误码 2030-2033（2030 参数非法 / 2031 计划不存在 / 2032 计划忙 /
+# 2033 无可续跑子任务）。执行走后台线程，事件落在计划快照的 events 里，
+# 用 GET /parallel/{plan_id} 拉取（与既有 SSE 单会话流不混用）。
+# ----------------------------------------------------------------------------
+@router.get("/parallel")
+async def parallel_list(limit: int = 50):
+    """并行计划列表（摘要，不含子任务明细）。"""
+    return ok(get_runner().list(limit))
+
+
+@router.post("/parallel/plan")
+async def parallel_plan(body: Optional[Dict[str, Any]] = None):
+    """把目标拆成子任务计划（只规划不执行）。
+
+    body: {goal, provider, model, max_tasks, workspace, title, subtasks?}
+    `subtasks` 给了就按它拆（不调模型，确定性路径）。
+    """
+    body = body or {}
+    try:
+        plan = get_runner().plan(
+            goal=str(body.get("goal") or ""),
+            provider_id=str(body.get("provider") or ""),
+            model=str(body.get("model") or ""),
+            max_tasks=int(body.get("max_tasks") or MAX_TASKS),
+            workspace=str(body.get("workspace") or ""),
+            title=str(body.get("title") or ""),
+            subtasks=body.get("subtasks") or None)
+    except ParallelError as e:
+        return fail(e.code, e.message)
+    except Exception as e:  # noqa: BLE001
+        return fail(ERR_PARAM, f"拆分失败：{e}")
+    return ok(plan.to_dict())
+
+
+@router.post("/parallel/run")
+async def parallel_run(body: Optional[Dict[str, Any]] = None):
+    """拆分并在后台并行执行；立即返回计划快照（用 GET 轮询进度）。"""
+    body = body or {}
+    runner = get_runner()
+    try:
+        plan = runner.plan(
+            goal=str(body.get("goal") or ""),
+            provider_id=str(body.get("provider") or ""),
+            model=str(body.get("model") or ""),
+            max_tasks=int(body.get("max_tasks") or MAX_TASKS),
+            workspace=str(body.get("workspace") or ""),
+            title=str(body.get("title") or ""),
+            subtasks=body.get("subtasks") or None)
+    except ParallelError as e:
+        return fail(e.code, e.message)
+    except Exception as e:  # noqa: BLE001
+        return fail(ERR_PARAM, f"拆分失败：{e}")
+
+    def _work() -> None:
+        try:
+            runner.run(plan)
+        except Exception as e:  # noqa: BLE001 —— 后台线程不外冒
+            audit("parallel_run_failed", plan_id=plan.id, error=str(e))
+
+    threading.Thread(target=_work, daemon=True,
+                     name=f"parallel-plan-{plan.id}").start()
+    return ok(plan.to_dict())
+
+
+@router.get("/parallel/{plan_id}")
+async def parallel_detail(plan_id: str):
+    """计划详情（含子任务状态与事件）。"""
+    plan = get_runner().get(plan_id)
+    if plan is None:
+        return fail(ERR_PLAN_NOT_FOUND, "计划不存在")
+    return ok(plan.to_dict())
+
+
+@router.post("/parallel/{plan_id}/cancel")
+async def parallel_cancel(plan_id: str):
+    """取消计划：停掉正在跑的子任务，未开始的标记为已取消。"""
+    try:
+        get_runner().cancel(plan_id)
+    except ParallelError as e:
+        return fail(e.code, e.message)
+    except Exception as e:  # noqa: BLE001
+        return fail(ERR_PARAM, f"取消失败：{e}")
+    return ok({"cancelled": True, "id": plan_id})
+
+
+@router.post("/parallel/{plan_id}/resume")
+async def parallel_resume(plan_id: str, body: Optional[Dict[str, Any]] = None):
+    """从断点续跑：跳过已完成的子任务，只跑未完成的（可换模型）。
+
+    body: {provider?, model?} —— 换模型只作用于未完成的子任务。
+    与 /parallel/run 一致：**后台执行**，立即返回计划快照，客户端轮询详情。
+    """
+    body = body or {}
+    runner = get_runner()
+    plan = runner.get(plan_id)
+    if plan is None:
+        return fail(ERR_PLAN_NOT_FOUND, "计划不存在")
+    if not plan.pending_tasks():
+        return fail(ERR_NOTHING_TO_RESUME, "没有未完成的子任务")
+    if runner.is_running(plan_id):
+        # 刚取消的计划还在收尾（子任务线程退出中），此时续跑会撞上「计划忙」
+        return fail(ERR_PLAN_BUSY, "计划还在收尾，请稍后再续跑")
+
+    def _work() -> None:
+        try:
+            runner.resume(plan_id,
+                          provider_id=str(body.get("provider") or ""),
+                          model=str(body.get("model") or ""))
+        except Exception as e:  # noqa: BLE001 —— 后台线程不外冒
+            audit("parallel_resume_failed", plan_id=plan_id, error=str(e))
+
+    threading.Thread(target=_work, daemon=True,
+                     name=f"parallel-resume-{plan_id}").start()
+    return ok(plan.to_dict())

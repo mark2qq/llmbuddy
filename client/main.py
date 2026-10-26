@@ -302,6 +302,17 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("本地大模型服务")
     app.setStyle("Fusion")
+    # 冻结包禁用原生对话框（QMessageBox / QColorDialog / QInputDialog）：
+    # 原生实现会 0x8001010d 崩掉（2026-10-26 实测：后端未运行时启动，
+    # 「启动本地服务」弹窗即崩）。必须早于任何对话框调用。
+    from core import dialog_guard
+    dialog_guard.patch_dialogs_non_native()
+    _startup_log("native dialogs disabled")
+    # 放行 Windows 的瞬时 RPC 拒绝（0x8001010d）：模态弹窗期间其它线程
+    # 发起 COM/GUI 调用会被拒，默认行为是杀进程（2026-10-26 实测崩溃）。
+    from core import win_exception_guard
+    _startup_log("rpc retry filter=%s"
+                 % win_exception_guard.install_rpc_retry_filter())
     # 托盘应用：关闭/隐藏窗口不退出进程（仅托盘“退出”才真正退出）
     app.setQuitOnLastWindowClosed(False)
     _startup_log("QApplication created")

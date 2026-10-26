@@ -12,12 +12,16 @@
     orchestrator.py LangGraph 复杂子任务编排（缺失时降级为顺序执行）
     agent.py        会话级 Agent 循环 + SSE 事件流
     queue.py        引导会话队列（排队插话 / 引导发送，1.0.9 增量）
+    parallel.py     并行多任务执行（拆分 / 并发调度 / 聚合 / 取消 / 断点续跑）
+    parallel_store.py 并行计划断点持久化（原子写，跨会话跨模型续跑）
 
 对外只暴露 get_assistant()，由 routers/assistant.py 挂载；
-队列单例 get_queue() 由路由层的队列端点与 SSE 消费循环使用。
+队列单例 get_queue() 由路由层的队列端点与 SSE 消费循环使用；
+并行单例 get_runner() 由路由层的并行端点使用。
 """
 from core.assistant.agent import Assistant, get_assistant
+from core.assistant.parallel import ParallelError, ParallelRunner, get_runner
 from core.assistant.queue import QueueError, QueueItem, get_queue
 
 __all__ = ["Assistant", "get_assistant", "QueueItem", "QueueError",
-           "get_queue"]
+           "get_queue", "ParallelRunner", "ParallelError", "get_runner"]

@@ -74,12 +74,19 @@ class SkillState(TypedDict, total=False):
 # ----------------------------------------------------------------------------
 # 工具函数
 # ----------------------------------------------------------------------------
-def _extract_json_array(text: str) -> List[str]:
-    """从模型输出里抠出 JSON 字符串数组。"""
+def _extract_json_array(text: str, allow_lines: bool = True) -> List[str]:
+    """从模型输出里抠出 JSON 字符串数组。
+
+    `allow_lines=False` 时**只认真正的 JSON 数组**：模型输出不是 JSON 就返回空
+    （并行任务拆分用这个严格模式——把一句「今天天气不错」当成一个子任务，
+    比老老实实降级成「单任务自己干」糟糕得多）。
+    """
     if not text:
         return []
     m = re.search(r"\[[\s\S]*?\]", text)
     if not m:
+        if not allow_lines:
+            return []
         # 退化：按行拆步骤
         lines = [re.sub(r"^\s*[-*\d.、)）]+\s*", "", ln).strip()
                  for ln in text.splitlines()]
@@ -91,6 +98,11 @@ def _extract_json_array(text: str) -> List[str]:
     except Exception:
         pass
     return []
+
+
+#: 公开别名：并行任务拆分（core/assistant/parallel.py）复用同一个解析器，
+#: 避免两处各写一份「从模型输出里抠 JSON 数组」的土办法。
+extract_json_array = _extract_json_array
 
 
 def _history_text(obs: List[Dict[str, Any]], limit: int = 6000) -> str:
