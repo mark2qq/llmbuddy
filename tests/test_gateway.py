@@ -68,6 +68,65 @@ def test_gguf_downloaded_flag(tmp_path, monkeypatch):
     assert gw._gguf_downloaded("ghost", {}) is False
 
 
+def _fake_pool(loaded):
+    class _P:
+        def list_loaded(self):
+            return [{"name": n, "status": "ready"} for n in loaded]
+    return _P()
+
+
+def test_v1_models_dedupe_same_gguf(tmp_path, monkeypatch):
+    """同一 gguf 被下载条目(目录名) + 目录扫描条目(文件名)注册两次时，
+    /v1/models 只保留一个名字——本地模型清单 = 模型目录里的模型
+    （2026-10-26 用户报告：对话页/智能助理本地模型重复）。"""
+    from routers import gateway as gw
+    (tmp_path / "Llama-3.2-3B-Instruct-Q4_K_M.gguf").write_bytes(b"x")
+    monkeypatch.setattr(gw, "MODELS_DIR", str(tmp_path))
+    reg = {
+        # 模型库下载条目：name=目录名，gguf=绝对路径，指向与扫描条目相同的文件
+        "llama-3.2-3b-instruct": {
+            "gguf": str(tmp_path / "Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+            "source": "download",
+        },
+        # models_dir 扫描条目：name=文件名 stem，gguf=相对文件名
+        "Llama-3.2-3B-Instruct-Q4_K_M": {
+            "gguf": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            "source": "scan",
+        },
+        # 无关内置条目：文件不存在 -> downloaded=False
+        "qwen2.5-7b-instruct": {"gguf": "qwen2.5-7b-instruct.gguf",
+                                "source": "builtin"},
+    }
+    monkeypatch.setattr(gw, "load_registry", lambda: reg)
+    monkeypatch.setattr(gw, "get_model_pool", lambda: _fake_pool([]))
+    r = gw.list_models()
+    ids = [m["id"] for m in r["data"]]
+    # 同一物理文件只出现一次，且保留的是目录扫描名（stem == 名字）
+    assert "Llama-3.2-3B-Instruct-Q4_K_M" in ids, f"应保留目录扫描名: {ids}"
+    assert "llama-3.2-3b-instruct" not in ids, f"重复别名应被去重: {ids}"
+    by_id = {m["id"]: m for m in r["data"]}
+    assert by_id["Llama-3.2-3B-Instruct-Q4_K_M"]["downloaded"] is True
+    assert by_id["qwen2.5-7b-instruct"]["downloaded"] is False
+
+
+def test_v1_models_dedupe_keeps_running_alias(tmp_path, monkeypatch):
+    """别名（下载条目名）正在运行时应作为该文件的唯一代表保留，不能消失。"""
+    from routers import gateway as gw
+    (tmp_path / "m.gguf").write_bytes(b"x")
+    monkeypatch.setattr(gw, "MODELS_DIR", str(tmp_path))
+    reg = {
+        "alias-name": {"gguf": str(tmp_path / "m.gguf"), "source": "download"},
+        "m": {"gguf": "m.gguf", "source": "scan"},
+    }
+    monkeypatch.setattr(gw, "load_registry", lambda: reg)
+    monkeypatch.setattr(gw, "get_model_pool", lambda: _fake_pool(["alias-name"]))
+    r = gw.list_models()
+    ids = [m["id"] for m in r["data"]]
+    assert ids == ["alias-name"], f"运行中别名应作为唯一代表: {ids}"
+    assert r["data"][0]["loaded"] is True
+    assert r["data"][0]["downloaded"] is True
+
+
 # ---------------------------------------------------------------------------
 # /v1/chat/completions 未注册模型 -> 404（非 500）
 # ---------------------------------------------------------------------------

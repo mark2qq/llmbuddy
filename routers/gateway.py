@@ -382,20 +382,74 @@ def _gguf_downloaded(name: str, info: Dict[str, Any]) -> bool:
         return False
 
 
+def _dedupe_by_gguf(reg: Dict[str, Dict[str, Any]],
+                    loaded_names: set) -> Dict[str, bool]:
+    """按 gguf 物理文件去重注册表，返回 保留名 -> downloaded 的映射。
+
+    背景（2026-10-26 用户报告）：模型库下载条目（registry.json，name=目录名如
+    llama-3.2-3b-instruct）与 models_dir 扫描条目（name=文件名 stem 如
+    Llama-3.2-3B-Instruct-Q4_K_M）可能指向**同一个** gguf 文件——两个名字都
+    通过存在性检查，导致对话页/智能助理的本地模型清单出现重复项。
+
+    规则：把所有注册名按解析后的绝对路径归一（Windows 不区分大小写）分组，
+    每组只保留一个规范名：
+        1. 组内正在运行的条目最优先（运行中模型绝不能从清单里消失）；
+        2. 其次名字 == gguf 文件名 stem 的条目（即「模型目录里扫出来的模型」，
+           正是设置页模型目录语义）；
+        3. 最后取名字典序最小者（确定性）。
+    另外所有正在运行的条目无条件保留（即使与别的名字同文件）。
+    """
+    groups: Dict[str, List[str]] = {}
+    for name in reg.keys():
+        info = reg.get(name) or {}
+        gguf = str(info.get("gguf") or f"{name}.gguf")
+        path = gguf if os.path.isabs(gguf) else os.path.join(MODELS_DIR, gguf)
+        try:
+            key = os.path.normcase(os.path.abspath(path))
+        except OSError:
+            key = f"unresolvable::{name}"
+        groups.setdefault(key, []).append(name)
+
+    keep: Dict[str, bool] = {}
+
+    def _rank(n: str) -> tuple:
+        if n in loaded_names:
+            return (0, n)
+        info = reg.get(n) or {}
+        gguf = str(info.get("gguf") or f"{n}.gguf")
+        stem = os.path.splitext(os.path.basename(gguf))[0]
+        if n == stem:
+            return (1, n)
+        return (2, n)
+
+    for members in groups.values():
+        canonical = sorted(members, key=_rank)[0]
+        keep[canonical] = _gguf_downloaded(canonical, reg.get(canonical) or {})
+    # 运行中条目无条件保留
+    for n in loaded_names:
+        if n in reg and n not in keep:
+            keep[n] = True
+    return keep
+
+
 @router.get("/v1/models", dependencies=[Depends(require_key)])
 def list_models():
     """模型列表：来自注册表，loaded 标记来自 ModelPool，downloaded 标记
-    表示 gguf 文件确实存在于当前模型目录（智能助理/对话页据此只列已下载模型）。"""
+    表示 gguf 文件确实存在于当前模型目录（智能助理/对话页据此只列已下载模型）。
+
+    2026-10-26 起按 gguf 物理文件去重（_dedupe_by_gguf）：下载条目与目录扫描
+    条目指向同一文件时只保留一个名字，本地模型清单 = 设置页模型目录里的模型。"""
     pool = get_model_pool()
     loaded_names = {e["name"] for e in pool.list_loaded()}
     reg = load_registry()
+    keep = _dedupe_by_gguf(reg, loaded_names)
     data = [{
         "id": name,
         "object": "model",
         "owned_by": "local",
         "loaded": name in loaded_names,
-        "downloaded": _gguf_downloaded(name, reg.get(name) or {}),
-    } for name in reg.keys()]
+        "downloaded": keep[name],
+    } for name in reg.keys() if name in keep]
     return {"object": "list", "data": data}
 
 
