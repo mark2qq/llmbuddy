@@ -91,7 +91,9 @@ class MainWindow(QMainWindow):
             btn = QPushButton(name)
             btn.setObjectName("NavButton")
             btn.setCheckable(True)
-            btn.setMinimumHeight(44)
+            # 行高 36：WorkBuddy 左栏一级入口就是 32~36，44 时六项之间空得
+            # 太散（用户批注「间距参考 workbuddy」）。左栏总高因此更宽松。
+            btn.setFixedHeight(36)
             btn.clicked.connect(lambda _checked, i=idx: self._switch_page(i))
             self._nav_buttons.append(btn)
             nav_layout.addWidget(btn)

@@ -94,8 +94,7 @@ MCP_COMMAND_WHITELIST = ("npx", "uvx", "python", "python3", "node", "docker")
 # 条数必须克制 —— 左栏宽 200、最高只有几百像素，靠滚动条才能看到其余内容。
 NAV_TASK_MAX = 4            # 「任务」区直接显示几条（WorkBuddy 的「任务 (4)」同款）
 NAV_SPACE_MAX = 4           # 「空间」区最多显示几个空间
-NAV_SPACE_TASK_MAX = 5      # 空间展开后最多显示几条任务
-NAV_ROW = 26                # 单行高度
+NAV_ROW = 30                # 单行高度（对齐 WorkBuddy 左栏行高，26 太挤）
 NAV_SCROLL_MAX = 420        # 任务+空间滚动区最高多少（超出内部滚动）
 # 兼容旧命名（管理面板文案里还引用着）
 NAV_MAX_SESSIONS = NAV_TASK_MAX
@@ -148,6 +147,21 @@ def _ellipsis(text: str, limit: int = 12) -> str:
     """左栏只有 200px，标题必须截断（完整标题放 tooltip）。"""
     text = " ".join(str(text or "").split()) or "未命名任务"
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _latest_task(tasks: Any) -> Optional[Dict[str, Any]]:
+    """一组任务里「最后一次聊过」的那条（左栏空间区只显示这一条）。
+
+    刻意不按后端排序结果取第一条：那里把置顶的排在最前，置顶的很可能是
+    上周的旧任务，拿来当「最新」会误导。
+    """
+    best: Optional[Dict[str, Any]] = None
+    for t in (tasks or []):
+        if not isinstance(t, dict):
+            continue
+        if best is None or (t.get("updated_at") or 0) > (best.get("updated_at") or 0):
+            best = t
+    return best
 
 
 def _compact_chip(btn) -> None:
@@ -346,7 +360,6 @@ class AssistantPage(QWidget):
         self._nav_task_btns: Dict[str, QPushButton] = {}
         self._nav_spaces: List[Dict[str, Any]] = []
         self._nav_rows: Optional[List[Dict[str, Any]]] = None   # 左栏用的任务快照
-        self._open_space = ""
 
         self._build_ui()
         # 注意：不在这里调 refresh()。构造函数运行在 QApplication.exec() 之前，
@@ -989,7 +1002,8 @@ class AssistantPage(QWidget):
         lay.setSpacing(1)
 
         head = QHBoxLayout()
-        head.setContentsMargins(20, 7, 10, 2)
+        # 与服务同一套几何：行外边距 8 + 内边距 12 = 20，标题和任务行的文字左沿对齐
+        head.setContentsMargins(20, 8, 12, 4)
         head.setSpacing(4)
         self._nav_task_title = QLabel("任务")
         self._nav_task_title.setObjectName("NavSubTitle")
@@ -997,7 +1011,7 @@ class AssistantPage(QWidget):
         head.addStretch(1)
         add = QPushButton("+")
         add.setObjectName("NavSubAdd")
-        add.setFixedSize(18, 18)
+        add.setFixedSize(20, 20)
         add.setCursor(Qt.PointingHandCursor)
         add.setToolTip("新建任务")
         add.clicked.connect(lambda: self._new_session())
@@ -1047,7 +1061,9 @@ class AssistantPage(QWidget):
 
     def _nav_task_row(self, t: Dict[str, Any], *, sub: bool = False) -> QPushButton:
         sid = str(t.get("id") or "")
-        text = _ellipsis(t.get("title"), 11 if sub else 12)
+        # 13px 字号下 11 个汉字约 143px，加上 20px 左内边距正好卡住 200px 的左栏，
+        # 再多就会被 QPushButton 直接裁掉（它不会自动省略）
+        text = _ellipsis(t.get("title"), 10 if sub else 11)
         btn = QPushButton(("📌 " if t.get("pinned") else "") + text)
         btn.setObjectName("NavTaskItem")
         btn.setProperty("sub", "true" if sub else "false")
@@ -1062,16 +1078,36 @@ class AssistantPage(QWidget):
         self._nav_task_btns[sid] = btn
         return btn
 
-    def _group_spaces(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # ---------------- 左栏数据：任务 / 空间 分口径 ----------------
+    def _default_ws(self) -> str:
+        """系统默认工作区（后端 state 下发）。
+
+        老后端没有 `default_workspace` 字段时退回当前工作区：宁可多显示几条，
+        也不要把左栏「任务」区清空成一片空白。
+        """
+        return (_norm_ws(self._state.get("default_workspace"))
+                or _norm_ws(self._state.get("workspace")))
+
+    def _task_ws(self, row: Dict[str, Any]) -> str:
+        """一条任务属于哪个空间（历史任务没有 workspace → 归默认空间）。"""
+        return _norm_ws(row.get("workspace")) or self._default_ws()
+
+    def _group_spaces(self, rows: List[Dict[str, Any]],
+                      default_ws: str = "") -> List[Dict[str, Any]]:
         """按所属空间分组（与后端 store.space_list 同规则）。
 
-        历史任务没有 workspace 字段（1.0.8 之前建的），统一归到当前工作区，
+        历史任务没有 workspace 字段（1.0.8 之前建的），统一归到默认工作区，
         否则左栏会多出一个「未归属」组，看起来像数据丢了。
+
+        `default_ws` 给了就**跳过**它：默认工作区的任务显示在「任务」区，
+        再在「空间」区出现一次就是重复（用户反馈截图里同一批任务上下各列一遍）。
         """
-        cur = _norm_ws(self._state.get("workspace"))
+        cur = default_ws or _norm_ws(self._state.get("workspace"))
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for r in rows:
             ws = _norm_ws(r.get("workspace")) or cur or "（未归属）"
+            if default_ws and ws == default_ws:
+                continue
             groups.setdefault(ws, []).append(r)
         out: List[Dict[str, Any]] = []
         for ws, tasks in groups.items():
@@ -1097,33 +1133,46 @@ class AssistantPage(QWidget):
         if rows is None:
             rows = self._session_rows or []
         rows = [r for r in rows if isinstance(r, dict)]
-        spaces = self._nav_spaces or self._group_spaces(rows)
+        spaces = self._nav_spaces or self._group_spaces(rows, self._default_ws())
+        default_ws = self._default_ws()
+        # 「任务」区只放默认工作区的任务；其它目录的任务归到「空间」区，
+        # 避免同一批任务上下各列一遍（用户反馈截图）。
+        tasks = [r for r in rows if self._task_ws(r) == default_ws]
         # 内容签名：refresh 可能被高频触发（状态轮询 / 切页 / 流式结束），
         # 每次清空重建会让左栏闪烁且丢鼠标 hover 态，签名没变就直接返回。
         sig = (tuple((r.get("id"), r.get("title"), r.get("pinned"),
-                      r.get("message_count"), r.get("workspace")) for r in rows),
+                      r.get("message_count"), r.get("workspace")) for r in tasks),
                tuple((sp.get("path"), sp.get("count")) for sp in spaces),
-               self._open_space, self._session_id)
+               self._session_id)
         if sig == getattr(self, "_nav_sig", None):
             return
         self._nav_sig = sig
         self._clear_nav_body()
         if self._nav_task_title is not None:
-            self._nav_task_title.setText(f"任务 ({len(rows)})")
+            self._nav_task_title.setText(f"任务 ({len(tasks)})")
         lines = 0
 
-        # ---- 任务区：跨空间最近任务（置顶的排最前，后端已排好）----
-        for t in rows[:NAV_TASK_MAX]:
+        # ---- 任务区：默认工作区的任务（置顶的排最前，后端已排好）----
+        for t in tasks[:NAV_TASK_MAX]:
             lay.addWidget(self._nav_task_row(t))
             lines += 1
-        if not rows:
-            empty = QLabel("还没有任务，点右上角 + 新建")
+        if len(tasks) > NAV_TASK_MAX:
+            more = QPushButton(f"其余 {len(tasks) - NAV_TASK_MAX} 个任务…")
+            more.setObjectName("NavTaskItem")
+            more.setProperty("more", "true")
+            more.setCursor(Qt.PointingHandCursor)
+            more.setFixedHeight(NAV_ROW)
+            more.clicked.connect(lambda _c=False: self.open_manager("sessions"))
+            lay.addWidget(more)
+            lines += 1
+        if not tasks:
+            empty = QLabel("默认空间还没有任务，点右上角 + 新建")
             empty.setObjectName("NavEmpty")
             empty.setWordWrap(True)
             lay.addWidget(empty)
             lines += 1
 
-        # ---- 空间区：任务按工作区目录分组，点空间展开 / 收起 ----
+        # ---- 空间区：一个空间只留最新的一条任务（用户要求：不用都列）----
         if spaces:
             gtitle = QLabel(f"空间 ({len(spaces)})")
             gtitle.setObjectName("NavGroupTitle")
@@ -1131,40 +1180,34 @@ class AssistantPage(QWidget):
             lines += 1              # 分组标题也占一行，漏算会把最后一行挤出视口
             for sp in spaces[:NAV_SPACE_MAX]:
                 path = str(sp.get("path") or "")
-                opened = bool(self._open_space) and path == self._open_space
+                latest = _latest_task(sp.get("tasks") or [])
                 missing = not sp.get("exists", True)
                 row = QPushButton(
-                    f"{'▾' if opened else '▸'} {'⚠ ' if missing else '📁 '}"
-                    f"{_ellipsis(sp.get('name') or path, 11)}   {sp.get('count')}")
+                    f"{'⚠ ' if missing else '📁 '}"
+                    f"{_ellipsis(sp.get('name') or path, 8)}   {sp.get('count')}")
                 row.setObjectName("NavSpaceItem")
-                row.setProperty("open", "true" if opened else "false")
+                row.setProperty("active",
+                                "true" if latest and
+                                str(latest.get("id")) == self._session_id else "false")
                 row.setCursor(Qt.PointingHandCursor)
                 row.setFixedHeight(NAV_ROW)
                 row.setToolTip(
                     f"{path}\n{sp.get('count')} 个任务"
+                    + (f"\n最新：{latest.get('title') or '未命名任务'}"
+                       if latest else "")
                     + ("\n⚠ 目录不存在（可能被删除或移动盘已拔出）" if missing else "")
-                    + "\n点击展开 / 收起；右键可在此空间新建任务")
-                row.clicked.connect(lambda _c=False, p=path: self._toggle_space(p))
+                    + "\n点击打开最新任务；右键可新建 / 查看该空间全部任务")
+                row.clicked.connect(
+                    lambda _c=False, p=path: self._open_space_latest(p))
                 row.setContextMenuPolicy(Qt.CustomContextMenu)
                 row.customContextMenuRequested.connect(
                     lambda pos, p=path, b=row: self._show_space_menu(
                         p, b.mapToGlobal(pos)))
                 lay.addWidget(row)
                 lines += 1
-                if not opened:
-                    continue
-                for t in (sp.get("tasks") or [])[:NAV_SPACE_TASK_MAX]:
-                    lay.addWidget(self._nav_task_row(t, sub=True))
-                    lines += 1
-                if sp.get("count", 0) > NAV_SPACE_TASK_MAX:
-                    more = QPushButton(f"查看全部 {sp.get('count')} 个…")
-                    more.setObjectName("NavTaskItem")
-                    more.setProperty("sub", "true")
-                    more.setProperty("more", "true")
-                    more.setCursor(Qt.PointingHandCursor)
-                    more.setFixedHeight(NAV_ROW)
-                    more.clicked.connect(lambda _c=False: self.open_manager("sessions"))
-                    lay.addWidget(more)
+                # 只显示该空间**最后一条**任务：再多就靠右键「查看该空间全部任务」
+                if latest:
+                    lay.addWidget(self._nav_task_row(latest, sub=True))
                     lines += 1
             if len(spaces) > NAV_SPACE_MAX:
                 more_sp = QPushButton(f"其余 {len(spaces) - NAV_SPACE_MAX} 个空间…")
@@ -1209,7 +1252,7 @@ class AssistantPage(QWidget):
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write("=== rebuild %s\n" % time.strftime("%H:%M:%S"))
                 fh.write("lines=%d spaces=%d open=%r\n"
-                         % (lines, len(self._nav_spaces or []), self._open_space))
+                         % (lines, len(self._nav_spaces or []), self._default_ws()))
                 fh.write("scroll h=%d hint=%d min=%d max=%d viewport=%d\n"
                          % (sc.height(), sc.sizeHint().height(),
                             sc.minimumHeight(), sc.maximumHeight(),
@@ -1277,10 +1320,20 @@ class AssistantPage(QWidget):
                 lay.invalidate()
                 lay.activate()
 
-    def _toggle_space(self, path: str) -> None:
-        # 手风琴：一次只展开一个空间，避免展开多个把左栏撑爆
-        self._open_space = "" if path == (self._open_space or "") else path
-        self._rebuild_nav_tasks()
+    def _open_space_latest(self, path: str) -> None:
+        """点空间 = 打开该空间里最近聊过的那个任务。
+
+        1.0.11 起空间不再展开成一堆任务行（用户要求：一个空间只显示最后一条），
+        所以点击的语义从「展开/收起」改成「进最新那条」；想看全部走右键菜单。
+        """
+        for sp in (self._nav_spaces or []):
+            if str(sp.get("path") or "") != path:
+                continue
+            latest = _latest_task(sp.get("tasks"))
+            if latest and latest.get("id"):
+                self._open_task(str(latest["id"]))
+                return
+        self._set_status("这个空间还没有任务，右键可在此空间新建")
 
     # ---------------- 任务操作（右键：置顶 / 重命名 / 归档 / 删除） ----------------
     def _open_task(self, sid: str) -> None:
@@ -1368,11 +1421,12 @@ class AssistantPage(QWidget):
             menu.exec(gpos)
 
     def build_space_menu(self, path: str) -> QMenu:
-        """空间右键菜单：在此空间新建任务 / 展开收起 / 打开目录。"""
+        """空间右键菜单：在此空间新建任务 / 查看全部任务 / 打开目录。"""
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")
         menu.addAction("在此空间新建任务", lambda: self._new_task_in_space(path))
-        menu.addAction("展开 / 收起", lambda: self._toggle_space(path))
+        # 左栏只显示每个空间最新的一条任务，其余的从清单中心看
+        menu.addAction("查看全部任务清单…", lambda: self.open_manager("sessions"))
         menu.addSeparator()
         act = menu.addAction("在资源管理器中打开",
                              lambda: self._open_space_folder(path))
@@ -1395,7 +1449,6 @@ class AssistantPage(QWidget):
         if not isinstance(session, dict) or not session.get("id"):
             self._set_status("任务创建失败，请确认后端已启动")
             return
-        self._open_space = path
         self._sync_workspace_to_task(path)
         self._on_session_created(session, False)
 
@@ -1509,8 +1562,8 @@ class AssistantPage(QWidget):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
         lay.addWidget(self._hint(
-            f"左栏「任务」区只直接显示最近 {NAV_TASK_MAX} 条、" +
-            f"「空间」区每空间至多 {NAV_SPACE_TASK_MAX} 条，全部任务都在这里。"
+            f"左栏「任务」区只显示默认工作区的最近 {NAV_TASK_MAX} 条、"
+            "「空间」区每个目录只显示最后 1 条任务；全部任务都在这里，"
             "点选后可打开或删除（也支持右键菜单）。"))
         self._all_sess_list = QListWidget()
         self._all_sess_list.setSelectionMode(
@@ -2628,7 +2681,7 @@ class AssistantPage(QWidget):
         # 注意用 get(..., 1)：字段缺失视为「有内容」，宁可多显示也不要把任务藏掉
         self._nav_rows = [s for s in items
                           if s.get("message_count", 1) or s.get("id") == self._session_id]
-        self._nav_spaces = self._group_spaces(self._nav_rows)
+        self._nav_spaces = self._group_spaces(self._nav_rows, self._default_ws())
         self._rebuild_nav_tasks()
 
         # 管理面板里的完整任务列表（面板未打开时为 None）
@@ -3012,6 +3065,12 @@ class AssistantPage(QWidget):
         elif kind == "replace":
             if self._bubble is not None:
                 self._bubble.set_text(ev.get("text") or "", markdown=True)
+        elif kind == "reasoning_replace":
+            # 思考里混进了工具调用标记（本地思考型模型常这样）：把原文清掉，
+            # 否则用户仍会看到一行 <tool_call>skill_list</tool_call>
+            if self._thinking is not None:
+                self._thinking.set_text(ev.get("text") or "")
+                self._scroll_bottom()
         elif kind == "tool_call":
             self._finish_bubble()
             card = ToolCard(ev.get("name") or "", ev.get("summary") or "",

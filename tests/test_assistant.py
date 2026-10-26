@@ -450,10 +450,126 @@ def test_text_tool_call_fallback(env):
     ass = agent_mod.get_assistant()
     content = ('我先看一下目录。\n```tool_call\n'
                '{"name": "fs_list", "arguments": {"path": "."}}\n```')
-    calls, cleaned = ass._parse_text_calls(content)
+    calls, cleaned, _bad = ass._parse_text_calls(content, known={"fs_list"})
     assert len(calls) == 1 and calls[0]["name"] == "fs_list"
     assert "tool_call" not in cleaned
     assert ass._parse_text_calls("普通回答，没有调用")[0] == []
+
+
+def test_text_tool_call_bare_name(env):
+    """`<tool_call>skill_list</tool_call>`：只有工具名、没有参数的老实写法。
+
+    用户截图里的报错就是这个：解析不出来 → 被当成「只输出了思考内容」，
+    然后把标记原样贴进气泡。这里必须识别成一次真实调用。
+    """
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    known = {"skill_list", "fs_list"}
+    for content in ("<tool_call>skill_list</tool_call>",
+                    "<tool_call> skill_list() </tool_call>",
+                    "```tool_call\nskill_list\n```"):
+        calls, cleaned, bad = ass._parse_text_calls(content, known=known)
+        assert [c["name"] for c in calls] == ["skill_list"], content
+        assert calls[0]["arguments"] == {}
+        assert cleaned == "" and bad == []
+
+
+def test_text_tool_call_bare_name_with_args(env):
+    """`<tool_call>fs_list {"path": "."}</tool_call>`：名字 + 裸 JSON 参数。"""
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    calls, cleaned, _bad = ass._parse_text_calls(
+        '<tool_call>fs_list {"path": "."}</tool_call>', known={"fs_list"})
+    assert calls[0]["name"] == "fs_list"
+    assert calls[0]["arguments"] == {"path": "."}
+    assert cleaned == ""
+
+
+def test_text_tool_call_unknown_name_not_executed(env):
+    """幻觉出来的工具名：不当成调用执行，但标记必须从正文里摘掉。
+
+    否则用户看到的就是一行 `<tool_call>skill_lst</tool_call>` 被当回答。
+    """
+    from core.assistant import agent as agent_mod
+    ass = agent_mod.get_assistant()
+    known = {"skill_list"}
+    calls, cleaned, bad = ass._parse_text_calls(
+        '<tool_call>skill_lst</tool_call>\n我以为这样就能列出技能', known=known)
+    assert calls == []
+    assert bad == ["skill_lst"]
+    assert "tool_call" not in cleaned
+    assert "我以为这样就能列出技能" in cleaned
+
+
+def test_turn_executes_bare_name_switch_call(env, monkeypatch):
+    """整轮：模型正文就是 `<tool_call>skill_list</tool_call>` → 真执行工具再答。
+
+    1.0.11 用户报的错（气泡里贴一行 `<tool_call>skill_list</tool_call>` 并
+    提示「只输出了思考内容」）就是这条链路断了：解析不出来 → 当成正文。
+    """
+    from core.assistant import agent as agent_mod
+    provider = FakeProvider([
+        ChatReply(content="<tool_call>skill_list</tool_call>"),
+        ChatReply(content="本机装了 3 个技能。"),
+    ])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "你有哪些技能", emit=events.append)
+    assert res["ok"], res
+    assert res["content"] == "本机装了 3 个技能。"
+    assert any(e["type"] == "tool_call" and e["name"] == "skill_list"
+               for e in events)
+    # 一个 error 都不许有：这轮本来就是能跑的
+    assert not [e for e in events if e["type"] == "error"]
+
+
+def test_turn_cleans_tool_markup_from_reasoning(env, monkeypatch):
+    """思考里混进工具标记：思考正文也要清干净，不留 <tool_call> 原文。
+
+    本地 qwen3 这类思考型模型经常把工具调用写在「思考」里；正文清干净了
+    但思考块还留着原文，用户在界面上仍会看到那一行标记。
+    """
+    from core.assistant import agent as agent_mod
+    provider = FakeProvider([
+        ChatReply(content="<tool_call>skill_list</tool_call>",
+                  reasoning="我先查一下技能 <tool_call>skill_list</tool_call>"),
+        ChatReply(content="本机装了 3 个技能。"),
+    ])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "你有哪些技能", emit=events.append)
+    assert res["ok"], res
+    reps = [e for e in events if e["type"] == "reasoning_replace"]
+    assert reps, events
+    assert "tool_call" not in reps[0]["text"]
+    assert "我先查一下技能" in reps[0]["text"]
+
+
+def test_turn_reports_unknown_tool_instead_of_dumping_markup(env, monkeypatch):
+    """模型调了一个本机没有的工具：报清楚的错误，绝不把标记当回答显示。"""
+    from core.assistant import agent as agent_mod
+    provider = FakeProvider([ChatReply(content="<tool_call>write_file</tool_call>")])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "写个文件", emit=events.append)
+    assert not res["ok"]
+    assert "write_file" in res["error"]
+    assert "function calling" in res["error"]
+    shown = "".join(e.get("content") or "" for e in events
+                    if e["type"] in ("done", "replace"))
+    assert "<tool_call>" not in shown, shown
 
 
 def test_skill_run_tool_allows_one_level(env):

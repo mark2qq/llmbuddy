@@ -27,6 +27,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
+from core.assistant import store as store_mod
 from core.assistant import context as context_mod
 from core.assistant import mcp as mcp_mod
 from core.assistant import profiles as profiles_mod
@@ -66,6 +67,95 @@ POLICY_TEXT = {
 # 文本内工具调用兜底协议：```tool_call {...} ``` / <tool_call>{...}</tool_call>
 _FENCE_RE = re.compile(r"```(?:tool_call|tool|json)\s*\n(.*?)```", re.S | re.I)
 _TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S | re.I)
+# 裸调用：「工具名」或「工具名 参数」——小模型（qwen/glm 系列）常这么写，
+# 之前只认 JSON，于是 `<tool_call>skill_list</tool_call>` 被当成了回答正文
+_BARE_CALL_RE = re.compile(
+    r"^(?:name\s*[:=]\s*)?([A-Za-z_][\w.\-]*(?:__[\w\-]+)?)\s*[(\[{]?\s*(.*?)\s*[)\]}]?$",
+    re.S)
+
+
+def _peel_call(obj: Dict[str, Any]) -> tuple:
+    """从 {"name":..,"arguments":..} 里取 (name, args)，兼容几种常见变体。"""
+    name = str(obj.get("name") or obj.get("tool") or "").strip()
+    args = obj.get("arguments")
+    if args is None:
+        args = obj.get("args")
+    fn = obj.get("function")
+    if isinstance(fn, str) and not name:
+        name = fn.strip()
+    elif isinstance(fn, dict):
+        name = name or str(fn.get("name") or "").strip()
+        if args is None:
+            args = fn.get("arguments")
+    if not isinstance(args, (dict, str)) or args is None:
+        args = {}
+    return name, args
+
+
+def _unknown_tool_note(names: List[str]) -> str:
+    """坏调用（幻觉工具名 / 格式解析不了）的说明文案。
+
+    用户反馈过：这种轮次原来只报「模型没有返回正文」，然后把
+    `<tool_call>skill_list</tool_call>` 原样贴在气泡里，既看不懂也帮不上忙。
+    这里说清「它想干什么、为什么没成、下一步怎么办」。
+    """
+    uniq: List[str] = []
+    for n in names:
+        n = str(n or "").strip()
+        if n and n not in uniq:
+            uniq.append(n)
+    shown = "、".join(f"「{n[:24]}」" for n in uniq[:3])
+    more = f" 等 {len(uniq)} 个" if len(uniq) > 3 else ""
+    return (f"模型尝试调用工具 {shown}{more}，但本机没有这个工具"
+            "（或调用格式无法解析），这一轮没有执行任何操作。"
+            "建议在输入条右侧「模型」里换一个支持工具调用（function calling）的模型，"
+            "或者直接说明要做什么，让它用现有工具完成。")
+
+
+def _calls_from_block(raw: str, known: Optional[set] = None) -> tuple:
+    """把一段（```tool_call``` 或 <tool_call> 里的）文本解析成 ([调用], [被拒名字])。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return [], []
+    out: List[tuple] = []
+    bad: List[str] = []
+
+    def _take(name: str, args: Any) -> None:
+        name = (name or "").strip()
+        if not name:
+            return
+        if known is not None and name not in known:
+            bad.append(name)          # 幻觉工具名：不当成调用，但要告诉用户
+            return
+        out.append((name, args if isinstance(args, (dict, str)) else {}))
+
+    obj = _loads_jsonish(raw)
+    if isinstance(obj, dict):
+        _take(*_peel_call(obj))
+        return out, bad
+    if isinstance(obj, list):
+        for it in obj:
+            if isinstance(it, dict):
+                _take(*_peel_call(it))
+        return out, bad
+    if isinstance(obj, str):          # 整段就是个纯名字（带引号的情况）
+        raw = obj.strip()
+
+    # 裸写法：skill_list / skill_list() / skill_list {"path": "."} / name: skill_list
+    m = _BARE_CALL_RE.match(raw)
+    if not m:
+        return [], [raw[:40]]
+    name = m.group(1)
+    rest = (m.group(2) or "").strip()
+    args: Any = {}
+    if rest and rest not in ("()", "{}", "[]"):
+        parsed = _loads_jsonish(rest)
+        if parsed is None:
+            # `{"path": "."}` 被外层括号吃掉时补回来再试
+            parsed = _loads_jsonish("{" + rest + "}")
+        args = parsed if isinstance(parsed, dict) else {}
+    _take(name, args)
+    return out, bad
 
 SYSTEM_PROMPT = """你是 llmBuddy 的本地智能助理，直接运行在用户自己的 Windows 电脑上。
 你可以操作本机文件、执行命令、抓取网页、调用 MCP 工具，还能运行技能包。
@@ -132,6 +222,9 @@ class Assistant:
             "policy": cfg.get("policy"),
             "policies": [{"id": k, "label": v} for k, v in POLICY_TEXT.items()],
             "workspace": cfg.get("workspace"),
+            # 系统默认工作区：左栏「任务」区只显示落在默认工作区的任务，
+            # 其它目录（空间）的任务只在「空间」区出现，避免两处重复
+            "default_workspace": norm_workspace(store_mod.DEFAULT_WORKSPACE),
             "workspace_error": cfg.get("workspace_error") or "",
             "active_provider": cfg.get("active_provider"),
             "providers": [{"id": p.get("id"), "label": p.get("label"),
@@ -295,6 +388,8 @@ class Assistant:
 
         # ---- 同源（A3）：schemas 只算一次，provider 与系统提示共用同一份 ----
         schemas = self._select_schemas(cfg, registry, profile)
+        # 文本兜底协议的工具名白名单：模型幻觉出来的名字不能被当成调用执行
+        tool_names = {str(t.get("name")) for t in registry.list() if t.get("name")}
         messages = self._build_messages(session, registry, cfg, schemas,
                                         mounted_skills=mounted, profile=profile,
                                         attachments=images)
@@ -409,35 +504,64 @@ class Assistant:
                     break
 
                 calls = list(reply.tool_calls or [])
+                rejected: List[str] = []
+                parsed_from_text = False
+                final_text = (reply.content or "").strip()
                 if not calls:
-                    parsed, cleaned = self._parse_text_calls(reply.content)
+                    parsed, cleaned, rejected = self._parse_text_calls(
+                        final_text, known=tool_names)
+                    # 正文里的工具标记一律摘掉再显示：认出来的执行、认不出的
+                    # 也不能把 `<tool_call>…</tool_call>` 原文当成回答贴给用户
+                    final_text = cleaned
+                    if cleaned != (reply.content or "").strip():
+                        emit({"type": "replace", "text": cleaned})
                     if parsed:
                         calls = parsed
-                        if cleaned != reply.content:
-                            emit({"type": "replace", "text": cleaned.strip()})
+                        parsed_from_text = True
+                    elif rejected:
+                        emit({"type": "note", "message": _unknown_tool_note(rejected)})
+
+                # 思考型模型经常把工具调用写进「思考」而不是正文（本地 qwen3 就是
+                # 这样，而且 provider 会把思考兜底成正文）。正文里已经摘干净了，
+                # 但思考块里还留着原文——用户仍会看到一行
+                # `<tool_call>skill_list</tool_call>`。这里把思考也清一遍。
+                if reply.reasoning:
+                    _, clean_reason, _bad = self._parse_text_calls(
+                        reply.reasoning, known=tool_names)
+                    if clean_reason != reply.reasoning.strip():
+                        emit({"type": "reasoning_replace", "text": clean_reason})
 
                 if not calls:
-                    final_text = reply.content.strip()
                     if not final_text:
                         # 思考型模型可能把 max_tokens 全用在思考上：provider 已自动
                         # 放大预算重试过一次（providers.chat），仍为空才报这里。
-                        error = ("模型没有返回正文：本轮 max_tokens 已被自动放大到上限"
-                                 f"{MAX_TOKENS_CAP} 重试仍为空"
-                                 f"（finish_reason={reply.finish_reason or '未知'}）。"
-                                 "请换用更大的模型，或把任务拆小一些。")
+                        if rejected:
+                            # 比「没有返回正文」准确得多：模型想调工具，但名字/格式
+                            # 不对，本机无法执行（用户截图里的 <tool_call>skill_list</tool_call>）
+                            error = _unknown_tool_note(rejected)
+                        else:
+                            error = ("模型没有返回正文：本轮 max_tokens 已被自动放大到上限"
+                                     f"{MAX_TOKENS_CAP} 重试仍为空"
+                                     f"（finish_reason={reply.finish_reason or '未知'}）。"
+                                     "请换用更大的模型，或把任务拆小一些。")
                         emit({"type": "error", "message": error})
                         break
                     if reply.fallback_reasoning:
                         emit({"type": "note", "message":
-                              "模型本轮只输出了思考内容、没有产出正文，下面是思考原文；"
-                              "建议调大 max_tokens 或换用更大的模型。"})
+                              "模型这一轮只写了思考过程、没有给出正式回答"
+                              "（多半是 max_tokens 被思考吃光，或这个模型不擅长当前任务）。"
+                              "下面是它的思考原文，仅供参考。"})
                     emit({"type": "done", "content": final_text,
                           "stopped": reply.finish_reason == "cancelled"})
                     break
 
-                # 有工具调用：把本轮 assistant 消息（含调用）加入上下文
+                # 有工具调用：把本轮 assistant 消息（含调用）加入上下文。
+                # 文本兜底解析出来的调用，正文里已经没有标记了（上面已清干净），
+                # 留着原文会让模型下一轮看到一堆 `<tool_call>` 噪声。
+                assistant_content = final_text if parsed_from_text \
+                    else (reply.content or "")
                 messages.append({"role": "assistant",
-                                 "content": reply.content or "",
+                                 "content": assistant_content,
                                  "tool_calls": [
                                      {"id": c.get("id") or f"call_{i}",
                                       "type": "function",
@@ -530,29 +654,41 @@ class Assistant:
         except Exception:
             return "{}"
 
-    def _parse_text_calls(self, content: str):
-        """文本内工具调用兜底：返回 (calls, 清理后的正文)。"""
+    def _parse_text_calls(self, content: str, known: Optional[set] = None):
+        """文本内工具调用兜底：返回 (calls, 清理后的正文, 被拒的名字)。
+
+        兼容模型实际写出来的几种土办法（本地小模型很爱这么写）：
+
+            <tool_call>{"name": "fs_list", "arguments": {"path": "."}}</tool_call>
+            <tool_call>skill_list</tool_call>          ← 只有工具名，无参数
+            <tool_call>fs_list {"path": "."}</tool_call>
+            ```tool_call
+            fs_list({"path": "."})
+            ```
+
+        `known` 传工具名白名单时，**名单外的名字不算调用**（模型幻觉的工具），
+        但标记照样从正文里摘掉——否则用户会看到一行
+        `<tool_call>skill_lst</tool_call>` 被当成回答（用户反馈的原始截图）。
+        被拒的名字回传给上层，用来给一句准确的提示，而不是报「没有正文」。
+        """
         text = content or ""
         found: List[Dict[str, Any]] = []
+        rejected: List[str] = []
         spans: List[tuple] = []
         for rx in (_FENCE_RE, _TAG_RE):
             for m in rx.finditer(text):
-                raw = (m.group(1) or "").strip()
-                obj = _loads_jsonish(raw)
-                if isinstance(obj, dict) and obj.get("name"):
-                    found.append({"id": f"txt_{len(found)}", "name": obj["name"],
-                                  "arguments": obj.get("arguments") or obj.get("args") or {}})
-                    spans.append(m.span())
-                elif isinstance(obj, list):
-                    for it in obj:
-                        if isinstance(it, dict) and it.get("name"):
-                            found.append({"id": f"txt_{len(found)}", "name": it["name"],
-                                          "arguments": it.get("arguments") or {}})
+                got, bad = _calls_from_block(m.group(1) or "", known)
+                for name, args in got:
+                    found.append({"id": f"txt_{len(found)}", "name": name,
+                                  "arguments": args})
+                rejected.extend(bad)
+                if got or bad:
+                    # 认出来了或确认是坏调用：两种情况都要把标记从正文里摘掉
                     spans.append(m.span())
         cleaned = text
         for start, end in sorted(spans, reverse=True):
             cleaned = cleaned[:start] + cleaned[end:]
-        return found[:8], cleaned
+        return found[:8], cleaned.strip(), rejected
 
     # ------------------------------------------------------------------ #
     # 自动加载 / 同源（1.0.8 增量）

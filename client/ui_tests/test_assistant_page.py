@@ -368,7 +368,8 @@ def page(monkeypatch):
     assert _pump(lambda: bool(p._state))
     assert _pump(lambda: bool(p._session_id))
     assert _pump(lambda: "s1" in p._nav_task_btns)
-    assert p._nav_spaces
+    # 假任务的 workspace 就是 state.workspace（= 默认空间），所以「空间」区是空的；
+    # 需要空间分组的用例自己调 _apply_sessions 铺数据（见 _two_tasks）
     # 等初始队列快照拉回再交出场：否则这个空快照的 Worker 可能晚到，
     # 在用例中途把面板清成空（全量跑时线程调度更慢，必现）
     assert _pump(lambda: p._session_id in fake.queue_calls)
@@ -671,6 +672,24 @@ def test_thinking_block_is_flat_not_collapsible(page):
     p._end_streaming()
 
 
+def test_reasoning_replace_cleans_tool_markup(page):
+    """后端把工具标记从思考里摘掉后回填：思考块里不能再有 <tool_call> 原文。
+
+    本地思考型模型常把工具调用写进「思考」，正文清干净了但思考块还留着原文，
+    用户在界面上仍会看到那一行标记。
+    """
+    p, _fake = page
+    p._begin_streaming()
+    p._on_event({"type": "reasoning", "text": "我先查一下技能 "})
+    p._on_event({"type": "reasoning",
+                 "text": "<tool_call>skill_list</tool_call>"})
+    assert "tool_call" in p._thinking.body.text()
+    p._on_event({"type": "reasoning_replace", "text": "我先查一下技能"})
+    assert "tool_call" not in p._thinking.body.text()
+    assert "我先查一下技能" in p._thinking.body.text()
+    p._end_streaming()
+
+
 def test_reasoning_text_accumulates_and_flushes(page):
     """多段思考内容按节流窗口合并刷新，结束后全部可见。"""
     p, _fake = page
@@ -943,28 +962,58 @@ def test_space_path_normalized_so_no_duplicate_groups(page):
     assert p._nav_spaces[0]["count"] == 2
 
 
-def test_space_expands_to_show_its_tasks(page):
-    """展开空间会多出一组该空间下的任务行（收起后复原）。"""
+def test_space_shows_only_its_latest_task(page):
+    """一个空间只显示**最后一条**任务（用户要求：不用都显示）。
+
+    左栏宽 200、高度有限，一个空间列 4 条任务会把整栏占满；
+    点空间 = 打开最新那条，其余的去清单中心看。
+    """
     from PySide6.QtWidgets import QPushButton
     p, fake = _two_tasks(page)
-    path = [sp["path"] for sp in p._nav_spaces if sp["name"] == "ws1"][0]
-    before = len(p._nav_body.findChildren(QPushButton))
-    p._toggle_space(path)
-    assert p._open_space == path
-    assert len(p._nav_body.findChildren(QPushButton)) > before
-    p._toggle_space(path)                        # 再点收起
-    assert p._open_space == ""
-    assert len(p._nav_body.findChildren(QPushButton)) == before
+    fake.tasks.append({"id": "c", "title": "最新一条", "message_count": 1,
+                       "workspace": r"E://ws1", "pinned": False,
+                       "archived": False, "updated_at": 300.0})
+    p._apply_sessions([dict(t) for t in fake.tasks])
+    sp = [s for s in p._nav_spaces if s["name"] == "ws1"][0]
+    assert sp["count"] == 2                     # 计数照旧统计全部
+    # 每个空间只挂 1 行任务（这里 ws1/ws2 两个空间），不随 count 增长
+    subs = [b for b in p._nav_body.findChildren(QPushButton)
+            if b.objectName() == "NavTaskItem" and b.property("sub") == "true"]
+    assert len(subs) == len(p._nav_spaces) == 2
+    texts = [b.text() for b in subs]
+    assert any("最新一条" in t for t in texts)   # ws1 显示最新的，不是旧任务
+    assert not any("旧任务" in t for t in texts)
 
 
-def test_space_accordion_only_one_open(page):
-    """手风琴：展开第二个空间时第一个自动收起，避免左栏被撑爆。"""
+def test_space_click_opens_latest_task(page):
+    """点空间行 = 打开该空间最近聊过的任务（不再展开/收起）。"""
     p, fake = _two_tasks(page)
-    p1 = [sp["path"] for sp in p._nav_spaces if sp["name"] == "ws1"][0]
-    p2 = [sp["path"] for sp in p._nav_spaces if sp["name"] == "ws2"][0]
-    p._toggle_space(p1)
-    p._toggle_space(p2)
-    assert p._open_space == p2
+    opened = []
+    p._open_task = lambda sid: opened.append(sid)      # 不打真正的后端
+    p._open_space_latest([s["path"] for s in p._nav_spaces if s["name"] == "ws2"][0])
+    assert opened == ["b"]
+
+
+def test_task_area_only_lists_default_workspace(page):
+    """「任务」区只列默认工作区的任务，其它目录的任务只在「空间」区出现。
+
+    用户反馈截图：同一批任务在「任务 (4)」和「空间 → newspace」上下各列一遍。
+    """
+    p, _fake = page
+    default = p._default_ws()
+    assert default                                  # 假后端 state.workspace
+    p._apply_sessions([
+        {"id": "d1", "title": "默认区任务", "message_count": 2,
+         "workspace": default, "updated_at": 100.0},
+        {"id": "w1", "title": "空间任务", "message_count": 2,
+         "workspace": r"E://other-ws", "updated_at": 200.0},
+    ])
+    assert [s["id"] for s in p._nav_rows] == ["w1", "d1"]      # 快照仍全量
+    assert p._nav_task_title.text() == "任务 (1)"               # 只数默认区
+    assert [sp["name"] for sp in p._nav_spaces] == ["other-ws"]  # 默认区不进空间
+    texts = [b.text() for b in p._nav_body.findChildren(QPushButton)]
+    assert any("默认区任务" in t for t in texts)
+    assert any("other-ws" in t for t in texts)
 
 
 def test_new_task_in_space_passes_workspace(page, tmp_path):
@@ -1115,18 +1164,18 @@ def test_empty_tasks_hidden_from_nav_but_kept_for_manager(page):
     但空任务不能删——管理面板要能列出来给用户自己清理（清理空任务按钮）。
     """
     p, _fake = page
+    default = p._default_ws()
     p._apply_sessions([
         {"id": "a", "title": "聊过的", "message_count": 3,
-         "workspace": r"E://ws1", "updated_at": 300.0},
+         "workspace": default, "updated_at": 300.0},
         {"id": "b", "title": "新任务", "message_count": 0,
-         "workspace": r"E://ws1", "updated_at": 200.0},
+         "workspace": default, "updated_at": 200.0},
         {"id": "c", "title": "新任务", "message_count": 0,
-         "workspace": r"E://ws1", "updated_at": 100.0},
+         "workspace": default, "updated_at": 100.0},
     ])
     assert [s["id"] for s in p._session_rows] == ["a", "b", "c"]   # 全量快照不丢
     assert [s["id"] for s in p._nav_rows] == ["a"]                 # 左栏只留非空
     assert p._nav_task_title.text() == "任务 (1)"
-    assert p._nav_spaces[0]["count"] == 1                          # 空间计数同步
 
 
 def test_current_empty_task_still_shows_in_nav(page):

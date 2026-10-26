@@ -512,6 +512,15 @@ class ThinkingBlock(QWidget):
             return
         self.head.setText(f"深度思考（{len(self._buf)} 字）")
 
+    def set_text(self, text: str) -> None:
+        """整体替换思考正文（后端把工具标记从思考里摘掉后回填）。"""
+        self._timer.stop()
+        self._buf = str(text or "")
+        self._shown = ""
+        self._flush()
+        if not self._buf.strip():
+            self.setVisible(False)
+
     def clear(self) -> None:
         """清空（后端自动放大 token 预算重试时，旧思考作废）。"""
         self._timer.stop()

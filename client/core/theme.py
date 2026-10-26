@@ -362,7 +362,7 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #NavTaskItem[more="true"]:hover { color: #12161f; }
 #NavSpaceItem { color: #3a4152; }
 #NavSpaceItem:hover { background-color: #e2e7f0; color: #12161f; }
-#NavSpaceItem[open="true"] { color: #12161f; }
+#NavSpaceItem[active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
 #NavEmpty { color: #7b8496; }
 
 /* 引导会话队列面板（1.0.9）：浅色 */
