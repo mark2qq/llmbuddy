@@ -669,3 +669,106 @@ def test_online_registry_smoke():
     out = catalog_mod.list_mcp(cfg, force=True, limit=5)
     assert out["stale"] is False
     assert out["items"], "Registry 应至少返回一条"
+
+
+# ----------------------------------------------------------------------------
+# 1.0.9：GitHub 限流兜底（tarball 扫描）+ Token + has_scripts 修正
+# ----------------------------------------------------------------------------
+def _make_tarball(files) -> bytes:
+    """在内存里造一个 codeload 风格的 tar.gz（顶层目录 `repo-main/`）。"""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for path, data in files.items():
+            payload = data.encode("utf-8")
+            info = tarfile.TarInfo("skills-main/" + path)
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
+class _TarResp:
+    """tarball 响应的最小替身（**不能**叫 `_FakeResp`：本文件前面已有同名类，
+    重复定义会把 probe 用例的桩覆盖掉）。"""
+
+    def __init__(self, content: bytes = b"", status: int = 200,
+                 headers=None) -> None:
+        self.content = content
+        self.status_code = status
+        self.headers = headers or {}
+
+
+def test_list_repo_skills_falls_back_to_archive_on_rate_limit(env, cfg,
+                                                              monkeypatch):
+    """tree API 403（未认证 60 次/小时）时改用 codeload tarball 扫描。
+
+    这是「在线技能点了没反应」的根因修复：游览两三个仓库就限流，旧实现直接
+    把 `GitHub 接口限流` 抛给用户，等于技能下载功能不可用。
+    """
+    raw = _make_tarball({
+        "a/b/SKILL.md": SKILL_MD,
+        "a/b/notes.md": "n",
+        "a/b/scripts/run.py": "print(1)",
+        "other/scripts/x.py": "print(2)",
+        "other/SKILL.md": "---\nname: other-skill\n---\n# x\n",
+    })
+
+    def fake_get_json(*_a, **_kw):
+        raise catalog_mod.CatalogError(
+            catalog_mod.ERR_UPSTREAM,
+            "GitHub 接口限流，请 600 秒后重试，或先使用已缓存的结果")
+
+    def fake_do_get(_cfg, url, params, timeout):
+        assert "codeload.github.com" in url, url
+        return _TarResp(raw)
+
+    monkeypatch.setattr(catalog_mod, "_get_json", fake_get_json)
+    monkeypatch.setattr(catalog_mod, "_do_get", fake_do_get)
+    out = catalog_mod.list_repo_skills(cfg, "acme", "skills", "main", force=True)
+    assert out["via"] == "archive"
+    assert {i["slug"] for i in out["items"]} == {"pdf-extract", "other-skill"}
+    pdf = next(i for i in out["items"] if i["slug"] == "pdf-extract")
+    assert pdf["dir"] == "a/b"
+    assert pdf["description"] == "从 PDF 提取正文"
+    # a/b 自己有 scripts/ → True；other 没有（兄弟目录不计入，见下一条用例）
+    assert pdf["has_scripts"] is True
+    assert sorted(pdf["files"]) == ["notes.md", "scripts/run.py"]
+
+
+def test_list_repo_skills_archive_fallback_failure_keeps_original_error(
+        env, cfg, monkeypatch):
+    """兜底也失败时，抛出**原始**的限流错误（信息更有用）。"""
+
+    def fake_get_json(*_a, **_kw):
+        raise catalog_mod.CatalogError(catalog_mod.ERR_UPSTREAM,
+                                       "GitHub 接口限流")
+
+    def fake_do_get(*_a, **_kw):
+        raise RuntimeError("proxy down")
+
+    monkeypatch.setattr(catalog_mod, "_get_json", fake_get_json)
+    monkeypatch.setattr(catalog_mod, "_do_get", fake_do_get)
+    with pytest.raises(catalog_mod.CatalogError) as ei:
+        catalog_mod.list_repo_skills(cfg, "acme", "skills", "main", force=True)
+    assert "限流" in str(ei.value)
+
+
+def test_has_scripts_ignores_sibling_directories():
+    """技能目录外的脚本不能算到本技能头上（曾导致 20 个技能全挂 ⚠）。"""
+    paths = ["a/b/SKILL.md", "other/scripts/x.py", "a/b/notes.md"]
+    assert catalog_mod._has_scripts(paths, "a/b") is False
+    assert catalog_mod._has_scripts(["a/b/SKILL.md", "a/b/scripts/x.py"], "a/b") is True
+
+
+def test_github_token_adds_auth_header_only_when_configured():
+    """配了 Token 才加 Authorization 头（限流配额 60 → 5000 次/小时）。"""
+    with catalog_mod._client({}) as c:
+        assert "authorization" not in {k.lower() for k in c.headers}
+    with catalog_mod._client({"catalog": {"github_token": "ghp_x"}}) as c:
+        assert c.headers.get("Authorization") == "Bearer ghp_x"
+
+
+def test_catalog_default_has_github_token(env):
+    """`catalog.github_token` 必须在默认配置里，否则老 config.json 读不到。"""
+    assert "github_token" in store_mod.load_config()["catalog"]

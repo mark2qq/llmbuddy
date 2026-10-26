@@ -84,9 +84,15 @@ def _default_profiles() -> List[Dict[str, Any]]:
 
 
 def _default_catalog() -> Dict[str, Any]:
-    """在线目录配置（PRD §6.1）：proxy 空 = 读环境变量，再空 = 本机默认代理。"""
+    """在线目录配置（PRD §6.1）：proxy 空 = 读环境变量，再空 = 本机默认代理。
+
+    `github_token`：可选。未认证的 GitHub API 配额仅 60 次/小时，
+    「列仓库 + 枚举 SKILL.md + 取 frontmatter」很快耗光；填任意 classical PAT
+    （无需勾 scope）可升到 5000 次/小时。
+    """
     return {
         "proxy": "",
+        "github_token": "",
         "ttl_hours": {"mcp": 24, "gh_repos": 24, "gh_skills": 168},
         "allow_nonfree": False,
     }

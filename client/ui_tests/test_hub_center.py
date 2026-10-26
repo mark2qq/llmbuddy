@@ -24,6 +24,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
 
 from ui.widgets import assistant_cards as cards_mod  # noqa: E402
 from ui.widgets.assistant_cards import AutoLoadPrompt, StepLine  # noqa: E402
+from ui.widgets.online_catalog_dialog import OnlineMcpDialog  # noqa: E402
 from ui.pages import assistant_page as mod  # noqa: E402
 from ui.pages.assistant_page import (  # noqa: E402
     CATALOG_CLASS_BADGE, CATALOG_HIDDEN_CLASSES, MCP_COMMAND_WHITELIST,
@@ -1018,16 +1019,20 @@ def test_catalog_failure_shows_banner_not_blank(page):
 
 
 def test_catalog_empty_state_is_not_blank(page):
-    """在线目录为空时列表给一句可读提示（P0-8 不白屏）。"""
+    """在线目录为空时列表给一句可读提示（P0-8 不白屏）。
+
+    1.0.9：内嵌列表（限高 180px）已移入独立窗口 `OnlineMcpDialog`，
+    断言目标随之改为窗口内的列表。
+    """
     p, fake = page
-    dlg = ManagerDialog(p)
+    dlg = OnlineMcpDialog(p)
     try:
         fake.catalog_mcp_data = {"items": [], "fetched_at": 0,
                                  "stale": False, "error": ""}
-        p._apply_catalog_mcp(dict(fake.catalog_mcp_data))
+        dlg._apply(dict(fake.catalog_mcp_data))
         _settle()
-        assert p._mcp_online_list.count() == 1
-        assert "为空" in p._mcp_online_list.item(0).text()
+        assert dlg._list.count() == 1
+        assert "为空" in dlg._list.item(0).text()
     finally:
         dlg.close()
         dlg.deleteLater()
@@ -1037,11 +1042,11 @@ def test_catalog_empty_state_is_not_blank(page):
 def test_online_repo_badge_shows_free_class(page):
     """在线条目按 free_class 打「[零配置]」/「[需密钥]」标签（PRD §5.3）。"""
     p, fake = page
-    dlg = ManagerDialog(p)
+    dlg = OnlineMcpDialog(p)
     try:
-        p._apply_catalog_mcp(dict(fake.catalog_mcp_data))
+        dlg._apply(dict(fake.catalog_mcp_data))
         _settle()
-        text = p._mcp_online_list.item(0).text()
+        text = dlg._list.item(0).text()
         assert CATALOG_CLASS_BADGE["zero_config"] in text, text
         assert "Filesystem" in text, text
     finally:
@@ -1070,3 +1075,77 @@ def test_model_label_truncated_to_eight_chars(page):
     p, _fake = page
     assert hasattr(p, "MODEL_LABEL_MAX")
     assert p.MODEL_LABEL_MAX == 8
+
+
+# --------------------------------------------------------------------------- #
+# T05（1.0.9）：工具列表行高裁切 + 刷新反馈
+# --------------------------------------------------------------------------- #
+def test_tool_rows_tall_enough_for_text(page):
+    """工具行高不能写死 24px —— 截图里「只读 / 内置」被裁掉下半截就是这个。
+
+    断言用「字高 + 8」而非固定像素：200% 缩放下字高本身就会超过 24。
+    """
+    p, _fake = page
+    dlg = ManagerDialog(p)
+    try:
+        dlg.show_tab("tools")
+        p._fill_tools(p._state.get("tools") or [])
+        _settle()
+        lst = p._tool_list
+        assert lst.count() >= 2, lst.count()
+        need = lst.fontMetrics().height() + 8
+        for i in range(lst.count()):
+            h = lst.item(i).sizeHint().height()
+            assert h >= need, f"第 {i} 行高 {h} < {need}，文字会被裁"
+        # 行与行一致（不能第一行矮、后面高）
+        heights = {lst.item(i).sizeHint().height() for i in range(lst.count())}
+        assert len(heights) == 1, heights
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        _settle()
+
+
+def test_refresh_tools_gives_visible_feedback(page):
+    """「刷新没反应」：必须能看出真的刷了（按钮态 + 上次刷新时间 + 真重拉）。"""
+    p, fake = page
+    dlg = ManagerDialog(p)
+    try:
+        dlg.show_tab("tools")
+        before = fake.tool_prefs_calls
+        p._refresh_tools()
+        # 发起瞬间按钮进「刷新中」且不可重复点
+        assert p._tool_refresh_btn.text() == "⟳ 刷新中…"
+        assert not p._tool_refresh_btn.isEnabled()
+        assert _pump(lambda: bool(p._tool_last_lbl.text()), 3.0)
+        assert "上次刷新" in p._tool_last_lbl.text()
+        # 弹窗未 show 时 isVisible() 恒为 False，这里只验「没被隐藏」
+        assert not p._tool_last_lbl.isHidden()
+        assert p._tool_refresh_btn.isEnabled()
+        assert p._tool_refresh_btn.text() == "⟳ 刷新"
+        assert fake.tool_prefs_calls > before, "刷新必须真的重拉 prefs"
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        _settle()
+
+
+def test_refresh_tools_failure_resets_button(page):
+    """刷新失败：按钮恢复可点 + 状态行说明失败（不能卡在「刷新中」）。"""
+    p, fake = page
+    dlg = ManagerDialog(p)
+    try:
+        dlg.show_tab("tools")
+
+        def boom():
+            raise RuntimeError("后端未就绪")
+
+        fake.tool_prefs = boom
+        p._refresh_tools()
+        assert _pump(lambda: p._tool_refresh_btn.isEnabled(), 3.0)
+        assert p._tool_refresh_btn.text() == "⟳ 刷新"
+        assert "刷新失败" in p._tool_last_lbl.text()
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        _settle()

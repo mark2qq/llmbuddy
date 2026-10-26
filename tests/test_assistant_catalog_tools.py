@@ -886,16 +886,58 @@ def test_get_json_retries_transport_error_then_succeeds(env, monkeypatch):
 
 
 def test_get_json_retries_exhausted_raises_2020(env, monkeypatch):
-    """连续传输层失败 -> 2 次重试后仍失败 -> CatalogError(2020)。"""
+    """连续传输层失败 -> 重试耗尽 -> CatalogError(2020)。
+
+    1.0.9 起 `_do_get` 还带「代理候选降级」，这里把候选链钉成单个代理，
+    专门验证「同一代理重试耗尽就报 2020」这一层；跨代理降级见下一个用例。
+    """
     import httpx
     fake = _FakeClient([httpx.ConnectError("a"), httpx.ConnectError("b"),
                         httpx.ConnectError("c")])
     monkeypatch.setattr(catalog_mod, "_client", lambda *a, **k: fake)
+    monkeypatch.setattr(catalog_mod, "_proxy_candidates", lambda *a, **k: ["http://p:1"])
     monkeypatch.setattr(catalog_mod.time, "sleep", lambda *_a, **_k: None)
     with pytest.raises(catalog_mod.CatalogError) as ei:
         catalog_mod._get_json({}, "https://registry/x")
     assert ei.value.code == 2020
     assert fake.calls == 1 + catalog_mod.RETRY_MAX
+
+
+def test_do_get_falls_back_to_next_proxy(env, monkeypatch):
+    """环境变量里的过期代理连不上时，自动换下一个候选（本机见过 64422）。
+
+    现实场景：机器上装了加速器 / Clash，`HTTPS_PROXY` 指向的端口早已失效，
+    只认第一个候选就会把「明明有可用代理」变成一路「无法连接」。
+    """
+    import httpx
+
+    seen = []
+
+    class _C:
+        def __init__(self, proxy):
+            self.proxy = proxy
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, params=None):
+            seen.append(self.proxy)
+            if self.proxy == "http://dead:1":
+                raise httpx.ConnectError("dead proxy")
+            return _FakeResp(200, {"ok": 1}, headers={})
+
+    monkeypatch.setattr(catalog_mod, "_proxy_candidates",
+                        lambda *a, **k: ["http://dead:1", "http://live:2"])
+    monkeypatch.setattr(catalog_mod, "_client",
+                        lambda cfg=None, timeout=5.0, proxy=None: _C(proxy))
+    monkeypatch.setattr(catalog_mod.time, "sleep", lambda *_a, **_k: None)
+    data, _h = catalog_mod._get_json({}, "https://registry/x")
+    assert data == {"ok": 1}
+    assert seen[0] == "http://dead:1"
+    assert seen[-1] == "http://live:2", seen
 
 
 def test_get_json_4xx_not_retried(env, monkeypatch):

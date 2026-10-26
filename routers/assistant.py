@@ -586,8 +586,24 @@ async def get_settings():
 async def put_settings(body: Dict[str, Any]):
     allowed = {"policy", "active_provider", "providers", "workspace",
                "max_steps", "approval_timeout", "temperature", "max_tokens",
-               "skill_timeout", "auto_load", "max_tool_rounds"}
+               "skill_timeout", "auto_load", "max_tool_rounds", "catalog"}
     patch = {k: v for k, v in (body or {}).items() if k in allowed}
+    if "catalog" in patch:
+        # catalog 只允许改白名单字段，且**按字段合并**（save_config 是浅合并，
+        # 整体覆盖会把没传的 proxy / ttl_hours 抹掉）
+        raw = patch.get("catalog") if isinstance(patch.get("catalog"), dict) else {}
+        cur_cat = dict(load_config().get("catalog") or {})
+        for key in ("proxy", "github_token"):
+            if key in raw:
+                cur_cat[key] = str(raw.get(key) or "").strip()
+        if isinstance(raw.get("ttl_hours"), dict):
+            merged_ttl = dict(cur_cat.get("ttl_hours") or {})
+            merged_ttl.update({k: v for k, v in raw["ttl_hours"].items()
+                               if isinstance(v, (int, float))})
+            cur_cat["ttl_hours"] = merged_ttl
+        if "allow_nonfree" in raw:
+            cur_cat["allow_nonfree"] = bool(raw.get("allow_nonfree"))
+        patch["catalog"] = cur_cat
     if "providers" in patch:
         # 按 id 合并：客户端拿到的 providers 不含 api_key（state 不下发密钥），
         # 直接整体覆盖会把已保存的 Key 抹掉，这里保留原值。

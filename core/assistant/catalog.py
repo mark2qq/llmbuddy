@@ -163,28 +163,56 @@ def _env_proxy() -> str:
     return ""
 
 
+def _proxy_candidates(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """代理尝试顺序：显式配置 > 环境变量 > 本机默认端口，去重保序。
+
+    为什么要有「候选链」：很多机器上 `HTTPS_PROXY` 是别的工具（Clash / 加速器）
+    写进去的**过期端口**（如 64422），进程一启动就带着它；只认第一个候选时，
+    「明明有可用代理」也会一路报「无法连接」。这里按序降级，只在**传输层失败**
+    （连不上 / 超时）时换下一个，业务错误（403/404）不换，避免把限流掩盖掉。
+    """
+    out: List[str] = []
+    for val in (str(_cfg_get(cfg, "catalog", "proxy", default="") or "").strip(),
+                _env_proxy(), PROXY_DEFAULT):
+        if val and val not in out:
+            out.append(val)
+    return out or [PROXY_DEFAULT]
+
+
 def _proxy(cfg: Optional[Dict[str, Any]] = None) -> str:
-    """代理地址：cfg.catalog.proxy > env HTTPS_PROXY/HTTP_PROXY > PROXY_DEFAULT。
+    """当前首选的代理地址（日志 / 报错文案用；实际请求走候选链）。
 
     **绝不做「直连」回落**：本机 registry 直连是 000，静默直连只会把
     "无网络" 的锅甩给用户。
     """
-    val = str(_cfg_get(cfg, "catalog", "proxy", default="") or "").strip()
-    if val:
-        return val
-    return _env_proxy() or PROXY_DEFAULT
+    return _proxy_candidates(cfg)[0]
 
 
 def _client(cfg: Optional[Dict[str, Any]] = None,
-            timeout: float = CLIENT_TIMEOUT) -> httpx.Client:
+            timeout: float = CLIENT_TIMEOUT,
+            proxy: Optional[str] = None) -> httpx.Client:
     """唯一出网点：trust_env=False + 显式 proxy（架构 §1.1 D4）。
 
     `trust_env=False` 是硬约束：环境变量里残留的坏代理会让 httpx 在任何请求前
-    就抛异常，且报错信息与真实原因无关；统一由 `_proxy()` 决定代理。
+    就抛异常，且报错信息与真实原因无关；统一由 `_proxy()` / 候选链决定代理。
     """
+    headers = {"User-Agent": "llmBuddy-assistant/1.0.8"}
+    token = _github_token(cfg)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     return httpx.Client(verify=False, timeout=timeout, trust_env=False,
-                        follow_redirects=True, proxy=_proxy(cfg),
-                        headers={"User-Agent": "llmBuddy-assistant/1.0.8"})
+                        follow_redirects=True,
+                        proxy=(proxy or _proxy(cfg)), headers=headers)
+
+
+def _github_token(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """GitHub Token（可选）：`config.catalog.github_token`。
+
+    未认证的 GitHub API 配额只有 **60 次/小时**，而「列仓库 → 枚举 SKILL.md →
+    取正文」三步就要打十几次请求，正常浏览几个仓库就会 403。配了 token（任意
+    classic PAT，无需任何 scope 勾选，只读公共仓库）配额升到 5000 次/小时。
+    """
+    return str(_cfg_get(cfg, "catalog", "github_token", default="") or "").strip()
 
 
 def _probe(cfg: Optional[Dict[str, Any]] = None) -> None:
@@ -290,29 +318,46 @@ def _is_retryable_transport(exc: BaseException) -> bool:
 def _do_get(cfg: Optional[Dict[str, Any]], url: str,
             params: Optional[Dict[str, Any]],
             timeout: float) -> httpx.Response:
-    """发一次 GET（含传输层重试）。最终失败抛原始异常，由调用方包 CatalogError。
+    """发一次 GET（含传输层重试 + 代理候选降级）。
 
     重试策略（P2-4）：最多 `RETRY_MAX` 次，仅 `httpx.TransportError` 重试，
     退避 `RETRY_BACKOFF`。为避免把 `force=1` 的同步路径拖死：每次尝试沿用
     调用方 `timeout`，总最坏耗时 ≈ (1+RETRY_MAX)*timeout，故对 5s 预算
     实际最坏 3×5s——因此只在**单次 timeout ≤ 5s** 时启用满额重试；大超时
     （如 list_repo_skills 用的 2×5s）降为最多 1 次重试，防止用户等太久。
+
+    代理降级：环境变量里的 `HTTPS_PROXY` 常是别的工具留下的过期端口
+    （本机就见过 64422），连不上时按 `_proxy_candidates()` 顺序换下一个，
+    全部失败才抛最后一次的异常。业务错误（403 限流 / 404）不触发换代理。
     """
-    proxy = _proxy(cfg)
     attempts = 1 + RETRY_MAX
     if timeout > CLIENT_TIMEOUT:          # 大超时请求少重试，别拖死同步路径
         attempts = 1 + 1
+    candidates = _proxy_candidates(cfg)
     last: Optional[BaseException] = None
-    for i in range(attempts):
-        try:
-            with _client(cfg, timeout=timeout) as c:
-                return c.get(url, params=params or None)
-        except Exception as e:                    # noqa: BLE001
-            last = e
-            if not _is_retryable_transport(e) or i >= attempts - 1:
-                raise
-            delay = RETRY_BACKOFF[min(i, len(RETRY_BACKOFF) - 1)]
-            time.sleep(delay)
+    for p_idx, proxy in enumerate(candidates):
+        last_cand = p_idx == len(candidates) - 1
+        # 非最后一个候选只给「短预算 + 一次尝试」：环境里那个过期代理若在
+        # 半死状态（接受连接但不回），按 ARCHIVE_TIMEOUT=120s × 2 次去等，
+        # 用户要先干等 4 分钟才轮到真能用的代理（实测过）。10s 足够判定
+        # 「这个代理连不上」，真正的下载只在最后一个候选上用满预算。
+        budget = timeout if last_cand else min(timeout, CLIENT_TIMEOUT * 2)
+        tries = attempts if last_cand else 1
+        for i in range(tries):
+            try:
+                with _client(cfg, timeout=budget, proxy=proxy) as c:
+                    return c.get(url, params=params or None)
+            except Exception as e:                    # noqa: BLE001
+                last = e
+                transport = _is_retryable_transport(e)
+                if not transport:
+                    raise
+                if i >= tries - 1:
+                    if not last_cand:
+                        break                     # 换下一个代理
+                    raise
+                delay = RETRY_BACKOFF[min(i, len(RETRY_BACKOFF) - 1)]
+                time.sleep(delay)
     assert last is not None
     raise last
 
@@ -326,13 +371,14 @@ def _get_json(cfg: Optional[Dict[str, Any]], url: str,
         连接异常 / 超时   -> CatalogError(2020)（传输层抖动已内部重试）
         非 200            -> CatalogError(2021)（含 GitHub 403 限流）
     """
-    proxy = _proxy(cfg)
+    proxy = "、".join(_proxy_candidates(cfg))
     try:
         resp = _do_get(cfg, url, params, timeout)
     except Exception as e:                       # noqa: BLE001
         raise CatalogError(
             ERR_UNREACHABLE,
-            f"无法连接在线目录（代理：{proxy}）：{type(e).__name__}: {e}") from e
+            f"无法连接在线目录（已尝试代理：{proxy}）：{type(e).__name__}: {e}"
+        ) from e
     if resp.status_code != 200:
         hint = ""
         if resp.status_code == 403 and "github" in url:
@@ -357,13 +403,14 @@ def _get_json(cfg: Optional[Dict[str, Any]], url: str,
 def _get_text(cfg: Optional[Dict[str, Any]], url: str,
               timeout: float = CLIENT_TIMEOUT) -> str:
     """取纯文本（raw.githubusercontent.com）。2020/2021 语义同上（含重试）。"""
-    proxy = _proxy(cfg)
+    proxy = "、".join(_proxy_candidates(cfg))
     try:
         resp = _do_get(cfg, url, None, timeout)
     except Exception as e:                       # noqa: BLE001
         raise CatalogError(
             ERR_UNREACHABLE,
-            f"无法连接 {url}（代理：{proxy}）：{type(e).__name__}: {e}") from e
+            f"无法连接 {url}（已尝试代理：{proxy}）：{type(e).__name__}: {e}"
+        ) from e
     if resp.status_code != 200:
         raise CatalogError(ERR_UPSTREAM,
                            f"下载失败 HTTP {resp.status_code}：{url}",
@@ -842,10 +889,19 @@ def _is_text_file(path: str) -> bool:
 
 
 def _has_scripts(tree_paths: List[str], dirpath: str) -> bool:
-    """技能目录下是否有可执行脚本（只提示，永不执行）。"""
+    """技能目录下是否有可执行脚本（只提示，永不执行）。
+
+    注意：带 prefix 时必须**跳过目录外的路径**。曾漏掉这步，导致任一技能只要
+    兄弟目录里有 .py 就被标「含脚本」，界面上 20 个技能全挂 ⚠，警示形同虚设。
+    """
     prefix = (dirpath.rstrip("/") + "/") if dirpath else ""
     for p in tree_paths:
-        rel = p[len(prefix):] if prefix and p.startswith(prefix) else p
+        if prefix:
+            if not p.startswith(prefix):
+                continue
+            rel = p[len(prefix):]
+        else:
+            rel = p
         low = rel.lower()
         if low.startswith("scripts/") or low.endswith((".py", ".sh", ".ps1",
                                                       ".bat", ".cmd", ".js")):
@@ -890,48 +946,14 @@ def _default_branch(cfg: Optional[Dict[str, Any]], owner: str, repo: str) -> str
     return str(body.get("default_branch") or "main")
 
 
-def list_repo_skills(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
-                     repo: str = "", ref: str = "",
-                     force: bool = False) -> Dict[str, Any]:
-    """枚举一个仓库里的技能目录（`**/SKILL.md`），并读 frontmatter 校验。
+def _collect_skill_items(repo: str, paths: List[str], all_paths: List[str],
+                         read_text) -> List[Dict[str, Any]]:
+    """从文件路径表里挑出 `**/SKILL.md`，读 frontmatter 生成条目。
 
-    返回 `{commit, ref, items:[{slug, dir, name, description, files,
-    has_scripts, path}], fetched_at, stale}`。
-
-    只读 frontmatter（不读正文）：一个仓库可能有几十个 SKILL.md，正文下载
-    交给 `fetch_skill_bundle`，避免"浏览列表"变成批量下载。
+    `read_text(path)` 由调用方提供（tree 路径走 raw.githubusercontent，tarball
+    路径直接读内存成员），这样「tree API」与「tar 兜底」共用同一套解析逻辑，
+    字段永远一致，不会出现两条路各错一处。
     """
-    owner = str(owner or "").strip()
-    repo = str(repo or "").strip()
-    if not owner or not repo:
-        raise CatalogError(ERR_BAD_BUNDLE, "owner / repo 不能为空")
-    branch = str(ref or "").strip() or _default_branch(cfg, owner, repo)
-    ttl = _ttl_seconds(cfg, "gh_skills")
-    if not force:
-        cached = _skills_cache_get(owner, repo, branch, ttl)
-        if cached is not None:
-            return {"commit": str(cached.get("commit") or ""), "ref": branch,
-                    "items": cached.get("items") or [],
-                    "fetched_at": cached.get("fetched_at") or 0,
-                    "stale": False, "error": ""}
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{branch}"
-    try:
-        payload, _headers = _get_json(cfg, url, params={"recursive": "1"},
-                                      timeout=CLIENT_TIMEOUT * 2)
-    except CatalogError as e:
-        cached = _skills_cache_get(owner, repo, branch, 10 ** 9)   # 不看 TTL
-        if cached is not None:
-            return {"commit": str(cached.get("commit") or ""), "ref": branch,
-                    "items": cached.get("items") or [],
-                    "fetched_at": cached.get("fetched_at") or 0,
-                    "stale": True, "error": e.message}
-        raise
-    body = payload if isinstance(payload, dict) else {}
-    tree = [t for t in (body.get("tree") or []) if isinstance(t, dict)]
-    paths = [str(t.get("path") or "") for t in tree
-             if str(t.get("type") or "blob") == "blob"]
-    all_paths = [str(t.get("path") or "") for t in tree]
-    commit = str(body.get("sha") or body.get("commit") or "")[:40]
     items: List[Dict[str, Any]] = []
     for path in paths:
         if not path.lower().endswith("skill.md"):
@@ -939,15 +961,15 @@ def list_repo_skills(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
         dirpath = _skill_dir_of(path)
         text = ""
         try:
-            text = _get_text(cfg, f"{GITHUB_RAW}/{owner}/{repo}/{branch}/{path}")
-        except CatalogError:
+            text = read_text(path) or ""
+        except Exception:                     # noqa: BLE001 - 单文件失败不毁整表
             text = ""
         meta: Dict[str, Any] = {}
         if text:
             try:
                 from core.assistant.skills import parse_skill_md
                 meta = parse_skill_md(text).get("meta") or {}
-            except Exception:
+            except Exception:                 # noqa: BLE001
                 meta = {}
         base = (dirpath.rsplit("/", 1)[-1] if dirpath else repo) or repo
         name = str(meta.get("name") or base)
@@ -966,11 +988,148 @@ def list_repo_skills(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
             "file_count": len(files),
             "has_scripts": _has_scripts(all_paths, dirpath),
         })
+    return items
+
+
+def _list_repo_skills_from_archive(cfg: Optional[Dict[str, Any]], owner: str,
+                                   repo: str, ref: str) -> Dict[str, Any]:
+    """兜底枚举：下一次 codeload tarball，在内存里扫 `**/SKILL.md`。
+
+    为什么需要它：`/git/trees` 属 GitHub REST API，未认证时**每小时仅 60 次**。
+    浏览两三个仓库（每个仓库还要逐文件取 frontmatter）就会 403，用户看到的就是
+    「在线技能点不动、下载不了」。codeload 的 tar.gz 走独立通道，不受 API 配额
+    限制，代价是多下一次整包（受 `ARCHIVE_MAX_DOWNLOAD` 约束）。
+    """
+    import io
+    import tarfile
+
+    url = f"{CODELOAD_BASE}/{owner}/{repo}/tar.gz/{ref}"
+    try:
+        resp = _do_get(cfg, url, None, timeout=ARCHIVE_TIMEOUT)
+    except Exception as e:                    # noqa: BLE001
+        raise CatalogError(
+            ERR_UNREACHABLE,
+            f"无法下载仓库快照（已尝试代理："
+            f"{'、'.join(_proxy_candidates(cfg))}）：{type(e).__name__}: {e}"
+        ) from e
+    if resp.status_code != 200:
+        raise CatalogError(ERR_UPSTREAM,
+                           f"仓库快照下载失败 HTTP {resp.status_code}：{url}",
+                           {"status": resp.status_code, "url": url})
+    cl = str(resp.headers.get("content-length") or "").strip()
+    if cl.isdigit() and int(cl) > ARCHIVE_MAX_DOWNLOAD:
+        raise CatalogError(
+            ERR_UPSTREAM,
+            f"仓库快照过大（>{ARCHIVE_MAX_DOWNLOAD // 1024 // 1024}MB），"
+            "无法在线枚举，请换用 GitHub Token 提高 API 配额",
+            {"url": url})
+    raw = resp.content
+    if not raw:
+        raise CatalogError(ERR_UPSTREAM, f"仓库快照为空：{url}")
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+        members = [m for m in tf.getmembers() if m.isfile()]
+    except (tarfile.TarError, OSError) as e:
+        raise CatalogError(ERR_UPSTREAM,
+                           f"仓库快照解包失败：{type(e).__name__}: {e}")
+    if not members:
+        return {"commit": "", "ref": ref, "items": [], "fetched_at": time.time(),
+                "stale": False, "error": "", "via": "archive"}
+    top = members[0].name.split("/", 1)[0] + "/"
+    rel_of = {m.name: m.name[len(top):] for m in members
+              if m.name.startswith(top)}
+    paths = [rel for rel in rel_of.values() if rel and not rel.endswith("/")]
+    by_rel = {rel: name for name, rel in rel_of.items()}
+
+    def _read(path: str) -> str:
+        name = by_rel.get(path)
+        if not name:
+            return ""
+        fh = tf.extractfile(name)
+        if fh is None:
+            return ""
+        data = fh.read(MAX_SKILL_MD_BYTES + 1)
+        if len(data) > MAX_SKILL_MD_BYTES:
+            return ""
+        return data.decode("utf-8", "replace")
+
+    items = _collect_skill_items(repo, paths, paths, _read)
+    return {"commit": "", "ref": ref, "items": items, "fetched_at": time.time(),
+            "stale": False, "error": "", "via": "archive"}
+
+
+def list_repo_skills(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
+                     repo: str = "", ref: str = "",
+                     force: bool = False) -> Dict[str, Any]:
+    """枚举一个仓库里的技能目录（`**/SKILL.md`），并读 frontmatter 校验。
+
+    返回 `{commit, ref, items:[{slug, dir, name, description, files,
+    has_scripts, path}], fetched_at, stale, via}`。
+
+    只读 frontmatter（不读正文）：一个仓库可能有几十个 SKILL.md，正文下载
+    交给 `fetch_skill_bundle`，避免"浏览列表"变成批量下载。
+
+    三级降级：命中缓存 → tree API → **tarball 扫描**（API 限流时的兜底）。
+    """
+    owner = str(owner or "").strip()
+    repo = str(repo or "").strip()
+    if not owner or not repo:
+        raise CatalogError(ERR_BAD_BUNDLE, "owner / repo 不能为空")
+    branch = str(ref or "").strip()
+    if not branch:
+        try:
+            branch = _default_branch(cfg, owner, repo)
+        except CatalogError:
+            branch = "main"                   # /repos 也可能被限流，别在这里卡死
+    ttl = _ttl_seconds(cfg, "gh_skills")
+    if not force:
+        cached = _skills_cache_get(owner, repo, branch, ttl)
+        if cached is not None:
+            return {"commit": str(cached.get("commit") or ""), "ref": branch,
+                    "items": cached.get("items") or [],
+                    "fetched_at": cached.get("fetched_at") or 0,
+                    "stale": False, "error": "",
+                    "via": str(cached.get("via") or "api")}
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{branch}"
+    try:
+        payload, _headers = _get_json(cfg, url, params={"recursive": "1"},
+                                      timeout=CLIENT_TIMEOUT * 2)
+    except CatalogError as e:
+        cached = _skills_cache_get(owner, repo, branch, 10 ** 9)   # 不看 TTL
+        if cached is not None:
+            return {"commit": str(cached.get("commit") or ""), "ref": branch,
+                    "items": cached.get("items") or [],
+                    "fetched_at": cached.get("fetched_at") or 0,
+                    "stale": True, "error": e.message,
+                    "via": str(cached.get("via") or "api")}
+        # 第二次机会：换 codeload tarball 扫（不受 API 配额），失败再抛原错
+        try:
+            out = _list_repo_skills_from_archive(cfg, owner, repo, branch)
+        except CatalogError:
+            raise e
+        except Exception:                     # noqa: BLE001 - 兜底失败仍报原错
+            raise e
+        _skills_cache_put(owner, repo, branch,
+                          {"commit": "", "items": out["items"],
+                           "fetched_at": out["fetched_at"], "via": "archive"})
+        return out
+    body = payload if isinstance(payload, dict) else {}
+    tree = [t for t in (body.get("tree") or []) if isinstance(t, dict)]
+    paths = [str(t.get("path") or "") for t in tree
+             if str(t.get("type") or "blob") == "blob"]
+    all_paths = [str(t.get("path") or "") for t in tree]
+    commit = str(body.get("sha") or body.get("commit") or "")[:40]
+
+    def _read(path: str) -> str:
+        return _get_text(cfg, f"{GITHUB_RAW}/{owner}/{repo}/{branch}/{path}")
+
+    items = _collect_skill_items(repo, paths, all_paths, _read)
     out = {"commit": commit, "ref": branch, "items": items,
-           "fetched_at": time.time(), "stale": False, "error": ""}
+           "fetched_at": time.time(), "stale": False, "error": "",
+           "via": "api"}
     _skills_cache_put(owner, repo, branch,
                       {"commit": commit, "items": items,
-                       "fetched_at": out["fetched_at"]})
+                       "fetched_at": out["fetched_at"], "via": "api"})
     return out
 
 
@@ -1115,31 +1274,19 @@ def fetch_skill_archive(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
     commit = str(listing.get("commit") or "")
     has_scripts = bool(hit.get("has_scripts"))
 
-    # 2) 校验 SKILL.md frontmatter（按文本取一次，复用现有校验）
-    md_text = _get_text(cfg, f"{GITHUB_RAW}/{owner}/{repo}/{ref}/{md_path}")
-    if len(md_text.encode("utf-8", "replace")) > MAX_SKILL_MD_BYTES:
-        raise CatalogError(ERR_BAD_BUNDLE,
-                           f"SKILL.md 过大（>{MAX_SKILL_MD_BYTES // 1024}KB）")
-    try:
-        from core.assistant.skills import parse_skill_md
-        meta = parse_skill_md(md_text).get("meta") or {}
-    except Exception:
-        meta = {}
-    if not str(meta.get("name") or "").strip():
-        raise CatalogError(ERR_BAD_BUNDLE,
-                           "SKILL.md 的 frontmatter 缺少 name，不是有效技能包",
-                           {"owner": owner, "repo": repo, "dir": dirpath})
-    name = str(meta.get("name") or "").strip()
-
-    # 3) 下载整子树 tarball（codeload 无 API 限流，单次拿全）
+    # 2) 下载整子树 tarball（codeload 无 API 限流，单次拿全）
+    #    注意：SKILL.md 的校验放在**解包之后**从 tarball 里读，不再单独打
+    #    raw.githubusercontent.com —— 少一个依赖点（国内该域名常被掐，
+    #    掐了就等于「在线安装永远失败」，而 codeload 通着）。
     url = f"{CODELOAD_BASE}/{owner}/{repo}/tar.gz/{ref}"
     try:
         resp = _do_get(cfg, url, None, timeout=ARCHIVE_TIMEOUT)
     except Exception as e:                       # noqa: BLE001
         raise CatalogError(
             ERR_UNREACHABLE,
-            f"无法下载技能包 tarball（代理：{_proxy(cfg)}）："
-            f"{type(e).__name__}: {e}") from e
+            f"无法下载技能包 tarball（已尝试代理："
+            f"{'、'.join(_proxy_candidates(cfg))}）：{type(e).__name__}: {e}"
+        ) from e
     if resp.status_code != 200:
         raise CatalogError(ERR_UPSTREAM,
                            f"tarball 下载失败 HTTP {resp.status_code}：{url}",
@@ -1226,6 +1373,23 @@ def fetch_skill_archive(cfg: Optional[Dict[str, Any]] = None, owner: str = "",
     if "SKILL.md" not in files:
         raise CatalogError(ERR_BAD_BUNDLE,
                            "tarball 中未找到 SKILL.md（目录可能为空）",
+                           {"owner": owner, "repo": repo, "dir": dirpath})
+
+    # 5) 校验 frontmatter（数据来自刚解出来的 SKILL.md，零额外请求）
+    md_bytes = files.get("SKILL.md") or b""
+    if len(md_bytes) > MAX_SKILL_MD_BYTES:
+        raise CatalogError(ERR_BAD_BUNDLE,
+                           f"SKILL.md 过大（>{MAX_SKILL_MD_BYTES // 1024}KB）")
+    md_text = md_bytes.decode("utf-8", "replace")
+    try:
+        from core.assistant.skills import parse_skill_md
+        meta = parse_skill_md(md_text).get("meta") or {}
+    except Exception:
+        meta = {}
+    name = str(meta.get("name") or "").strip() or str(hit.get("name") or "").strip()
+    if not name:
+        raise CatalogError(ERR_BAD_BUNDLE,
+                           "SKILL.md 的 frontmatter 缺少 name，不是有效技能包",
                            {"owner": owner, "repo": repo, "dir": dirpath})
 
     return {

@@ -60,6 +60,8 @@ from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
                                         StepLine, ThinkingBlock, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
+#: 在线目录徽标文案的单一来源在在线窗口模块（两边共用一套，避免文案漂移）
+from ui.widgets.online_catalog_dialog import CLASS_BADGE as CATALOG_CLASS_BADGE
 from ui.widgets.queue_item import QueueItemRow
 
 POLICY_ITEMS = [
@@ -77,12 +79,7 @@ RISK_TEXT = {"low": "只读", "medium": "写入", "high": "高危"}
 #   need_key       yellow 默认隐藏，需筛选勾选
 #   need_register  grey   同上
 #   unknown        no install button，只给「查看源」
-CATALOG_CLASS_BADGE = {
-    "zero_config": "[零配置]",
-    "need_key": "[需密钥]",
-    "need_register": "[需注册]",
-    "unknown": "[未知]",
-}
+# 定义在 ui/widgets/online_catalog_dialog.py，这里 import 成 CATALOG_CLASS_BADGE
 #: 「需密钥 / 需注册」默认隐藏（PRD §5.3 结论）
 CATALOG_HIDDEN_CLASSES = ("need_key", "need_register")
 
@@ -1715,119 +1712,68 @@ class AssistantPage(QWidget):
         row1.addStretch(1)
         lay.addLayout(row1)
 
-        # ---- 在线区：提示条 + 仓库列表（首屏先渲染缓存，不阻塞）----
+        # ---- 在线区：一行提示 + 独立窗口入口（1.0.9：列表太窄改单独弹窗）----
         self._skill_online_banner = QLabel("")
         self._skill_online_banner.setObjectName("PageSubtitle")
         self._skill_online_banner.setWordWrap(True)
         self._skill_online_banner.setVisible(False)
         lay.addWidget(self._skill_online_banner)
-        self._skill_online_list = QListWidget()
-        self._skill_online_list.setObjectName("HubList")
-        self._skill_online_list.setWordWrap(False)
-        self._skill_online_list.setMaximumHeight(140)
-        self._skill_online_list.itemDoubleClicked.connect(
-            lambda it: self._open_online_repo(it))
-        self._skill_online_list.setVisible(False)
-        lay.addWidget(self._skill_online_list)
-        self._skill_online_btn = QPushButton("🔍 浏览在线技能目录")
+        self._skill_online_btn = QPushButton("🌐 在线技能目录（浏览 / 下载安装）…")
         self._skill_online_btn.setObjectName("MiniBtn")
         self._skill_online_btn.setToolTip(
-            "GitHub topic:claude-skills 仓库列表（双击仓库枚举其中的 SKILL.md）")
+            "单独窗口：GitHub topic:claude-skills 仓库列表 → 列出 SKILL.md → "
+            "下载并安装到本地（原内嵌列表限高 140px，看不全）")
         self._skill_online_btn.clicked.connect(
-            lambda _c=False: self._toggle_online_skills())
+            lambda _c=False: self.open_online_skills())
         lay.addWidget(self._skill_online_btn)
         return w
 
-    def _toggle_online_skills(self) -> None:
-        """展开/收起在线技能仓库列表（展开时立即拉缓存 + 后台刷新）。"""
-        lst = getattr(self, "_skill_online_list", None)
-        if lst is None:
-            return
-        show = not lst.isVisibleTo(self)
-        lst.setVisible(show)
-        btn = getattr(self, "_skill_online_btn", None)
-        if btn is not None:
-            btn.setText("⇱ 收起在线技能目录" if show else "🔍 浏览在线技能目录")
-        if show:
-            self._load_online_catalog(force=False)
+    def open_online_skills(self) -> None:
+        """打开在线技能目录窗口（独立窗口，含下载安装）。"""
+        from ui.widgets.online_catalog_dialog import OnlineSkillsDialog
+        dlg = getattr(self, "_online_skills_dlg", None)
+        if dlg is None:
+            dlg = OnlineSkillsDialog(self, self._dialog_parent())
+            self._online_skills_dlg = dlg
+        dlg.fit_to_parent()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.refresh(force=False)          # 先吃缓存，立刻有内容
+        self._load_online_catalog(force=False)
+
+    def open_online_mcp(self) -> None:
+        """打开在线 MCP 清单窗口（独立窗口，含安装并连接）。"""
+        from ui.widgets.online_catalog_dialog import OnlineMcpDialog
+        dlg = getattr(self, "_online_mcp_dlg", None)
+        if dlg is None:
+            dlg = OnlineMcpDialog(self, self._dialog_parent())
+            self._online_mcp_dlg = dlg
+        dlg.fit_to_parent()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.refresh(force=False)
+        self._load_online_catalog(force=False)
 
     def _open_online_repo(self, item) -> None:
-        """双击在线仓库 → 枚举它的技能（GET /catalog/skills/{owner}/{repo}）。"""
+        """（1.0.9 兼容入口）打开在线技能窗口并选中该仓库。
+
+        旧实现是「双击内嵌列表 → 弹一串确认框」，列表限高 140px 且安装动作
+        藏在双击里，用户根本发现不了。现在统一走独立窗口，本方法只做跳转。
+        """
         repo = (item.data(Qt.UserRole) if item is not None else None) or {}
         full = str(repo.get("full_name") or "")
-        if "/" not in full:
-            return
-        owner, name = full.split("/", 1)
-        ref = str(repo.get("default_branch") or "")
-        self._set_status(f"正在枚举 {full} 里的技能…")
-        w = Worker(self._assist.catalog_repo_skills, owner, name, ref, False)
-        w.result.connect(lambda res, r=repo: self._on_repo_skills(res, r))
-        w.error.connect(lambda m: self._set_status(f"枚举仓库失败：{m}"))
-        w.start()
-
-    def _on_repo_skills(self, res: Any, repo: Dict[str, Any]) -> None:
-        items = (res or {}).get("items") if isinstance(res, dict) else None
-        if not items:
-            self._set_status("该仓库里没有找到 SKILL.md")
-            return
-        full = str(repo.get("full_name") or "")
-        ref = str(repo.get("default_branch") or "")
-        stars = int(repo.get("stars") or 0)
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            slug = str(it.get("slug") or "")
-            ok = self._confirm_install_skill(
-                repo=full, ref=ref, dirpath=str(it.get("dir") or ""),
-                slug=slug, stars=stars,
-                files=list(it.get("files") or []),
-                has_scripts=bool(it.get("has_scripts")),
-                description=str(it.get("description") or ""))
-            if not ok:
-                continue
-            self._set_status(f"正在安装技能 {slug}…")
-            w = Worker(self._assist.catalog_install_skill, full, ref,
-                       str(it.get("dir") or ""), slug, False)
-            w.result.connect(self._on_installed_online_skill)
-            w.error.connect(lambda m, s=slug: self._on_install_failed(m, s))
-            w.start()
-
-    def _on_installed_online_skill(self, res: Any) -> None:
-        slug = (res or {}).get("slug") if isinstance(res, dict) else ""
-        self.refresh()
-        self._set_status(f"已安装技能：{slug or '（未知）'}")
-        self._auto_refresh_manager_lists()
-
-    def _confirm_install_skill(self, repo: str, ref: str, dirpath: str,
-                               slug: str, stars: int, files: List[str],
-                               has_scripts: bool, description: str) -> bool:
-        """在线技能安装确认框（P0-7 强制项：来源 / ⭐ / 文件数 / 脚本警示 / 风险）。"""
-        lines = [
-            f"来源：{repo}" + (f" · {dirpath}" if dirpath else ""),
-            f"标识：{slug}",
-            f"⭐ star：{stars}",
-            f"文件数：{len(files)}" + (f"（{'、'.join(files[:6])}…）"
-                                      if len(files) > 6 else
-                                      (f"（{'、'.join(files)}）" if files else "")),
-            "风险等级：medium（技能正文只会作为提示词，但可能引导模型调用高危工具）",
-        ]
-        if description:
-            lines.insert(2, f"说明：{description}")
-        if has_scripts:
-            lines.append("")
-            lines.append("⚠ 该技能包含 scripts/ 或可执行文件，运行时有额外风险。")
-        lines.append("")
-        lines.append("安装只会落文件，不会自动执行任何下载到的脚本。")
-        ans = QMessageBox.question(
-            self._dialog_parent(), "从在线来源安装",
-            "\n".join(lines),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        return ans == QMessageBox.StandardButton.Yes
+        self.open_online_skills()
+        dlg = getattr(self, "_online_skills_dlg", None)
+        if dlg is not None and "/" in full:
+            dlg.focus_repo(full)
 
     def _confirm_install_mcp(self, item: Dict[str, Any],
-                             suggest: Dict[str, Any]) -> bool:
+                             suggest: Dict[str, Any],
+                             parent: Optional[QWidget] = None) -> bool:
         """在线 MCP 安装确认框（含传输 / 是否需密钥 / 风险=high）。"""
+        host = parent if parent is not None else self._dialog_parent()
         required = [str(e.get("name")) for e in
                     (suggest.get("required_env") or []) if isinstance(e, dict)]
         transport = str(suggest.get("transport") or item.get("transport") or "stdio")
@@ -1840,7 +1786,7 @@ class AssistantPage(QWidget):
             "风险等级：high（本地子进程 = 任意代码执行，运行时逐次审批）",
         ]
         ans = QMessageBox.question(
-            self._dialog_parent(), "从在线来源安装 MCP",
+            host, "从在线来源安装 MCP",
             "\n".join(lines),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -1919,18 +1865,29 @@ class AssistantPage(QWidget):
         self._tool_count_lbl.setObjectName("HubHeadCount")
         head.addWidget(self._tool_count_lbl)
         head.addStretch(1)
-        b_refresh = QPushButton("⟳ 刷新")
-        b_refresh.setObjectName("MiniBtn")
-        b_refresh.setToolTip("重新拉取工具清单与开关状态（GET /state + /tools/prefs）")
+        # 刷新结果必须可见（用户反馈「刷新没反应」）：除按钮变文案外，
+        # 再留一行「上次刷新 HH:MM:SS」，点了有没有生效一眼能看出来。
+        self._tool_last_lbl = QLabel("")
+        self._tool_last_lbl.setObjectName("PageSubtitle")
+        self._tool_last_lbl.setVisible(False)
+        head.addWidget(self._tool_last_lbl)
+        self._tool_refresh_btn = QPushButton("⟳ 刷新")
+        self._tool_refresh_btn.setObjectName("MiniBtn")
+        self._tool_refresh_btn.setToolTip(
+            "重新拉取工具清单与开关状态（GET /state + /tools/prefs）")
         # 1.0.9：原实现只重拉 prefs，若 _state["tools"] 还没到位，点了「刷新」
         # 界面毫无变化 → 看起来像按钮没实现。改为 state + prefs 一起重拉。
-        b_refresh.clicked.connect(lambda _c=False: self._refresh_tools())
-        head.addWidget(b_refresh)
+        self._tool_refresh_btn.clicked.connect(
+            lambda _c=False: self._refresh_tools())
+        head.addWidget(self._tool_refresh_btn)
         lay.addLayout(head)
 
+        # 「工具怎么下载」：内置工具随应用走，没有在线仓库；扩展工具 = 装 MCP
+        # （MCP 连上后其工具自动以 mcp__<标识>__<工具> 进白名单）。一句话合并到
+        # 提示里，避免多占一行高度（弹窗高度本就紧张）。
         lay.addWidget(self._hint(
-            "只读工具自动执行；写入 / 高危按底栏的审批策略处理。"
-            "超出上限的工具会标灰不下发给模型。"))
+            "只读工具自动执行，写入 / 高危按底栏的审批策略处理；超出上限的标灰不下发。"
+            "工具本身随应用内置、无需下载，要扩展就到「MCP」页装在线 MCP。"))
 
         self._tool_list = QListWidget()
         self._tool_list.setObjectName("HubList")
@@ -1955,13 +1912,32 @@ class AssistantPage(QWidget):
             prefs = self._assist.tool_prefs() or {}
             return state, prefs
 
+        btn = getattr(self, "_tool_refresh_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("⟳ 刷新中…")
         self._set_status("正在刷新工具清单…")
         w = Worker(pull)
         w.result.connect(self._apply_tools_refresh)
-        w.error.connect(lambda m: self._set_status(f"刷新工具清单失败：{m}"))
+        w.error.connect(self._on_tools_refresh_failed)
         w.start()
 
+    def _reset_tools_refresh_btn(self) -> None:
+        btn = getattr(self, "_tool_refresh_btn", None)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("⟳ 刷新")
+
+    def _on_tools_refresh_failed(self, msg: str) -> None:
+        self._reset_tools_refresh_btn()
+        lbl = getattr(self, "_tool_last_lbl", None)
+        if lbl is not None:
+            lbl.setText("刷新失败")
+            lbl.setVisible(True)
+        self._set_status(f"刷新工具清单失败：{msg}")
+
     def _apply_tools_refresh(self, payload) -> None:
+        self._reset_tools_refresh_btn()
         state, prefs = (payload or ({}, {}))
         if isinstance(state, dict) and state:
             self._state.update(state)
@@ -1970,6 +1946,11 @@ class AssistantPage(QWidget):
         tools = self._state.get("tools") or []
         self._fill_tools(tools)
         n = len([t for t in tools if isinstance(t, dict)])
+        # 时间戳是「有没有真刷新」的唯一可视证据：内容不变时列表看不出来
+        lbl = getattr(self, "_tool_last_lbl", None)
+        if lbl is not None:
+            lbl.setText(f"上次刷新 {time.strftime('%H:%M:%S')}")
+            lbl.setVisible(True)
         self._set_status(f"工具清单已刷新：{n} 个"
                          f"（下发 {self._tool_prefs_snapshot()['active']} 个）")
 
@@ -2023,26 +2004,19 @@ class AssistantPage(QWidget):
         self._mcp_list.setObjectName("HubList")
         lay.addWidget(self._mcp_list, 1)
 
-        # ---- 在线区（默认收起，点「从在线清单安装」展开）----
+        # ---- 在线区（1.0.9：内嵌列表限高 180px 看不全，改成独立窗口）----
         self._mcp_online_banner = QLabel("")
         self._mcp_online_banner.setObjectName("PageSubtitle")
         self._mcp_online_banner.setWordWrap(True)
         self._mcp_online_banner.setVisible(False)
         lay.addWidget(self._mcp_online_banner)
-        self._mcp_online_list = QListWidget()
-        self._mcp_online_list.setObjectName("HubList")
-        self._mcp_online_list.setWordWrap(False)
-        self._mcp_online_list.setMaximumHeight(180)
-        self._mcp_online_list.itemDoubleClicked.connect(
-            lambda it: self._install_online_mcp(it))
-        self._mcp_online_list.setVisible(False)
-        lay.addWidget(self._mcp_online_list)
-        self._mcp_online_btn = QPushButton("🔍 从在线清单安装 MCP…")
+        self._mcp_online_btn = QPushButton("🌐 在线 MCP 清单（浏览 / 安装并连接）…")
         self._mcp_online_btn.setObjectName("MiniBtn")
         self._mcp_online_btn.setToolTip(
-            "官方 MCP Registry：搜索并自动生成 npx / http 配置（风险默认 high）")
+            "单独窗口：官方 MCP Registry 清单，带传输方式 / 版本 / 必填密钥 / "
+            "风险说明，选中即可安装并尝试连接")
         self._mcp_online_btn.clicked.connect(
-            lambda _c=False: self._toggle_online_mcp())
+            lambda _c=False: self.open_online_mcp())
         lay.addWidget(self._mcp_online_btn)
 
         row = QHBoxLayout()
@@ -2064,27 +2038,29 @@ class AssistantPage(QWidget):
         return w
 
     def _toggle_online_mcp(self) -> None:
-        """展开/收起在线 MCP 列表（展开时拉缓存 + 后台刷新）。"""
-        lst = getattr(self, "_mcp_online_list", None)
-        if lst is None:
-            return
-        show = not lst.isVisibleTo(self)
-        lst.setVisible(show)
-        btn = getattr(self, "_mcp_online_btn", None)
-        if btn is not None:
-            btn.setText("⇱ 收起在线目录" if show else "🔍 从在线清单安装 MCP…")
-        if show:
-            self._load_online_catalog(force=False)
+        """（1.0.9 兼容入口）打开独立窗口展示在线 MCP 清单。"""
+        self.open_online_mcp()
 
     def _install_online_mcp(self, item) -> None:
-        """双击在线 MCP 条目 → 确认框 → POST /catalog/mcp/install。"""
+        """（1.0.9 兼容入口）按列表项安装在线 MCP。"""
         it = (item.data(Qt.UserRole) if item is not None else None) or {}
+        self._install_online_mcp_item(it)
+
+    def _install_online_mcp_item(self, it: Dict[str, Any],
+                                 parent: Optional[QWidget] = None) -> None:
+        """在线 MCP 安装：必填 env 收集 → 确认框 → POST /catalog/mcp/install。
+
+        `parent`：提示框的父窗口。从独立窗口（`OnlineMcpDialog`）调用时必须传，
+        否则确认框会被弹到被遮住的页面上，用户看到的是「点了没反应」。
+        """
+        it = it if isinstance(it, dict) else {}
+        host = parent if parent is not None else self._dialog_parent()
         suggest = it.get("suggest") or {}
         if not isinstance(suggest, dict):
             suggest = {}
         if str(it.get("free_class") or "") == "unknown":
             QMessageBox.information(
-                self._dialog_parent(), "无法安装",
+                host, "无法安装",
                 "该条目在 Registry 里只登记了元数据（没有 packages / remotes），"
                 "无法自动生成配置。可点「查看源」到上游看手动配置。")
             return
@@ -2096,15 +2072,15 @@ class AssistantPage(QWidget):
             for e in required:
                 name = str(e.get("name"))
                 val, ok = QInputDialog.getText(
-                    self._dialog_parent(), "填写环境变量",
+                    host, "填写环境变量",
                     f"{name}（{e.get('description') or '必填'}）：",
                     QLineEdit.EchoMode.Normal, "")
                 if not ok or not (val or "").strip():
-                    QMessageBox.warning(self._dialog_parent(), "缺少必填变量",
+                    QMessageBox.warning(host, "缺少必填变量",
                                         f"该服务器需要 {name}，请填写后再安装。")
                     return
                 env[name] = str(val).strip()
-        if not self._confirm_install_mcp(it, suggest):
+        if not self._confirm_install_mcp(it, suggest, host):
             return
         reg = str(it.get("registry_name") or "")
         self._set_status(f"正在安装 MCP：{it.get('title') or reg}…")
@@ -2455,6 +2431,10 @@ class AssistantPage(QWidget):
         disabled = set(snap["disabled"])
         lst.clear()
         self._tool_checks = {}
+        # 行高：**不能写死 24px**。行内是 QCheckBox + QLabel，200% 缩放下字高
+        # 就已超过 24，item 高度小于控件 sizeHint 时 Qt 直接把下半截裁掉 ——
+        # 用户截图里「只读 / 内置」被切掉一半就是这个原因。
+        row_h = 0
         for t in tools:
             if not isinstance(t, dict):
                 continue
@@ -2486,7 +2466,18 @@ class AssistantPage(QWidget):
                 row_lay.addWidget(tag)
             lst.setItemWidget(item, row)
             self._tool_checks[name] = cb
-            item.setSizeHint(QSize(0, 24))
+            # 实测行高：取「控件 sizeHint」与「字高 + 上下边距」的较大值，
+            # 再留 4px 余量，保证文字永远完整（不同 DPI 都成立）
+            need = max(row.sizeHint().height(),
+                       text.fontMetrics().height() + 8) + 4
+            row_h = max(row_h, need)
+            item.setSizeHint(QSize(0, row_h))
+        if row_h:
+            # 前面几行按已知最大行高回填，避免「第一行比后面矮」
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it is not None and it.sizeHint().height() < row_h:
+                    it.setSizeHint(QSize(0, row_h))
         if not tools:
             lst.addItem(QListWidgetItem("（暂无工具）"))
         self._fit_tools_list()
@@ -2504,11 +2495,15 @@ class AssistantPage(QWidget):
         n = lst.count()
         if n <= 0:
             return
-        dlg = self._manager
+        # 弹窗来源：`_manager` 可能还没赋值（例如别处直接 new 出来），
+        # 兜底用列表自己的顶层窗口，保证「撑高」在任何打开路径下都生效。
+        dlg = self._manager if self._manager is not None else lst.window()
         if dlg is None or not dlg.isVisible():
             return
+        min_h = int(getattr(dlg, "MIN_H", 520) or 520)
         # 只在「工具」Tab 可见时调尺寸，否则会平白把弹窗撑高
-        if dlg.tabs.currentWidget() is not lst.parentWidget():
+        tabs = getattr(dlg, "tabs", None)
+        if tabs is not None and tabs.currentWidget() is not lst.parentWidget():
             return
         try:
             per = max(lst.sizeHintForRow(i) for i in range(n))
@@ -2517,7 +2512,7 @@ class AssistantPage(QWidget):
             avail_h = 900
             scr = dlg.screen()
             if scr is not None:
-                avail_h = max(dlg.MIN_H, scr.availableGeometry().height() - 24)
+                avail_h = max(min_h, scr.availableGeometry().height() - 24)
             want = min(need + chrome, avail_h)
             if want > dlg.height():
                 dlg.resize(dlg.width(), want)
@@ -4242,55 +4237,29 @@ class AssistantPage(QWidget):
         w2.start()
 
     def _apply_catalog_mcp(self, data: Any) -> None:
+        """缓存 MCP 目录 + 提示条 + 转发给独立窗口（1.0.9：内嵌列表已移除）。"""
         if not isinstance(data, dict):
             return
         self._catalog_mcp = data
-        lst = getattr(self, "_mcp_online_list", None)
-        if lst is not None:
-            lst.clear()
-            for it in (data.get("items") or []):
-                if not isinstance(it, dict):
-                    continue
-                badge = CATALOG_CLASS_BADGE.get(
-                    str(it.get("free_class") or "unknown"), "未知")
-                title = it.get("title") or it.get("registry_name") or ""
-                item = QListWidgetItem(
-                    f"{badge} {title}\n{it.get('description') or ''}")
-                item.setData(Qt.UserRole, it)
-                item.setToolTip(f"{it.get('registry_name') or ''}\n"
-                                f"传输：{it.get('transport') or ''} · "
-                                f"版本：{it.get('version') or ''}")
-                lst.addItem(item)
-            if not data.get("items"):
-                lst.addItem("（在线目录为空：点「⟳ 刷新」或检查网络/代理）")
+        dlg = getattr(self, "_online_mcp_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg._apply(data)                  # 窗口开着就同步刷新，避免两份数据
         self._update_catalog_banner("mcp", data)
 
     def _on_catalog_mcp_failed(self, msg: str) -> None:
-        lst = getattr(self, "_mcp_online_list", None)
         self._update_catalog_banner(
             "mcp", self._catalog_mcp,
             error=str(msg), empty_hint="（还没有在线目录缓存。请检查网络/代理后点"
                                        "「⟳ 刷新」，或先用「手动添加」加 MCP）")
 
     def _apply_catalog_repos(self, data: Any) -> None:
+        """缓存仓库目录 + 提示条 + 转发给独立窗口（1.0.9）。"""
         if not isinstance(data, dict):
             return
         self._catalog_repos = data
-        lst = getattr(self, "_skill_online_list", None)
-        if lst is not None:
-            lst.clear()
-            for it in (data.get("items") or []):
-                if not isinstance(it, dict):
-                    continue
-                item = QListWidgetItem(
-                    f"⭐{it.get('stars') or 0}  {it.get('full_name') or ''}\n"
-                    f"{it.get('description') or ''}")
-                item.setData(Qt.UserRole, it)
-                item.setToolTip(f"{it.get('full_name') or ''}\n"
-                                f"默认分支：{it.get('default_branch') or 'main'}")
-                lst.addItem(item)
-            if not data.get("items"):
-                lst.addItem("（在线目录为空：点「⟳ 刷新」或检查网络/代理）")
+        dlg = getattr(self, "_online_skills_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg._apply(data)
         self._update_catalog_banner("gh_repos", data)
 
     def _on_catalog_repos_failed(self, msg: str) -> None:
