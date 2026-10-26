@@ -36,6 +36,9 @@ class ChatReply:
     # 正文为空、用思考内容兜底时为 True：Agent 会在对话里提示「只有思考没有正文」，
     # 避免用户把推理过程误当最终答案。
     fallback_reasoning: bool = False
+    #: 自愈记录（如「max_tokens 2048 被用尽 → 自动放大到 8192 重试」），
+    #: Agent 以 note 事件显示，便于用户理解为什么这轮变慢了
+    note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -44,6 +47,28 @@ class ChatReply:
 
 class ProviderError(RuntimeError):
     pass
+
+
+#: max_tokens 自愈上限：空正文时按 4 倍放大，最多到这个值
+#: （32k 已足够让 R1/Qwen3-thinking 既思考完又写出正文）
+MAX_TOKENS_CAP = 32768
+
+_STATUS_HINT = {
+    401: "鉴权失败（401，请检查 API Key）",
+    402: "余额不足（402）",
+    403: "无权限（403）",
+    404: "模型或端点不存在（404）",
+    429: "触发限流（429，TPM/RPM 超限）",
+    500: "上游内部错误（500）",
+    502: "上游网关错误（502）",
+    503: "上游繁忙（503）",
+    504: "上游超时（504）",
+}
+
+
+def _status_hint(code: int) -> str:
+    """把 HTTP 状态码翻成人话，避免用户只看到一串 `HTTP 503：{...}`。"""
+    return _STATUS_HINT.get(code, f"请求失败（{code}）")
 
 
 def _local_api_key() -> str:
@@ -174,19 +199,58 @@ class Provider:
              on_delta: Optional[Callable[[str, str], None]] = None,
              cancel_check: Optional[Callable[[], bool]] = None,
              timeout: float = 300.0) -> ChatReply:
-        """流式对话；on_delta(channel, text)，channel ∈ content / reasoning。"""
+        """流式对话；on_delta(channel, text)，channel ∈ content / reasoning / reset。"""
         target_model = self.resolve_model(model)
+        budget = max(1, int(max_tokens or 2048))
         payload: Dict[str, Any] = {
             "model": target_model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": int(max_tokens),
+            "max_tokens": budget,
             "stream": True,
         }
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
+        reply = self._stream_once(payload, on_delta, cancel_check, timeout)
+
+        # ---- 空正文自愈（用户反馈：思考型模型几乎每次都报「没有返回正文」）----
+        # 根因：R1 / Qwen3-thinking 这类模型把 max_tokens 预算全花在思考上，
+        # 流式结束后 content 为空、finish_reason="length"。旧实现直接报错让用户
+        # 自己去设置里改，体验极差。这里自动把预算放大 4 倍重试一次（封顶
+        # MAX_TOKENS_CAP），并把这次自愈作为 note 告知用户。
+        if reply.ok and not (reply.content or "").strip() and not reply.tool_calls:
+            truncated = str(reply.finish_reason or "").lower() in (
+                "length", "max_tokens", "length_exceeded", "max_output_tokens")
+            blank = not (reply.reasoning or "").strip()
+            if budget < MAX_TOKENS_CAP and (truncated or blank):
+                new_budget = int(min(max(budget * 4, 8192), MAX_TOKENS_CAP))
+                payload["max_tokens"] = new_budget
+                note = (f"上一轮 max_tokens={budget} 被用尽（finish_reason="
+                        f"{reply.finish_reason or '未知'}），已自动放大到 "
+                        f"{new_budget} 重试")
+                if on_delta and (reply.content or reply.reasoning):
+                    # 清掉前端已渲染的半截思考/正文，避免重试内容叠在旧内容后面
+                    on_delta("reset", "")
+                retry = self._stream_once(payload, on_delta, cancel_check, timeout)
+                if retry.ok:
+                    retry.note = note
+                    reply = retry
+
+        # 本地 qwen3 思考模型：正文可能全在 reasoning 里（网关已兜底合并，
+        # 但云端部分模型同样存在此现象），这里再兜一层，保证 Agent 有输入。
+        if reply.ok and not reply.content.strip() and not reply.tool_calls \
+                and reply.reasoning.strip():
+            reply.content = reply.reasoning.strip()
+            reply.fallback_reasoning = True
+        return reply
+
+    def _stream_once(self, payload: Dict[str, Any],
+                     on_delta: Optional[Callable[[str, str], None]],
+                     cancel_check: Optional[Callable[[], bool]],
+                     timeout: float) -> ChatReply:
+        """发一次流式请求（429/5xx/网络错误退避重试，最多 3 次）。"""
         reply = ChatReply()
         attempts = 3
         for attempt in range(1, attempts + 1):
@@ -196,14 +260,16 @@ class Provider:
                     with c.stream("POST", self.endpoint(), json=payload) as resp:
                         if resp.status_code >= 400:
                             resp.read()
-                            body = resp.text[:400]
+                            body = (resp.text or "")[:400]
                             # 免费额度常见 429（TPM/RPM）与偶发 5xx：退避重试，
                             # 直接失败会让技能编排白跑好几步
                             if resp.status_code in (429, 500, 502, 503, 504) \
                                     and attempt < attempts:
                                 time.sleep(2.0 * attempt)
                                 continue
-                            raise ProviderError(f"HTTP {resp.status_code}：{body}")
+                            raise ProviderError(
+                                f"{_status_hint(resp.status_code)}"
+                                f"（HTTP {resp.status_code}）：{body}")
                         self._consume_sse(resp, reply, on_delta, cancel_check)
                 break
             except ProviderError as e:
@@ -221,28 +287,40 @@ class Provider:
             except Exception as e:
                 reply.error = f"{type(e).__name__}: {e}"
                 break
-
-        # 本地 qwen3 思考模型：正文可能全在 reasoning 里（网关已兜底合并，
-        # 但云端部分模型同样存在此现象），这里再兜一层，保证 Agent 有输入。
-        if reply.ok and not reply.content.strip() and not reply.tool_calls \
-                and reply.reasoning.strip():
-            reply.content = reply.reasoning.strip()
-            reply.fallback_reasoning = True
         return reply
 
     @staticmethod
     def _consume_sse(resp: httpx.Response, reply: ChatReply,
                      on_delta: Optional[Callable[[str, str], None]],
                      cancel_check: Optional[Callable[[], bool]]) -> None:
-        """解析 OpenAI SSE：content / reasoning_content / tool_calls 增量。"""
+        """解析 OpenAI SSE：content / reasoning_content / tool_calls 增量。
+
+        兼容性（1.0.9）：
+          - 有的网关忽略 `stream=true` 直接回**整包 JSON**；也有网关在 200 里塞
+            错误体（`{"code":50508,"message":"System is too busy"}`）。旧实现只认
+            `data:` 行，遇到这两种情况会静默得到「空回复」，前端只看到
+            「模型没有返回正文」——完全误导。这里缓存原始文本，解析不到增量时
+            兜底按 JSON 解析（正常回复直接取用、错误体转成明确报错）。
+          - `data:` 前缀允许前后空白。
+        """
         calls: Dict[int, Dict[str, Any]] = {}
+        raw_parts: List[str] = []
+        raw_len = 0
+        saw_data = False
         for line in resp.iter_lines():
             if cancel_check and cancel_check():
                 reply.finish_reason = "cancelled"
                 break
-            if not line or not line.startswith("data:"):
+            text = (line or "").strip()
+            if text and raw_len < 8000:
+                raw_parts.append(text)
+                raw_len += len(text)
+            if not text:
                 continue
-            data = line[5:].strip()
+            if not text.startswith("data:"):
+                continue
+            saw_data = True
+            data = text[5:].strip()
             if data == "[DONE]":
                 break
             try:
@@ -283,6 +361,50 @@ class Provider:
         for i, tc in enumerate(reply.tool_calls):
             if not tc.get("id"):
                 tc["id"] = f"call_{i}_{int(time.time() * 1000) % 100000}"
+
+        if reply.content.strip() or reply.reasoning.strip() or reply.tool_calls \
+                or reply.error:
+            return
+        # 一个增量都没解析出来：把原始文本当 JSON 再试一次（非流式 / 错误体）
+        raw = "\n".join(raw_parts).strip()
+        if not raw:
+            reply.error = "上游返回了空响应（没有任何内容）"
+            return
+        obj: Any = None
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            if obj.get("error"):
+                reply.error = str(obj["error"])[:300]
+                return
+            if obj.get("code") or obj.get("message"):
+                reply.error = f"上游错误：{str(obj.get('message') or obj)[:300]}"
+                return
+            choices = obj.get("choices") or []
+            if choices:
+                ch = choices[0] or {}
+                msg = ch.get("message") or {}
+                reply.content = str(msg.get("content") or "")
+                reply.reasoning = str(msg.get("reasoning_content")
+                                      or msg.get("reasoning") or "")
+                reply.finish_reason = str(ch.get("finish_reason") or "")
+                for i, tc in enumerate(msg.get("tool_calls") or []):
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        reply.tool_calls.append({
+                            "id": tc.get("id") or f"call_{i}", "name": fn["name"],
+                            "arguments": fn.get("arguments") or ""})
+                if reply.content or reply.reasoning or reply.tool_calls:
+                    if on_delta and reply.reasoning:
+                        on_delta("reasoning", reply.reasoning)
+                    if on_delta and reply.content:
+                        on_delta("content", reply.content)
+                    return
+        if not saw_data:
+            reply.error = ("上游没有按流式协议返回（缺少 data: 行）："
+                           f"{raw[:300]}")
 
 
 _CACHE: Dict[str, tuple] = {}

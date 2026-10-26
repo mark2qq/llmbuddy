@@ -30,6 +30,7 @@ from PySide6.QtGui import (QPixmap, QPainter, QColor, QPolygon,
                            QIcon)
 
 from core.task_runner import Worker
+from core import model_info
 from ui.widgets.custom_model_dialog import (CustomModelDialog,
                                             load_custom_models,
                                             save_custom_models)
@@ -43,20 +44,9 @@ SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 # 背景：GET /models 接口的响应只含 id/created/owned_by，不带免费标记，
 # 因此用这份清单给拉取到的模型打「免费」标并在菜单置顶；未命中的模型仍
 # 可选择（按量付费，余额不足时发送会报错，用户可自行判断）。
-SILICONFLOW_KNOWN_FREE = (
-    "Qwen/Qwen3-8B",
-    "Qwen/Qwen3-14B",
-    "Qwen/Qwen3-32B",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-Coder-7B-Instruct",
-    "deepseek-ai/DeepSeek-R1",
-    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-    "deepseek-ai/DeepSeek-V3",
-    "THUDM/glm-4-9b-chat",
-    "THUDM/GLM-4-9B-0414",
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "meta-llama/Meta-Llama-3.1-8B-Instruct",
-)
+# 1.0.9：清单与「模型介绍 / 收费提示」统一收敛到 core/model_info.py，
+# 智能助理的模型菜单也用同一份数据，避免两处清单各自漂移。
+SILICONFLOW_KNOWN_FREE = model_info.KNOWN_FREE
 
 # 内置云端模型清单：首次「获取最新模型」前的默认值（取已知免费模型）。
 # 走云端路由：选中后直连 SiliconFlow，复用 chat_stream_custom。
@@ -475,6 +465,8 @@ class ChatPage(QWidget):
         网络请求——本函数会被打开菜单/选模型等交互频繁调用，必须瞬时完成）。
         """
         self._model_menu.clear()
+        # 悬停提示（模型介绍 + 收费口径）开关：QMenu 默认不显示 action tooltip
+        self._model_menu.setToolTipsVisible(True)
         if local is None:
             local = self._local_split
         running = local["running"]
@@ -485,9 +477,9 @@ class ChatPage(QWidget):
         if running or not_running:
             self._add_menu_header("本地模型")
             for n in running:
-                self._add_menu_action(f"●  {n}", n)
+                self._add_menu_action(f"●  {n}", n, local=True)
             for n in not_running:
-                self._add_menu_action(f"○  {n}", n)
+                self._add_menu_action(f"○  {n}", n, local=True)
         else:
             hint = self._model_menu.addAction("（暂无本地模型，请到模型库下载/加载）")
             hint.setEnabled(False)
@@ -506,6 +498,7 @@ class ChatPage(QWidget):
             # 付费模型收进子菜单，避免主列表过长；选中后同样走云端直连
             sub = self._model_menu.addMenu(f"其它模型（{len(rest)}，按量付费）")
             sub.setObjectName("ModelMenu")
+            sub.setToolTipsVisible(True)
             for c in rest:
                 label = f"☁  {c['name']}"
                 self._add_menu_action(label, c["name"], menu=sub)
@@ -533,10 +526,17 @@ class ChatPage(QWidget):
         act = self._model_menu.addAction(text)
         act.setEnabled(False)
 
-    def _add_menu_action(self, label: str, name: str, menu=None) -> None:
-        """添加模型菜单项；menu 缺省为顶层面板（子菜单传入 sub QMenu）。"""
+    def _add_menu_action(self, label: str, name: str, menu=None,
+                         local: bool = False) -> None:
+        """添加模型菜单项；menu 缺省为顶层面板（子菜单传入 sub QMenu）。
+
+        1.0.9：每个模型项都挂悬停提示（模型介绍 + 收费口径），菜单需
+        `setToolTipsVisible(True)` 才会显示（已在 `_build_model_menu` 打开）。
+        """
         target = menu if menu is not None else self._model_menu
         act = target.addAction(("✓  " if name == self._current_model else "    ") + label)
+        info = model_info.describe(name, local=local)
+        act.setToolTip(info.get("tooltip") or name)
         act.triggered.connect(
             lambda _checked=False, m=name: self._on_pick_model(m))
 

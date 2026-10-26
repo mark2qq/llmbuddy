@@ -137,8 +137,22 @@ def _install_action_trace(app) -> None:
         ui_trace.mark_session_start()
         ui_trace.install(app)
         atexit.register(ui_trace.mark_normal_exit)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         pass
+
+
+def _install_diag(app) -> None:
+    """崩溃诊断补强（1.0.9）：后台线程异常 / Qt fatal / 正常退出标记。
+
+    背景：用户反馈「执行任务时闪退」，但 crash.log 只有 session start、
+    Windows 事件日志也没有 Application Error —— 说明退出路径没被任何现有
+    钩子覆盖（线程异常无控制台、强杀不跑 atexit）。这里把三类痕迹补齐。
+    """
+    try:
+        from core import crash_diag
+        crash_diag.install_all(app)
+    except Exception as e:  # noqa: BLE001
+        _startup_log("diag install failed: %s" % e)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +306,7 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(False)
     _startup_log("QApplication created")
     _install_action_trace(app)
+    _install_diag(app)
     install_translations(app)
     _startup_log("translations installed=%s" % bool(_TRANSLATORS))
 

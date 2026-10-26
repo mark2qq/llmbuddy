@@ -16,6 +16,7 @@
 """
 
 import os
+import sys
 import logging
 from contextlib import asynccontextmanager
 
@@ -102,7 +103,26 @@ def run() -> None:
                     if os.path.isdir(_cfg.MODELS_DIR) else 0)
     except Exception as _e:  # noqa: BLE001
         logger.warning("log models_dir failed: %s", _e)
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    # uvicorn 的默认日志配置会往 sys.stderr 建 StreamHandler；进程**没有控制台**
+    # 且 stdout/stderr 为 None 时（例如被外部工具以隐藏窗口方式拉起），
+    # dictConfig 会抛 `ValueError: Unable to configure formatter 'default'`
+    # 直接把后端启动搞死（2026-10-26 实测）。这种场景退化为不重配日志，
+    # 服务照常起——日志少了比服务起不来强。
+    try:
+        if sys.stderr is None or getattr(sys.stderr, "fileno", None) is None:
+            uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+                        log_config=None)
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    except ValueError as e:
+        # 兜底：仍报日志配置错误时，去掉日志配置再试一次
+        if "Unable to configure" not in str(e):
+            raise
+        logger.warning("uvicorn log config failed (%s), retry without it", e)
+        uvicorn.run(app, host=HOST, port=PORT, log_level="info", log_config=None)
 
 
 if __name__ == "__main__":

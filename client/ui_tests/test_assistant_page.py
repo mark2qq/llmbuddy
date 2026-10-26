@@ -106,8 +106,10 @@ class _FakeAssistApi:
         self.cleared = []         # sid
         # ---------------- 1.0.8 清单中心 / 工具开关 / 自动加载 ----------------
         self.tool_prefs_calls = 0
-        self.tool_prefs = {"disabled": [], "max_tools": 24, "total": 2,
-                           "active": 2, "over": None}
+        # 注意：字典叫 _prefs_data，方法叫 tool_prefs()——同名属性会遮蔽方法，
+        # 页面里 `self._assist.tool_prefs()` 就会 TypeError（1.0.9 踩过）
+        self._prefs_data = {"disabled": [], "max_tools": 24, "total": 2,
+                            "active": 2, "over": None}
         self.saved_prefs = []     # (disabled[], max_tools)
         self.profiles_calls = 0
         self.profiles_data = {"auto_load": True,
@@ -266,16 +268,16 @@ class _FakeAssistApi:
     # ---------------- 1.0.8 工具偏好 / profile / 在线目录 ----------------
     def tool_prefs(self):
         self.tool_prefs_calls += 1
-        return dict(self.tool_prefs)
+        return dict(self._prefs_data)
 
     def save_tool_prefs(self, disabled=None, max_tools=None):
         self.saved_prefs.append((list(disabled or []), max_tools))
-        self.tool_prefs = {"disabled": list(disabled or []),
-                           "max_tools": int(max_tools or 24),
-                           "total": 2,
-                           "active": max(0, 2 - len(disabled or [])),
-                           "over": None}
-        return dict(self.tool_prefs)
+        self._prefs_data = {"disabled": list(disabled or []),
+                            "max_tools": int(max_tools or 24),
+                            "total": 2,
+                            "active": max(0, 2 - len(disabled or [])),
+                            "over": None}
+        return dict(self._prefs_data)
 
     def profiles(self):
         self.profiles_calls += 1
@@ -1807,3 +1809,79 @@ def test_switch_task_resets_and_fetches_queue(page):
     assert not p._queue_panel.isVisibleTo(p)     # 旧任务队列已清
     assert _pump(lambda: fake.queue_calls
                  and fake.queue_calls[-1] == "sX")
+
+
+# ---------------------------------------------------------------------------
+# 1.0.9：模型菜单「免费」标识 + 悬停提示 / reset 事件 / 工具页刷新
+# ---------------------------------------------------------------------------
+def _menu_actions(menu):
+    """递归收集菜单（含子菜单）里的 action。"""
+    out = []
+    for act in menu.actions():
+        sub = act.menu()
+        if sub is not None:
+            out.extend(_menu_actions(sub))
+        else:
+            out.append(act)
+    return out
+
+
+def test_model_menu_marks_free_and_has_tooltip(page):
+    """线上免费模型标「免费」；每项都带「能力 / 收费」悬停提示。"""
+    p, _fake = page
+    p._active_provider = "siliconflow"
+    p._model_cache["siliconflow"] = ["Qwen/Qwen3-8B",
+                                     "deepseek-ai/DeepSeek-V4-Flash"]
+    menu = p._build_model_menu()
+    assert menu.toolTipsVisible() is True
+
+    by_text = {a.text().strip(): a for a in _menu_actions(menu)}
+    free = [t for t in by_text if t.startswith("Qwen/Qwen3-8B")]
+    assert free, "菜单里找不到 Qwen/Qwen3-8B"
+    assert "免费" in free[0]
+    tip = by_text[free[0]].toolTip()
+    assert "能力：" in tip and "收费：" in tip
+
+    paid = [t for t in by_text if t.startswith("deepseek-ai/DeepSeek-V4-Flash")]
+    assert paid and "免费" not in paid[0]
+    assert "按量计费" in by_text[paid[0]].toolTip()
+
+
+def test_model_menu_provider_has_tooltip(page):
+    """模型来源子项也要有悬停说明（类型 / 端点 / 默认模型）。"""
+    p, _fake = page
+    menu = p._build_model_menu()
+    acts = [a for a in _menu_actions(menu) if a.text() in ("硅基流动", "本地模型")]
+    assert acts
+    assert any("类型：" in a.toolTip() for a in acts)
+
+
+def test_reset_event_clears_partial_bubble(page):
+    """provider 自动放大 max_tokens 重试时下发 reset：半截内容要清掉。"""
+    p, _fake = page
+    p._on_event({"type": "delta", "text": "半截正文"})
+    p._on_event({"type": "reasoning", "text": "半截思考"})
+    p._on_event({"type": "reset"})
+    assert p._bubble is not None and p._bubble.label.text() == ""
+    if p._thinking is not None:
+        assert p._thinking.body.text() == ""
+
+
+def test_tools_tab_refresh_pulls_state_and_prefs(page):
+    """「⟳ 刷新」必须同时重拉 state 与 tool prefs（旧实现只拉 prefs）。"""
+    from ui.pages import assistant_page as mod
+    p, fake = page
+    # 工具列表在清单中心弹窗里懒创建：先建弹窗才有 _tool_list
+    mod.ManagerDialog(p)
+    before = fake.tool_prefs_calls
+    p._refresh_tools()
+    assert _pump(lambda: fake.tool_prefs_calls > before)
+    assert _pump(lambda: "工具清单已刷新" in p._status.text())
+    assert p._tool_list.count() >= 2
+
+
+def test_tool_list_fit_does_not_crash_without_dialog(page):
+    """弹窗未打开时 _fit_tools_list 直接返回（不能在无父窗口时调尺寸）。"""
+    p, _fake = page
+    p._fill_tools(p._state.get("tools") or [])
+    p._fit_tools_list()      # 不应抛异常

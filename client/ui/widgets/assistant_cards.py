@@ -33,6 +33,10 @@ class ChatBubble(QWidget):
     MAX_WIDTH = 660
     #: 估宽时预留的内边距（QSS 里 padding 8~12px + 边框）
     PAD = 30
+    #: 字宽估算余量：中文/emoji 混排时按字宽累加会偏小 1~2 个字，
+    #: 不留余量就会出现「明明放得下却折了最后一个字」（用户反馈截图：
+    #: 「继续完成任务」被折成「继续完成任 / 务」）
+    SLACK = 1.08
     #: 流式刷新节流（毫秒）：每个 token 都重排整段文本会闪得厉害
     FLUSH_MS = 40
 
@@ -100,7 +104,7 @@ class ChatBubble(QWidget):
         固定宽度后文字只往下长，结束时再一次性贴合内容。
         """
         w = int(width or 0) or self.MAX_WIDTH
-        w = max(260, min(w, self.MAX_WIDTH))
+        w = max(260, min(w, self._avail_width()))
         self._fit_w = w
         self.label.setFixedWidth(w)
 
@@ -130,19 +134,47 @@ class ChatBubble(QWidget):
         self._apply_format(markdown=markdown)
         self._fit_width()
 
+    def clear(self) -> None:
+        """清空内容（后端自动放大 token 预算重试时用，避免半截文字留在屏上）。"""
+        self._buf = ""
+        self._shown = ""
+        self._timer.stop()
+        self.label.setText("")
+        self.label.setFixedWidth(max(120, min(self.MAX_WIDTH, self._avail_width())))
+
+    def _avail_width(self) -> int:
+        """内容区可用宽度（父容器宽度），封顶 MAX_WIDTH。
+
+        用户要求「按界面内容区宽度计算，超过才换行」：气泡宽度上限不能是
+        写死的常量，否则宽窗口下短句仍被折行。父容器即对话列（`_col`，
+        上限 940），这里取其宽度作为可用宽度，留 8% 给滚动条与边距。
+        """
+        p = self.parentWidget()
+        w = 0
+        while p is not None:
+            cw = p.width()
+            if cw > 0:
+                w = cw
+                break
+            p = p.parentWidget()
+        if w <= 0:
+            return self.MAX_WIDTH
+        return max(220, min(self.MAX_WIDTH, int(w * 0.92)))
+
     def _fit_width(self) -> None:
         """按内容估算理想宽度。
 
         开了 wordWrap 的 QLabel 给不出可用宽度（布局会把它压成很窄一列，
         中文长句被切成四五行），所以这里按字宽自己算一次，换行仍交给
-        wordWrap；短句贴合文字，长段落封顶 MAX_WIDTH。
+        wordWrap；短句贴合文字，长段落封顶「内容区可用宽度」。
         """
         text = self.label.text() or ""
         fm = self.label.fontMetrics()
         widest = 0
         for line in (text.splitlines() or [""]):
             widest = max(widest, fm.horizontalAdvance(line))
-        width = min(max(widest + self.PAD, 84), self.MAX_WIDTH)
+        need = int(widest * self.SLACK) + self.PAD
+        width = min(max(need, 84), self._avail_width())
         if width != self._fit_w:
             self._fit_w = width
             self.label.setFixedWidth(width)
@@ -153,9 +185,25 @@ class ChatBubble(QWidget):
         else:
             self.label.setTextFormat(Qt.PlainText)
 
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """首次显示时重算宽度。
+
+        气泡常在「还没挂进对话列」时就构造好（此时拿不到父容器宽度，
+        只能按 MAX_WIDTH 兜底）；挂上去之后必须按真实内容区宽度再算一次，
+        否则窄窗口里会横向溢出、宽窗口里又提前折行。
+        """
+        super().showEvent(event)
+        if self._buf or self.label.text():
+            self._fit_width()
+
 
 class StepLine(QWidget):
-    """技能阶段 / 系统提示：居中的一行小字；error=True 时变成醒目的错误条。"""
+    """技能阶段 / 系统提示：**左对齐**的一行小字；error=True 时变成醒目的错误条。
+
+    1.0.9 变更（用户反馈截图）：原实现居中（`AlignCenter`），长句在内容列中间
+    折成两三行、两侧留白，读起来像一段漂浮的文字。统一改左对齐 + wordWrap，
+    折行宽度由内容列宽度决定（`QHBoxLayout` 拉伸 + `setWordWrap`）。
+    """
 
     def __init__(self, text: str, parent=None, error: bool = False):
         super().__init__(parent)
@@ -164,7 +212,10 @@ class StepLine(QWidget):
         self.label = QLabel(text)
         self.label.setObjectName("ErrorLine" if error else "StepLine")
         self.label.setWordWrap(True)
-        self.label.setAlignment(Qt.AlignLeft if error else Qt.AlignCenter)
+        self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # 长句必须按可用宽度折行：默认 Preferred 会让 QLabel 在布局里被压成
+        # 一窄条，改 Expanded 让它吃满内容列宽度
+        self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         lay.addWidget(self.label, 1)
 
     def set_text(self, text: str) -> None:
@@ -353,6 +404,9 @@ class ThinkingBlock(QWidget):
     """
 
     FLUSH_MS = 60
+    #: 展示上限：思考型模型（R1 / Qwen3 thinking）单轮可吐几万字，QLabel
+    #: 对超长富文本的每次重排都是 O(n)，节流也压不住 → 只保留尾部 N 字
+    MAX_CHARS = 20000
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -391,7 +445,12 @@ class ThinkingBlock(QWidget):
         if self._buf == self._shown:
             return
         self._shown = self._buf
-        self.body.setText(self._shown)
+        text = self._shown
+        if len(text) > self.MAX_CHARS:
+            # 只留尾部（最新思考），避免超长文本拖死布局
+            text = "（前文已省略 %d 字）\n…%s" % (
+                len(text) - self.MAX_CHARS, text[-self.MAX_CHARS:])
+        self.body.setText(text)
 
     def finish(self) -> None:
         """收尾：把剩余内容刷出来；一个字都没有就整块隐藏。"""
@@ -400,6 +459,13 @@ class ThinkingBlock(QWidget):
             self.setVisible(False)
             return
         self.head.setText(f"深度思考（{len(self._buf)} 字）")
+
+    def clear(self) -> None:
+        """清空（后端自动放大 token 预算重试时，旧思考作废）。"""
+        self._timer.stop()
+        self._buf = ""
+        self._shown = ""
+        self.body.setText("")
 
 
 def _short_json(obj: Any, limit: int = 400) -> str:

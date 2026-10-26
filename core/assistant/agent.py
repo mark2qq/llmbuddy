@@ -32,7 +32,7 @@ from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
 from core.assistant import tools as tools_mod
 from core.assistant.approval import get_approval_manager
-from core.assistant.providers import ProviderError, get_provider
+from core.assistant.providers import MAX_TOKENS_CAP, ProviderError, get_provider
 from core.assistant.store import (audit, delete_session, ensure_dirs, get_provider as cfg_provider,
                                  list_sessions, load_config, load_session, norm_workspace,
                                  save_config, save_session, space_list as group_spaces,
@@ -280,6 +280,10 @@ class Assistant:
             return {"ok": False, "error": str(e)}
 
         def on_delta(channel: str, piece: str) -> None:
+            if channel == "reset":
+                # provider 因空正文自动放大 max_tokens 重试：先让前端清空半截内容
+                emit({"type": "reset"})
+                return
             emit({"type": "reasoning" if channel == "reasoning" else "delta",
                   "text": piece})
 
@@ -361,6 +365,9 @@ class Assistant:
                     error = reply.error
                     emit({"type": "error", "message": reply.error})
                     break
+                if getattr(reply, "note", ""):
+                    # provider 自愈记录（如自动放大 max_tokens 重试）
+                    emit({"type": "note", "message": str(reply.note)})
                 if self._cancelled(session_id):
                     # 用户在流式过程中点了停止：provider 会以 cancelled 结束，
                     # 这里不要报「空回复」错误，按正常停止处理
@@ -378,10 +385,12 @@ class Assistant:
                 if not calls:
                     final_text = reply.content.strip()
                     if not final_text:
-                        # 思考型模型可能把 max_tokens 全用在思考上：明确报出来，
-                        # 而不是前端看到一个空回复。
-                        error = ("模型没有返回正文（可能全部 token 用在思考上了）。"
-                                 "可在设置里调大 max_tokens，或换用更大的模型。")
+                        # 思考型模型可能把 max_tokens 全用在思考上：provider 已自动
+                        # 放大预算重试过一次（providers.chat），仍为空才报这里。
+                        error = ("模型没有返回正文：本轮 max_tokens 已被自动放大到上限"
+                                 f"{MAX_TOKENS_CAP} 重试仍为空"
+                                 f"（finish_reason={reply.finish_reason or '未知'}）。"
+                                 "请换用更大的模型，或把任务拆小一些。")
                         emit({"type": "error", "message": error})
                         break
                     if reply.fallback_reasoning:

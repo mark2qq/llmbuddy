@@ -39,6 +39,7 @@ import json
 import os
 import time
 import tempfile
+import traceback
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QWidget)
 
 from core.assistant_client import AssistantApi, AssistantStream
+from core import model_info
 from core.task_runner import Worker
 from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
@@ -1424,6 +1426,9 @@ class AssistantPage(QWidget):
         # 在线区与工具偏好是懒加载的：打开时补一次（先渲染缓存，不阻塞）
         if key in ("skills", "mcp", "tools"):
             self._load_tool_prefs()
+        if key == "tools" and not (self._state.get("tools") or []):
+            # 首次打开工具页且 state 里还没有清单：主动拉一次，别让用户面对空列表
+            self._refresh_tools()
         if key in ("skills", "mcp") and getattr(dlg, "_online_visible", False):
             self._load_online_catalog(force=False)
         dlg.exec()
@@ -1909,7 +1914,10 @@ class AssistantPage(QWidget):
         head.addStretch(1)
         b_refresh = QPushButton("⟳ 刷新")
         b_refresh.setObjectName("MiniBtn")
-        b_refresh.clicked.connect(lambda _c=False: self._load_tool_prefs())
+        b_refresh.setToolTip("重新拉取工具清单与开关状态（GET /state + /tools/prefs）")
+        # 1.0.9：原实现只重拉 prefs，若 _state["tools"] 还没到位，点了「刷新」
+        # 界面毫无变化 → 看起来像按钮没实现。改为 state + prefs 一起重拉。
+        b_refresh.clicked.connect(lambda _c=False: self._refresh_tools())
         head.addWidget(b_refresh)
         lay.addLayout(head)
 
@@ -1919,11 +1927,44 @@ class AssistantPage(QWidget):
 
         self._tool_list = QListWidget()
         self._tool_list.setObjectName("HubList")
+        # 行高不固定（QCheckBox 行在 200% 缩放下会变高）→ 按像素滚动，
+        # 并保证内容超高时一定有滚动条（否则最后一行被裁掉却看不出能滚）
+        self._tool_list.setVerticalScrollMode(
+            QListWidget.ScrollMode.ScrollPerPixel)
+        self._tool_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._tool_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         lay.addWidget(self._tool_list, 1)
 
         #: 行内开关：工具名 → QCheckBox（`_fill_tools` 重建，测试断言用）
         self._tool_checks: Dict[str, Any] = {}
         return w
+
+    def _refresh_tools(self) -> None:
+        """工具 Tab 的「⟳ 刷新」：state（清单）+ tools/prefs（开关）一起重拉。"""
+        def pull():
+            state = self._assist.state() or {}
+            prefs = self._assist.tool_prefs() or {}
+            return state, prefs
+
+        self._set_status("正在刷新工具清单…")
+        w = Worker(pull)
+        w.result.connect(self._apply_tools_refresh)
+        w.error.connect(lambda m: self._set_status(f"刷新工具清单失败：{m}"))
+        w.start()
+
+    def _apply_tools_refresh(self, payload) -> None:
+        state, prefs = (payload or ({}, {}))
+        if isinstance(state, dict) and state:
+            self._state.update(state)
+        if isinstance(prefs, dict) and prefs:
+            self._tool_prefs = dict(prefs)
+        tools = self._state.get("tools") or []
+        self._fill_tools(tools)
+        n = len([t for t in tools if isinstance(t, dict)])
+        self._set_status(f"工具清单已刷新：{n} 个"
+                         f"（下发 {self._tool_prefs_snapshot()['active']} 个）")
 
     def _load_tool_prefs(self) -> None:
         """GET /tools/prefs → 更新顶部计数与列表开关态。"""
@@ -2437,6 +2478,41 @@ class AssistantPage(QWidget):
             item.setSizeHint(QSize(0, 24))
         if not tools:
             lst.addItem(QListWidgetItem("（暂无工具）"))
+        self._fit_tools_list()
+
+    def _fit_tools_list(self) -> None:
+        """工具列表按实际行高自适应高度（用户反馈：14 行时最后一行被裁一半）。
+
+        行高在 200% 缩放下由 QCheckBox 行控件决定（sizeHint 24 只是下限），
+        所以用 `sizeHintForRow` 实测总高，再把它塞进弹窗：空间够就一次显示完，
+        不够就给列表一个「整行边界」的高度并留可见滚动条，避免出现半行。
+        """
+        lst = getattr(self, "_tool_list", None)
+        if lst is None:
+            return
+        n = lst.count()
+        if n <= 0:
+            return
+        dlg = self._manager
+        if dlg is None or not dlg.isVisible():
+            return
+        # 只在「工具」Tab 可见时调尺寸，否则会平白把弹窗撑高
+        if dlg.tabs.currentWidget() is not lst.parentWidget():
+            return
+        try:
+            per = max(lst.sizeHintForRow(i) for i in range(n))
+            need = per * n + 2 * lst.frameWidth() + 2
+            chrome = max(0, dlg.height() - lst.height())   # 弹窗非列表部分高度
+            avail_h = 900
+            scr = dlg.screen()
+            if scr is not None:
+                avail_h = max(dlg.MIN_H, scr.availableGeometry().height() - 24)
+            want = min(need + chrome, avail_h)
+            if want > dlg.height():
+                dlg.resize(dlg.width(), want)
+            lst.setMinimumHeight(min(need, max(120, want - chrome)))
+        except Exception:                     # 无头测试环境：保持默认布局
+            pass
 
     def _fill_mcp(self, servers: List[Dict[str, Any]]) -> None:
         """MCP 列表：`● 名称 · 传输 · N 工具`（属性名 `_mcp_list` 保持不变）。"""
@@ -2763,7 +2839,31 @@ class AssistantPage(QWidget):
         self._fill_sessions()
 
     # ---------------- 事件分发 ----------------
-    def _on_event(self, ev: Dict[str, Any]) -> None:  # noqa: C901
+    def _on_event(self, ev: Dict[str, Any]) -> None:
+        """事件入口（1.0.9）：单个事件处理异常不允许拖垮整条流。
+
+        用户反馈「执行任务时闪退」：助手流里事件类型多（skill_step / tool_result
+        / queue / approval…），任何一处 KeyError 都会让这轮流静默断掉、界面像卡死。
+        这里统一兜底 —— 记 crash.log + 在对话区显示一条可读的错误，然后继续处理
+        后续事件。
+        """
+        try:
+            self._handle_event(ev)
+        except Exception as e:  # noqa: BLE001
+            try:
+                from core import crash_diag
+                crash_diag.log_block(
+                    "assistant event error",
+                    "event=%s\n%s" % (repr(ev)[:600], traceback.format_exc()))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._add_step(f"事件处理异常（已跳过）：{type(e).__name__}: {e}",
+                               error=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle_event(self, ev: Dict[str, Any]) -> None:  # noqa: C901
         kind = ev.get("type")
         if kind is None and ev.get("code"):
             # 走 SSE 的路径返回了 JSON 错误体（如 resume 撞活跃流 2017）：
@@ -2779,6 +2879,13 @@ class AssistantPage(QWidget):
             self._on_auto_loaded(ev.get("auto_loaded") or {})
         elif kind == "model":
             self._set_status(f"模型：{ev.get('model')}")
+        elif kind == "reset":
+            # 后端因「空正文」自动放大 max_tokens 重试：旧半截内容作废，清掉重画
+            if self._bubble is not None:
+                self._bubble.clear()
+            if self._thinking is not None:
+                self._thinking.clear()
+            self._add_step("首轮 token 预算用尽，已自动放大 max_tokens 重试…")
         elif kind == "delta":
             self._ensure_bubble().append_text(ev.get("text") or "")
             self._scroll_bottom()
@@ -3197,17 +3304,26 @@ class AssistantPage(QWidget):
         """构建模型下拉（WorkBuddy 的「模型 ⌄」位）：来源 + 模型 + 配置入口。
 
         拆出构建段便于无头测试（_show_model_menu 只负责弹出，exec 会阻塞）。
+
+        1.0.9（用户需求）：免费模型在名字后标「免费」，所有模型项都带悬停
+        提示（模型介绍 + 收费口径）。数据统一来自 `core.model_info`，
+        与对话页共用同一份免费清单，避免两处漂移。
         """
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")  # 复用对话页的菜单样式
+        # QMenu 默认不弹 action 的 tooltip，必须显式打开
+        menu.setToolTipsVisible(True)
 
+        is_local = self._active_provider == "local"
         src = menu.addMenu("模型来源")
+        src.setToolTipsVisible(True)
         for p in (self._state.get("providers") or []):
             if not p.get("enabled", True):
                 continue
             act = src.addAction(p.get("label") or p.get("id"))
             act.setCheckable(True)
             act.setChecked(p.get("id") == self._active_provider)
+            act.setToolTip(self._provider_tooltip(p))
             act.triggered.connect(
                 lambda _c=False, pid=p.get("id"): self._set_provider(pid))
 
@@ -3216,18 +3332,13 @@ class AssistantPage(QWidget):
         names = self._model_cache.get(self._active_provider) or []
         if names:
             for n in names[:20]:
-                act = menu.addAction(n)
-                act.setCheckable(True)
-                act.setChecked(n == self._active_model)
-                act.triggered.connect(lambda _c=False, m=n: self._set_model(m))
+                self._add_model_action(menu, n, is_local)
             if len(names) > 20:
                 # 超出部分收进可点开的子菜单（之前是禁用的一行字，用户找不到入口）
                 more = menu.addMenu(f"还有 {len(names) - 20} 个模型 ▸")
+                more.setToolTipsVisible(True)
                 for n in names[20:]:
-                    act = more.addAction(n)
-                    act.setCheckable(True)
-                    act.setChecked(n == self._active_model)
-                    act.triggered.connect(lambda _c=False, m=n: self._set_model(m))
+                    self._add_model_action(more, n, is_local)
         else:
             act = menu.addAction("（暂无可用模型，点下面刷新）")
             act.setEnabled(False)
@@ -3245,6 +3356,29 @@ class AssistantPage(QWidget):
         act = menu.addAction(label)
         act.triggered.connect(self._configure_custom_provider)
         return menu
+
+    def _add_model_action(self, menu: QMenu, name: str, local: bool = False) -> None:
+        """往模型菜单加一项：免费模型带「免费」标识 + 悬停提示（介绍/收费）。"""
+        act = menu.addAction(model_info.menu_label(name, local=local))
+        act.setCheckable(True)
+        act.setChecked(name == self._active_model)
+        info = model_info.describe(name, local=local)
+        act.setToolTip(str(info.get("tooltip") or name))
+        act.triggered.connect(lambda _c=False, m=name: self._set_model(m))
+
+    @staticmethod
+    def _provider_tooltip(p: Dict[str, Any]) -> str:
+        """模型来源的悬停提示：类型 + 端点 + 当前默认模型。"""
+        kind = "本地引擎（免费）" if p.get("kind") == "local" else "线上 OpenAI 兼容端点"
+        lines = [str(p.get("label") or p.get("id") or "")]
+        lines.append(f"类型：{kind}")
+        if p.get("base_url"):
+            lines.append(f"端点：{p.get('base_url')}")
+        if p.get("model"):
+            lines.append(f"默认模型：{p.get('model')}")
+        if p.get("kind") != "local" and not p.get("has_key"):
+            lines.append("尚未配置 API Key（选中后会提示配置）")
+        return "\n".join(lines)
 
     def _show_model_menu(self) -> None:
         self._popup_above(self._build_model_menu(), self._model_btn)
@@ -4392,6 +4526,8 @@ class ManagerDialog(QDialog):
         self.tabs.addTab(page._build_tools_tab(), "工具")
         self.tabs.addTab(page._build_mcp_tab(), "MCP")
         self.tabs.addTab(page._build_audit_tab(), "审计")
+        # 切到「工具」Tab 时按实际行数重算高度（1.0.9：修「列表显示不全」）
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         lay.addWidget(self.tabs, 1)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -4442,6 +4578,15 @@ class ManagerDialog(QDialog):
         keys = [k for k, _ in self.TABS]
         if key in keys:
             self.tabs.setCurrentIndex(keys.index(key))
+
+    def _on_tab_changed(self, index: int) -> None:
+        """切到「工具」Tab 时按实际行数重算高度（1.0.9：修列表显示不全）。"""
+        try:
+            key = self.TABS[index][0] if 0 <= index < len(self.TABS) else ""
+        except Exception:
+            return
+        if key == "tools":
+            self.page._fit_tools_list()
 
     def resizeEvent(self, event):  # noqa: N802 - Qt 命名
         super().resizeEvent(event)
