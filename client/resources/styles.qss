@@ -855,7 +855,7 @@ QTabBar::tab:hover { color: #d6dbe8; }
 #NavTaskItem[sub="true"] {
     padding-left: 36px;
     font-size: 12px;
-    color: #98a1b4;
+    color: #b3bccf;
 }
 #NavTaskItem[sub="true"][active="true"] { color: #ffffff; }
 #NavTaskItem[more="true"] {

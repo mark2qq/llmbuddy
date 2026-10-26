@@ -1184,7 +1184,7 @@ class AssistantPage(QWidget):
                 missing = not sp.get("exists", True)
                 row = QPushButton(
                     f"{'⚠ ' if missing else '📁 '}"
-                    f"{_ellipsis(sp.get('name') or path, 8)}   {sp.get('count')}")
+                    f"{_ellipsis(sp.get('name') or path, 10)}")
                 row.setObjectName("NavSpaceItem")
                 row.setProperty("active",
                                 "true" if latest and
@@ -1278,11 +1278,12 @@ class AssistantPage(QWidget):
             pass
 
     def _fit_nav_scroll(self, rows: int = 0) -> None:
-        """按行数算高，但允许被窗口压缩。
+        """按内容实测高度，但允许被窗口压缩。
 
-        刻意不依赖 `body.sizeHint()`：滚动区内部 widget 的布局在首次重建时
-        还没 activate，sizeHint 会偏小，结果「空间」那一段被裁掉（实测过，
-        任务区 4 行后再也看不到「空间 (N)」）。行数是自己数的，确定性强。
+        不用 `rows * NAV_ROW` 估：分组标题 / 空态标签带 QSS padding，实际
+        比 NAV_ROW 高一截，估算偏小会把最后一行（空间最新任务行）裁掉半截
+        （用户截图反馈「界面看不清」）。逐个取子控件 sizeHint 求和，与
+        「行数是自己数的」同样确定性强，且对每行实际高度都准。
 
         也不能 setFixedHeight：主窗口最小高 680，左栏还要放标题 + 6 个一级入口
         + 4 个管理入口；这里给「最小可压到 96 / 最大不超过 NAV_SCROLL_MAX」，
@@ -1291,7 +1292,21 @@ class AssistantPage(QWidget):
         sc = getattr(self, "_nav_scroll", None)
         if sc is None:
             return
-        h = max(96, min(rows * NAV_ROW + 4, NAV_SCROLL_MAX))
+        total = 0
+        lay = getattr(self, "_nav_body_lay", None)
+        if lay is not None:
+            n = 0
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is None:            # stretch 等布局项不占行高
+                    continue
+                total += w.sizeHint().height()
+                n += 1
+            if n > 1:
+                total += lay.spacing() * (n - 1)
+        if total <= 0:                   # 兜底：布局还没建好时按行数估
+            total = rows * NAV_ROW + 4
+        h = max(96, min(total + 4, NAV_SCROLL_MAX))
         # 最小 96（约 3 行）保证矮窗口下还能看到任务区；最大=内容高，
         # 内容少时不占一大片空白，内容多时由布局压缩 → 内部滚动。
         sc.setMinimumHeight(min(h, 96))
@@ -1449,7 +1464,7 @@ class AssistantPage(QWidget):
         if not isinstance(session, dict) or not session.get("id"):
             self._set_status("任务创建失败，请确认后端已启动")
             return
-        self._sync_workspace_to_task(path)
+        # 工作区同步已统一在 _on_session_created 里（按新任务的 workspace 指过去）
         self._on_session_created(session, False)
 
     def _open_space_folder(self, path: str) -> None:
@@ -2263,12 +2278,24 @@ class AssistantPage(QWidget):
 
     def _on_state_error(self, msg: str) -> None:
         self._loading = False
+        if not getattr(self, "_state_ok", False):
+            # 初始加载：后端大概率还没启动（启动引导弹窗正在问用户），这不算
+            # 错误 —— 不显示「ConnectError 10061」，安静重试等后端起来
+            # （截图反馈：初始加载不要出现错误）。上限 10 次 × 3s，之后由
+            # 切页 / 控制台启动事件正常触发 refresh。
+            self._set_status("")
+            self._state_retry = getattr(self, "_state_retry", 0) + 1
+            if self._state_retry <= 10:
+                QTimer.singleShot(3000, self.refresh)
+            return
         self._set_status(f"后端未就绪：{msg}（请先在控制台启动服务）")
 
     def _apply_state(self, st: Dict[str, Any]) -> None:
         self._loading = False
         if not isinstance(st, dict):
             return
+        self._state_ok = True           # 拉到过 state：之后的失败才算真错误
+        self._state_retry = 0
         self._state = st
         ws = str(st.get("workspace") or "")
         # 本机记忆兜底：后端可能因为「配置被重置 / PUT 没发出去（上次闪退）」
@@ -2712,15 +2739,23 @@ class AssistantPage(QWidget):
     # ------------------------------------------------------------------ #
     def _new_session(self, silent: bool = False) -> None:
         # 当前任务本来就是空的（0 条消息）就直接复用，别再建一个：
-        # 反复点左栏「+」或来回切页会攒出一长串「新任务（0 条）」
+        # 反复点左栏「+」或来回切页会攒出一长串「新任务（0 条）」。
+        # 例外：空任务在别的空间 —— 左栏「+」的语义是「在系统默认工作区新建」，
+        # 复用会把用户带回那个空间（截图反馈：点 + 后新任务落到 newspace，
+        # 「任务 (0)」永远不变）。
         cur = next((s for s in self._session_rows
                     if s.get("id") == self._session_id), None)
-        if not silent and cur is not None and not cur.get("message_count"):
+        if (not silent and cur is not None and not cur.get("message_count")
+                and self._task_ws(cur) == self._default_ws()):
             self._clear_chat()
             self._greet()
             self._set_status("当前已经是新任务")
             return
-        w = Worker(self._assist.new_session)
+        # 工作区之外新建（左栏 + / 清单中心按钮）→ 落系统默认工作区；
+        # 想落在自定义空间走空间右键「在此空间新建任务」。silent 是后台自动
+        # 建任务（首次进页 / 删任务兜底），跟随后端当前工作区即可。
+        ws = "" if silent else self._default_ws()
+        w = Worker(self._assist.new_session, ws)
         w.result.connect(lambda s: self._on_session_created(s, silent))
         w.error.connect(lambda m: self._set_status(f"新建任务失败：{m}"))
         w.start()
@@ -2730,6 +2765,9 @@ class AssistantPage(QWidget):
             return
         self._session_id = session["id"]
         self._sel_sid = str(session["id"])      # 新任务立刻成为列表选中项
+        # 任务落在哪个空间，工作区就指到哪（+ → 默认空间 / 右键 → 该空间），
+        # 文件工具和底栏 chip 与任务归属保持一致（截图反馈：重新指向就可以）
+        self._sync_workspace_to_task(str(session.get("workspace") or ""))
         self._clear_chat()
         self._greet()
         self._fill_sessions()

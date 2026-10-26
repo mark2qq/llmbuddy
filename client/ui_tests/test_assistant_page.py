@@ -43,7 +43,8 @@ from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
                                QInputDialog, QLabel, QPushButton, QMessageBox)
 from ui.widgets.assistant_cards import ChatBubble  # noqa: E402
-from ui.pages.assistant_page import _ellipsis, parse_mcp_json  # noqa: E402
+from ui.pages.assistant_page import (_ellipsis, _norm_ws,  # noqa: E402
+                                     parse_mcp_json)
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -1026,6 +1027,69 @@ def test_new_task_in_space_passes_workspace(page, tmp_path):
     assert _pump(lambda: fake.created == before + 1)
     assert fake.created_ws == str(ws)
     assert _pump(lambda: str(p._state.get("workspace") or "").endswith("ws1"))
+
+
+def test_space_row_hides_task_count(page):
+    """批注：空间行末尾的任务计数（「newspace 5」的 5）不再显示。"""
+    import re
+    p, _fake = _two_tasks(page)
+    rows = [b for b in p._nav_body.findChildren(QPushButton)
+            if b.objectName() == "NavSpaceItem"]
+    assert len(rows) == 2
+    for b in rows:
+        # 计数格式是「名字 + 空格 + 数字」，名字本身带数字（ws2）不算
+        assert not re.search(r"\s\d+\s*$", b.text()), b.text()
+        assert ("ws1" in b.text()) or ("ws2" in b.text())
+
+
+def test_new_session_button_creates_in_default_workspace(page, tmp_path):
+    """左栏 + / 清单中心「新建任务」→ 落系统默认工作区，工作区重新指过去。
+
+    批注：工作区之外新建任务默认加载到系统默认工作空间；用户手动改工作区
+    （chip 重新指向）依旧有效；自定义空间里新建走右键，落自定义空间。
+    """
+    ws = tmp_path / "def-ws"
+    ws.mkdir()
+    p, fake = page
+    p._state["workspace"] = str(ws)
+    p._state["default_workspace"] = str(ws)
+    before = fake.created
+    p._new_session()
+    assert _pump(lambda: fake.created == before + 1)
+    assert fake.created_ws == _norm_ws(str(ws))
+    # 工作区（chip / state）跟着新任务指回默认空间
+    assert _pump(lambda: os.path.normcase(
+        str(p._state.get("workspace") or "")) == os.path.normcase(str(ws)))
+
+
+def test_new_session_recreates_in_default_when_empty_task_in_other_space(page):
+    """当前空任务在别的空间时点 +：不复用，改在默认空间新建。
+
+    否则出现截图里的状态：chip 指着 newspace，点 + 一直复用那条空任务，
+    「任务 (0)」永远不变。
+    """
+    p, fake = page
+    p._session_rows = [{"id": "cur", "title": "新任务", "message_count": 0,
+                        "workspace": r"E://other-ws"}]
+    p._session_id = "cur"
+    before = fake.created
+    p._new_session()
+    assert _pump(lambda: fake.created == before + 1)
+    assert fake.created_ws == _norm_ws(p._default_ws())
+
+
+def test_state_error_silent_on_first_load(page):
+    """初始加载后端还没启动：不显示 ConnectError（批注：初始加载不要出现错误）。
+
+    拉到过 state 之后再失败，照常提示「后端未就绪」。
+    """
+    p, fake = page
+    p._state_ok = False                    # 模拟还没成功拉到过 state
+    p._on_state_error("ConnectError: [WinError 10061] 由于目标计算机积极拒绝")
+    assert p._status.text() == ""
+    p._apply_state(fake.state())           # 之后拉到 state，再失败才报错
+    p._on_state_error("ConnectError: again")
+    assert "后端未就绪" in p._status.text()
 
 
 def test_open_task_switches_workspace_to_its_space(page, monkeypatch, tmp_path):

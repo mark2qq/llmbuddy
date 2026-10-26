@@ -372,7 +372,9 @@ def main() -> None:
         reply = QMessageBox.question(
             win, "启动本地服务",
             f"本地大模型服务尚未运行，是否现在启动？\n\n{detail}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            # 默认选「是」（用户反馈）：回车直接启动，不用再点一次
+            QMessageBox.StandardButton.Yes)
         _startup_log("user reply=%s" % reply)
         if reply == QMessageBox.StandardButton.Yes:
             launcher.start()
