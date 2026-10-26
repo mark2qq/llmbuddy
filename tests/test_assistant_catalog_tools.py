@@ -955,3 +955,119 @@ def test_profiles_roundtrip(env):
         {"profiles": [{"id": "nope"}]}))["code"] == 2002
     assert asyncio.run(api.put_profiles(
         {"profiles": [{"id": "code-read", "priority": "high"}]}))["code"] == 2002
+
+
+# ---------------------------------------------------------------------------
+# web_fetch 出网必须走 catalog 同源代理（防 R-F1：trust_env=True 在本机=全失败）
+# ---------------------------------------------------------------------------
+def test_web_fetch_uses_catalog_proxy(monkeypatch):
+    """web_fetch 不得再依赖环境变量：必须 trust_env=False + 显式 proxy。
+
+    背景：本机代理不在环境变量里，旧实现 trust_env=True 导致 api.github.com
+    等全部请求失败（用户截图里的「访问网络 … 失败」×6 + 撞 12 次上限）。
+    """
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = "hello"
+        url = "https://api.github.com/repos/x/y"
+
+    class _Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url):
+            captured["url"] = url
+            return _Resp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", _Client)
+    reg = ToolRegistry(workspace=os.getcwd())
+    out = reg.call("web_fetch", {"url": "https://api.github.com/repos/x/y"})
+
+    assert out.ok and out.content == "hello"
+    assert captured["trust_env"] is False
+    assert captured["proxy"] == catalog_mod._proxy()
+    assert captured["url"] == "https://api.github.com/repos/x/y"
+    # 代理解析优先级：env 优先于默认值
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
+    assert catalog_mod._proxy() == "http://127.0.0.1:9999"
+
+
+def test_web_fetch_error_reports_proxy(monkeypatch):
+    """请求失败时报错里必须带代理值，便于用户自查（不静默直连）。"""
+    import httpx
+
+    def _boom(**kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(httpx, "Client", _boom)
+    reg = ToolRegistry(workspace=os.getcwd())
+    out = reg.call("web_fetch", {"url": "https://example.com"})
+    assert not out.ok
+    assert "代理" in out.error and catalog_mod._proxy() in out.error
+
+
+# ---------------------------------------------------------------------------
+# web_fetch 出网必须走 catalog 同源代理（防 R-F1：trust_env=True 在本机=全失败）
+# ---------------------------------------------------------------------------
+def test_web_fetch_uses_catalog_proxy(monkeypatch):
+    """web_fetch 不得再依赖环境变量：必须 trust_env=False + 显式 proxy。
+
+    背景：本机代理不在环境变量里，旧实现 trust_env=True 导致 api.github.com
+    等全部请求失败（用户截图里的「访问网络 … 失败」×6 + 撞 12 次上限）。
+    """
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = "hello"
+        url = "https://api.github.com/repos/x/y"
+
+    class _Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url):
+            captured["url"] = url
+            return _Resp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", _Client)
+    reg = ToolRegistry(workspace=os.getcwd())
+    out = reg.call("web_fetch", {"url": "https://api.github.com/repos/x/y"})
+
+    assert out.ok and out.content == "hello"
+    assert captured["trust_env"] is False
+    assert captured["proxy"] == catalog_mod._proxy()
+    assert captured["url"] == "https://api.github.com/repos/x/y"
+    # 代理解析优先级：env 优先于默认值
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
+    assert catalog_mod._proxy() == "http://127.0.0.1:9999"
+
+
+def test_web_fetch_error_reports_proxy(monkeypatch):
+    """请求失败时报错里必须带代理值，便于用户自查（不静默直连）。"""
+    import httpx
+
+    def _boom(**kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(httpx, "Client", _boom)
+    reg = ToolRegistry(workspace=os.getcwd())
+    out = reg.call("web_fetch", {"url": "https://example.com"})
+    assert not out.ok
+    assert "代理" in out.error and catalog_mod._proxy() in out.error

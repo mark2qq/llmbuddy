@@ -661,13 +661,17 @@ class ToolRegistry:
         if not url.startswith(("http://", "https://")):
             return ToolResult(False, error="仅支持 http/https URL")
         max_chars = max(500, min(int(args.get("max_chars") or 8000), 40000))
+        # 代理与 catalog 同源（cfg.catalog.proxy > env > 127.0.0.1:7897）：
+        # trust_env=True 只读环境变量，而本机代理常不在环境变量里 → 出网全失败。
+        from core.assistant.catalog import _proxy
+        proxy = _proxy()
         try:
             with httpx.Client(follow_redirects=True, timeout=25.0,
-                              trust_env=True,
+                              trust_env=False, proxy=proxy or None,
                               headers={"User-Agent": "llmBuddy-Assistant/1.0"}) as c:
                 r = c.get(url)
         except Exception as e:
-            return ToolResult(False, error=f"请求失败：{e}")
+            return ToolResult(False, error=f"请求失败（代理：{proxy or '无'}）：{e}")
         text = r.text or ""
         # 极简 HTML -> 文本（去掉 script/style/标签，压缩空行）
         import re
