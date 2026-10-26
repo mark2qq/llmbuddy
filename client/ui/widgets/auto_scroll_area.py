@@ -40,6 +40,16 @@ class AutoHideScrollArea(QScrollArea):
 
         self._syncing = False
 
+        # 横向：只允许 0。
+        #
+        # 内容列比视口宽时（历史上有卡片的不可折行标题把最小宽度顶出去），
+        # 隐藏的横向滚动条仍会有 0..N 的量程；任何一个子控件拿到焦点、
+        # 或触控板横滑，Qt 都会 ensureVisible 把它横向滚进去 → **整个内容列
+        # 左移，所有行首文字被裁掉**（用户反馈截图：「ob 查找 …」行首没了）。
+        # 这里的界面永远不需要横向滚动，所以直接钉死在 0。
+        self._hbar = self.horizontalScrollBar()
+        self._hbar.valueChanged.connect(self._keep_left)
+
         # 内部（隐藏的）纵向滚动条：唯一事实来源
         self._inner = self.verticalScrollBar()
         self._inner.rangeChanged.connect(self._on_range_changed)
@@ -116,6 +126,11 @@ class AutoHideScrollArea(QScrollArea):
             self._hide_now()
             return
         self._bar.hide()
+
+    def _keep_left(self, value: int) -> None:
+        """横向位置恒为 0（内容列不允许被横向滚走）。"""
+        if value:
+            self._hbar.setValue(0)
 
     def _on_range_changed(self, _minimum: int, _maximum: int) -> None:
         # 内容/高度变化：需要滚动就短暂浮出提示，不需要就彻底隐藏

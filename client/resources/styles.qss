@@ -995,13 +995,15 @@ QComboBox#Pill QAbstractItemView { font-size: 12px; padding: 2px; }
     font-size: 11px;
     padding: 6px 0 2px 0;
 }
+/* 上下文占用（输入条右侧的自绘小圆环，见 widgets/context_meter.py）
+ * 这里的 color 只作为圆环的颜色来源（palette WindowText，深浅主题自动跟随）；
+ * ≥70% 的告警色在控件内部绘制，不再用 hot 属性。 */
 #CtxMeter {
     color: #7d8596;
     background: transparent;
     border: none;
     font-size: 11px;
 }
-#CtxMeter[hot="true"] { color: #f0b862; }
 
 /* ================================================================
  * 1.0.11 字号档位（2026-10-26，用户反馈「字体太小，参考 workbuddy」）
@@ -1028,8 +1030,8 @@ QComboBox#Pill QAbstractItemView { font-size: 12px; padding: 2px; }
 #NavSpaceItem { font-size: 13px; }
 #NavEmpty { font-size: 12px; }
 
-/* 对话区：气泡正文 15px（原来 13px），行距靠 padding 补 */
-#UserBubble, #BotBubble { font-size: 15px; }
+/* 对话区：气泡正文 14px（15px 反馈偏大，回落一号）、行距靠 padding 补 */
+#UserBubble, #BotBubble { font-size: 14px; }
 #UserBubble { padding: 9px 13px; }
 #BotBubble { padding: 11px 13px; }
 #StepLine { font-size: 12px; }

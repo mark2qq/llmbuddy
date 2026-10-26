@@ -194,3 +194,20 @@ def test_loaded_models_list_also_autohides():
     page = _make_page(1080, 780)
     assert isinstance(page._loaded_scroll, AutoHideScrollArea)
     assert page._loaded_scroll.overlay_visible() is False
+
+
+def test_horizontal_scroll_pinned_to_zero():
+    """横向永不滚走（内容列比视口宽时，行首文字会被裁掉的根因）。"""
+    area = AutoHideScrollArea()
+    inner = QWidget()
+    inner.setMinimumWidth(3000)
+    area.setWidget(inner)
+    area.resize(320, 240)
+    area.show()
+    app.processEvents()
+    hbar = area.horizontalScrollBar()
+    assert hbar.maximum() > 0            # 确实溢出了
+    hbar.setValue(hbar.maximum())        # 模拟触控板横滑 / 焦点 ensureVisible
+    app.processEvents()
+    assert hbar.value() == 0             # 被钉回 0：内容列不会左移
+    area.close()

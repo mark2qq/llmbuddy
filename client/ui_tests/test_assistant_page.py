@@ -1635,9 +1635,12 @@ def test_queue_row_edit_calls_rest(page):
     assert _pump(lambda: fake.updated ==
                  [(p._session_id, "q0", "改过的消息")])
     # 保存后快照拉回：文本已更新（单一事实来源）
-    assert _pump(lambda: p._queue_rows["q0"]._full_text == "改过的消息")
+    # 注意：在途的旧快照可能刚好在这两条语句之间落地把行清掉（历史 flaky），
+    # 断言走 .get()，兜底复用原 row 控件（它的事件连接与文本还在）
+    assert _pump(lambda: (p._queue_rows.get("q0") is not None and
+                          p._queue_rows["q0"]._full_text == "改过的消息"))
     # 取消编辑不发请求
-    row2 = p._queue_rows["q0"]
+    row2 = p._queue_rows.get("q0") or row
     row2.begin_edit()
     row2.cancel_edit()
     assert fake.updated == [(p._session_id, "q0", "改过的消息")]
@@ -2147,21 +2150,31 @@ def test_enqueue_with_image_keeps_path_in_text(page):
 # 1.0.11：上下文占用 + 「上下文已压缩」提示
 # ---------------------------------------------------------------------------
 def test_context_event_updates_meter(page):
-    """后端每轮上报的使用量 → 底部「上下文 33% · 2.6k/8k」。"""
+    """后端每轮上报的使用量 → 输入条右侧小圆环「33%」，明细进 tooltip。"""
     p, _fake = page
     p._apply_context({"used": 2640, "limit": 8000, "ratio": 0.33,
                       "compressed": False})
-    text = p._ctx_label.text()
-    assert "上下文" in text and "33%" in text
-    assert "2.6k" in text and "8.0k" in text
+    m = p._ctx_meter
+    assert (not m.isHidden()) and m.pct == 33
+    tip = m.toolTip()
+    assert "上下文 33%" in tip
+    assert "2.6k" in tip and "8.0k" in tip
 
 
 def test_context_meter_marks_hot_when_near_full(page):
     p, _fake = page
     p._apply_context({"used": 7000, "limit": 8000, "ratio": 0.875})
-    assert bool(p._ctx_label.property("hot")) is True
+    assert p._ctx_meter.is_hot() is True
     p._apply_context({"used": 800, "limit": 8000, "ratio": 0.1})
-    assert bool(p._ctx_label.property("hot")) is False
+    assert p._ctx_meter.is_hot() is False
+
+
+def test_context_meter_hidden_without_data(page):
+    """没有 usage 时不占底栏宽度（底栏宽度有门禁）。"""
+    p, _fake = page
+    p._apply_context({"used": 0, "limit": 0})
+    assert p._ctx_meter.isHidden()
+    assert p._ctx_meter.pct is None
 
 
 def test_context_compressed_event_renders_line(page):
@@ -2192,7 +2205,7 @@ def test_context_usage_shown_when_loading_old_session(page):
                      {"role": "assistant", "content": "在"}],
         "context_usage": {"used": 1200, "limit": 8192, "ratio": 0.15,
                           "compressed": False}})
-    assert "15%" in p._ctx_label.text()
+    assert p._ctx_meter.pct == 15
 
 
 def test_history_renders_pasted_image_thumbs(page):
@@ -2254,11 +2267,11 @@ def test_force_scroll_bottom_after_send(page):
 # 1.0.11：字号档位（参考 WorkBuddy）
 # ---------------------------------------------------------------------------
 def test_assistant_fonts_are_scaled_up():
-    """正文 15px / 步骤行 12px：字号档位段必须存在且生效于助理界面选择器。"""
+    """气泡 14px / 步骤行 12px：字号档位段必须存在且生效于助理界面选择器。"""
     from core.theme import read_base_stylesheet
 
     qss = read_base_stylesheet()
-    assert "#UserBubble, #BotBubble { font-size: 15px; }" in qss
+    assert "#UserBubble, #BotBubble { font-size: 14px; }" in qss
     assert "#StepLine { font-size: 12px; }" in qss
     assert "#NavButton { font-size: 15px; }" in qss
     assert "#Composer QTextEdit#ComposerInput" in qss
@@ -2298,3 +2311,46 @@ def test_queue_snapshot_from_other_session_is_dropped(page):
     p._on_event({"type": "queue", "items": _queue_items(2), "paused": False})
     p._on_queue_fetched({"items": []}, p._queue_seq, "another-session")
     assert set(p._queue_rows) == {"q0", "q1"}
+
+
+# ---------------------------------------------------------------------------
+# 1.0.11 修复：工具卡片长标题不得把内容列顶到视口之外
+# ---------------------------------------------------------------------------
+def test_long_tool_card_head_does_not_overflow_column(page):
+    """长标题必须省略显示。
+
+    缺陷（用户截图）：卡片标题是不可折行、不可压缩的 QLabel，最小宽度直接
+    决定内容列最小宽度。标题一长，内容列就比视口宽 → 对话区出现横向溢出，
+    被滚走后**所有行首文字**都被裁掉（截图里「ob 查找 …」）。
+    """
+    p, _fake = page
+    p.resize(720, 680)
+    p._show_thread = None
+    long_summary = ("查找 **/ppt-master/workflows/routing.md（在 12 个目录里递归"
+                    "匹配，命中 3 处，已按修改时间排序）")
+    for i in range(3):
+        p._on_event({"type": "tool_call", "name": "fs_glob",
+                     "summary": long_summary, "risk": "low",
+                     "args": {}, "index": i})
+    _pump(lambda: False, 0.2)
+    from PySide6.QtWidgets import QSizePolicy
+
+    from ui.widgets.assistant_cards import ToolCard
+    cards = p.findChildren(ToolCard)
+    assert cards
+    card = cards[0]
+    # ① 标题可压缩：水平策略必须是 Ignored（Preferred 会把卡片最小宽度顶到全宽）
+    assert card.head_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
+    assert card.head_label.fullText().startswith("工具 · fs_glob")
+    # ② 压窄后真的省略（不全称铺开）
+    card.resize(320, 60)
+    _pump(lambda: False, 0.2)
+    shown = card.head_label.text()
+    assert shown != card.head_label.fullText()
+    assert shown.endswith("…")
+    # ③ 卡片最小宽度不再由标题全称决定
+    assert card.minimumSizeHint().width() < 400
+    # ④ 内容列不超出视口 → 横向量程为 0 → 不可能被横向滚走
+    assert p._col.minimumSizeHint().width() <= max(
+        p._scroll.viewport().width(), 1)
+    assert p._scroll.horizontalScrollBar().maximum() == 0

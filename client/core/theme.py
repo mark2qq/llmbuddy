@@ -423,7 +423,6 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #AttachDel:hover { color: #c02a55; }
 #ContextLine, #CtxMeter { color: #6b7385; }
 #ContextLine { border-top: 1px dashed #d5dbe7; }
-#CtxMeter[hot="true"] { color: #9a6a12; }
 """
 
 

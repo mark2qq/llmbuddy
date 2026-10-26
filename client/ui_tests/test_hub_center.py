@@ -1149,3 +1149,30 @@ def test_refresh_tools_failure_resets_button(page):
         dlg.close()
         dlg.deleteLater()
         _settle()
+
+
+def test_bottom_bar_fits_with_context_meter(page):
+    """上下文圆环显示 + 忙碌态全按钮：底栏仍不超可用宽度。
+
+    1.0.11 把「上下文 6% · 453/8.2k」从输入框下方小字改成输入条右侧的图标
+    （圆环，数字进 tooltip），会真的占底栏宽度，所以要在最挤的组合下验一遍。
+
+    宽度基准取**真实最窄面板**：主窗口最小宽 1000 - 左栏 200 - 页面边距 ≈ 770，
+    而不是老的 720px 门禁（那是按 720 逻辑高推的保守场景，实际窗口到不了）。
+    另外钉一个「图标宽度 ≤ 22px」的上限：一旦有人往圆环里塞文字就会先在这里失败。
+    """
+    p, _fake = page
+    p.resize(770, 680)
+    p._skill_slugs = []
+    p._refresh_skill_chips()
+    p._apply_context({"used": 7000, "limit": 8000, "ratio": 0.875})
+    p._busy_lbl.setVisible(True)
+    p._stop_btn.setVisible(True)
+    p._guide_btn.setVisible(True)
+    _settle()
+    assert p._ctx_meter.is_hot() is True
+    assert not p._ctx_meter.isHidden()
+    assert p._ctx_meter.width() <= 22, "上下文圆环只能是图标（文字请放 tooltip）"
+    w = _bar_width(p)
+    avail = p._composer.width() - 16      # 减去 composer 左右内边距
+    assert w <= avail, f"带上下文圆环的忙碌态底栏 {w}px 超可用宽 {avail}px"

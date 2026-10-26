@@ -214,8 +214,8 @@ class StepLine(QWidget):
         self.label.setWordWrap(True)
         self.label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         # 长句必须按可用宽度折行：默认 Preferred 会让 QLabel 在布局里被压成
-        # 一窄条，改 Expanded 让它吃满内容列宽度
-        self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        # 一窄条，改 Ignored 让它吃满内容列宽度、同时不把最小宽度顶出去
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         lay.addWidget(self.label, 1)
 
     def set_text(self, text: str) -> None:
@@ -255,6 +255,48 @@ class AutoLoadPrompt(QWidget):
         self.step.set_text(text)
 
 
+class ElidedLabel(QLabel):
+    """单行标签：超宽时按可用宽度省略（`Qt.ElideRight`），全称进 tooltip。
+
+    为什么要这么个类：不折行、不可压缩的 QLabel 会把所在卡片的最小宽度撑到
+    文本全宽；卡片一旦比视口宽，对话区就出现横向溢出，被横向滚走后**所有行
+    的行首文字**都会被裁掉（用户反馈截图：整列只剩「ob 查找 …」）。
+    `Ignored` 策略允许它被压窄，`resizeEvent` 里重新省略，全称仍可看 tooltip。
+    """
+
+    def __init__(self, text: str = "", parent=None,
+                 mode: Qt.TextElideMode = Qt.ElideRight):
+        super().__init__("", parent)
+        self.setTextFormat(Qt.PlainText)
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._mode = mode
+        self._full = ""
+        self.setFullText(text)
+
+    def setFullText(self, text: str) -> None:
+        """设置全称（显示的可能是省略后的文本，`text()` 返回显示值）。"""
+        self._full = str(text or "")
+        self.setToolTip(self._full)
+        self._refresh()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def _refresh(self) -> None:
+        fm = self.fontMetrics()
+        avail = self.width() - 2
+        # 宽度还是布局初始值（0/100）时先用全称顶着，resizeEvent 会重算
+        text = self._full if avail <= 8 else fm.elidedText(
+            self._full, self._mode, avail)
+        if text != super().text():      # 防 setText → relayout → resize 循环
+            super().setText(text)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt 命名
+        super().resizeEvent(event)
+        self._refresh()
+
+
 class _Collapsible(QFrame):
     """可折叠卡片基类：标题行点击展开/收起。"""
 
@@ -268,7 +310,8 @@ class _Collapsible(QFrame):
 
         head = QHBoxLayout()
         head.setSpacing(8)
-        self.head_label = QLabel(title)
+        # 超宽省略（中间省略：保住「工具 · fs_glob」开头和「· 完成」结尾）
+        self.head_label = ElidedLabel(title, mode=Qt.ElideMiddle)
         self.head_label.setObjectName("CardHead")
         self.head_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         head.addWidget(self.head_label, 1)
@@ -282,9 +325,18 @@ class _Collapsible(QFrame):
         self.body = QLabel("")
         self.body.setObjectName("CardBody")
         self.body.setWordWrap(True)
+        # WordWrap 的 QLabel 最小宽度 = 最长「词」宽度，长路径/长 JSON 会顶爆列宽
+        self.body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.body.setVisible(False)
         outer.addWidget(self.body)
+
+    # ------------------------------------------------------------------ #
+    # 标题：超宽省略（不撑宽卡片）
+    # ------------------------------------------------------------------ #
+    def set_head(self, text: str) -> None:
+        """设置标题全称（内部按当前宽度省略显示，全称进 tooltip）。"""
+        self.head_label.setFullText(text)
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
@@ -316,8 +368,7 @@ class ToolCard(_Collapsible):
     def _render(self) -> None:
         state = "运行中…" if self._result is None else (
             "完成" if self._result[0] else "失败")
-        self.head_label.setText(
-            f"工具 · {self._name}   {self._summary}   · {state}")
+        self.set_head(f"工具 · {self._name}   {self._summary}   · {state}")
         detail = []
         if self._args:
             detail.append("参数：\n" + _short_json(self._args))
@@ -425,7 +476,8 @@ class ThinkingBlock(QWidget):
         self.body.setObjectName("ThinkingBody")
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        # Ignored：避免「最长词」（长英文/路径/代码行）把整列最小宽度顶爆
+        self.body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
         lay.addWidget(self.body)
 
         self._timer = QTimer(self)

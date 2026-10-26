@@ -60,6 +60,7 @@ from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
                                         StepLine, ThinkingBlock, ToolCard)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
+from ui.widgets.context_meter import ContextMeter
 from ui.widgets.image_composer import (IMAGE_EXTS, AttachmentBar, PasteImageEdit,
                                        save_image)
 #: 在线目录徽标文案的单一来源在在线窗口模块（两边共用一套，避免文案漂移）
@@ -449,16 +450,10 @@ class AssistantPage(QWidget):
 
         il.addWidget(self._build_composer())
 
-        # 合规提示行：左侧顺带显示上下文占用（WorkBuddy 风格的一行小字）
+        # 合规提示行（上下文占用已挪进输入条右侧，见 _build_composer）
         meta = QHBoxLayout()
         meta.setContentsMargins(6, 0, 6, 0)
         meta.setSpacing(6)
-        self._ctx_label = QLabel("")
-        self._ctx_label.setObjectName("CtxMeter")
-        self._ctx_label.setToolTip(
-            "当前任务的上下文占用。接近上限时会自动把较早的对话压成摘要"
-            "（原始消息仍保留在本机任务记录里），压缩发生时会在这行上方提示")
-        meta.addWidget(self._ctx_label, 0)
         meta.addStretch(1)
         tip = QLabel("内容由 AI 生成，请核实重要信息")
         tip.setObjectName("ComposerTip")
@@ -642,7 +637,16 @@ class AssistantPage(QWidget):
 
         bar.addStretch(1)
 
-        # 右：运行指示 / 模型 / 发送
+        # 右：上下文占用 / 运行指示 / 模型 / 发送
+        #
+        # 上下文占用（1.0.11 再调）：原来是输入框下面单独一行小字
+        # 「上下文 6% · 453/8.2k」，占高度、且挤压合规提示。按 WorkBuddy
+        # 的位置挪到最后一行右组的最前面，**只用一个圆环图标**表示占用比例，
+        # 具体数字（百分比 / 已用 / 上限）走 tooltip。无数据时 setVisible(False)，
+        # 不凭空占底栏宽度（底栏有 BAR_BUDGET_W 宽度门禁）。
+        self._ctx_meter = ContextMeter()
+        bar.addWidget(self._ctx_meter, 0, Qt.AlignVCenter)
+
         self._busy_lbl = QLabel("")
         self._busy_lbl.setObjectName("BusyDot")
         self._busy_lbl.setFixedWidth(16)
@@ -3415,13 +3419,13 @@ class AssistantPage(QWidget):
         return f"{v / 1000:.1f}k" if v >= 1000 else str(v)
 
     def _apply_context(self, ev: Dict[str, Any]) -> None:
-        """更新底部「上下文 32% · 2.6k/8k」，压缩时插入一行分隔提示。
+        """更新输入条右侧的上下文小圆环，压缩时插入一行分隔提示。
 
         事件来源：后端每轮开始发的 `context`，以及会话详情的 `context_usage`
         （切到旧任务也能显示，不必等下次发言）。
         """
-        lbl = getattr(self, "_ctx_label", None)
-        if lbl is None:
+        meter = getattr(self, "_ctx_meter", None)
+        if meter is None:
             return
         try:
             used = int(ev.get("used") or 0)
@@ -3429,17 +3433,9 @@ class AssistantPage(QWidget):
         except (TypeError, ValueError):
             used = limit = 0
         if limit <= 0:
-            lbl.setText("")
-            lbl.setVisible(True)
+            meter.clear()
             return
-        pct = max(0, min(100, int(round(used * 100.0 / limit))))
-        lbl.setText(f"上下文 {pct}% · {self._fmt_tokens(used)}/"
-                    f"{self._fmt_tokens(limit)}")
-        hot = pct >= 70
-        if bool(lbl.property("hot")) != hot:
-            lbl.setProperty("hot", hot)
-            lbl.style().unpolish(lbl)
-            lbl.style().polish(lbl)
+        meter.set_usage(used, limit)
         if ev.get("compressed") and "folded" in ev:
             # 只有真正的压缩事件才插提示行：`context_usage`（切旧任务时的
             # 摘要统计）也带 compressed=True，这里再插就重复了
@@ -3501,12 +3497,8 @@ class AssistantPage(QWidget):
         self._follow = True
         # 新任务：待发送的图片与上下文占用都不再属于这个任务
         self._reset_attachments()
-        if getattr(self, "_ctx_label", None) is not None:
-            self._ctx_label.setText("")
-            if bool(self._ctx_label.property("hot")):
-                self._ctx_label.setProperty("hot", False)
-                self._ctx_label.style().unpolish(self._ctx_label)
-                self._ctx_label.style().polish(self._ctx_label)
+        if getattr(self, "_ctx_meter", None) is not None:
+            self._ctx_meter.clear()
         # 自动加载提示的去重表跟着对话清空（换任务重新提示一次）
         self._auto_tips.clear()
         # 队列面板跟随任务重置（新任务的快照由 _fetch_queue 拉回）
