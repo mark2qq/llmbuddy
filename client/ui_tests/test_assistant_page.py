@@ -1885,3 +1885,36 @@ def test_tool_list_fit_does_not_crash_without_dialog(page):
     p, _fake = page
     p._fill_tools(p._state.get("tools") or [])
     p._fit_tools_list()      # 不应抛异常
+
+
+def test_siliconflow_key_sync_only_once(page):
+    """1.0.9 修复 PUT settings 死循环：state 接口不下发 api_key（后端脱敏），
+    所以 `not provider["api_key"]` 恒为真。原实现每次 `_fill_models("siliconflow")`
+    都回写对话页 Key，而回写成功后又 refresh() → _apply_state → _fill_models，
+    形成每 ~1.6s 一轮的 save→refresh 死循环（审计日志被 providers 条目刷满、
+    后台线程不停创建）。现在本页生命周期内只同步一次。"""
+    p, fake = page
+
+    class _StubSettings:
+        def __init__(self, data):
+            self._data = data
+
+        def value(self, key, default=None):
+            return self._data.get(key, default)
+
+    p._settings = _StubSettings({"chat/cloud_api_key": "sk-test-123",
+                                 "chat/cloud_models": "[]"})
+    p._active_provider = "siliconflow"
+    p._sf_key_synced = False
+    before = len(fake.save_calls)
+
+    for _ in range(3):                      # 模拟三轮 refresh
+        p._fill_models("siliconflow")
+        _pump(lambda: False, timeout=0.15)  # 放行 Worker
+
+    key_saves = [c for c in fake.save_calls[before:]
+                 if any(pr.get("api_key") == "sk-test-123"
+                        for pr in (c.get("providers") or [])
+                        if isinstance(pr, dict))]
+    assert len(key_saves) == 1, f"Key 回写应只发生一次，实际 {len(key_saves)} 次"
+    assert p._sf_key_synced is True

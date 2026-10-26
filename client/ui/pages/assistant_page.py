@@ -305,6 +305,13 @@ class AssistantPage(QWidget):
         self._active_model = ""
         self._skill_slugs: List[str] = []
         self._model_cache: Dict[str, List[str]] = {}
+        #: 1.0.9 修复「PUT settings 死循环」：state 接口**不下发 api_key**
+        #: （routers/assistant.py 明确注释），所以 `provider["api_key"]` 永远为空；
+        #: 原实现在 _fill_models("siliconflow") 里每次发现为空就回写对话页的 Key，
+        #: 而回写成功后 `_save_provider_patch` 又 refresh() → _apply_state →
+        #: _fill_models → 再回写……每 ~1.6s 一轮，审计日志被 providers 条目刷满、
+        #: 后台线程不停创建。改为「本页生命周期内只同步一次」。
+        self._sf_key_synced = False
         #: 1.0.8 清单中心 / 自动加载
         #: _tool_prefs: 后端 GET /tools/prefs 快照（disabled / max_tools / active）
         #: _profiles: GET /profiles 快照（auto_load / profiles）
@@ -2314,9 +2321,13 @@ class AssistantPage(QWidget):
         provider = next((p for p in (self._state.get("providers") or [])
                          if p.get("id") == provider_id), {})
         # 硅基流动：首次进入时把对话页已存的 Key 同步到助理配置，免二次输入
+        # 1.0.9：只同步一次。state 接口不下发 api_key（后端脱敏），所以这里的
+        # `not provider.get("api_key")` 恒为真；若无条件回写，会形成
+        # save → refresh → _fill_models → save 的死循环（每 ~1.6s 一轮）。
         if provider_id == "siliconflow" and not (provider.get("api_key") or ""):
             key = str(self._settings.value("chat/cloud_api_key", "") or "").strip()
-            if key:
+            if key and not self._sf_key_synced:
+                self._sf_key_synced = True      # 先置位：即使回写失败也不再重试
                 self._save_provider_patch("siliconflow", {"api_key": key})
 
         self._refresh_model_btn()
