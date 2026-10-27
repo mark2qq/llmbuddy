@@ -247,3 +247,51 @@ def _index_of(events, phase, start=0):
         if e.get("type") == "phase" and e.get("phase") == phase:
             return i
     return -1
+
+
+def test_sessions_list_reports_running_flag(env):
+    """GET /sessions 每行带 running：多任务并行的运行状态由后端权威给出。"""
+    import asyncio
+    from routers import assistant as api
+
+    ass = api.get_assistant()
+    a = ass.new_session(workspace=str(env["workspace"]))
+    b = ass.new_session(workspace=str(env["workspace"]))
+    with ass._lock:
+        ass._running[a["id"]] = True           # 模拟 A 正在跑
+    try:
+        body = asyncio.run(api.sessions(False))
+        assert body["code"] == 0
+        rows = {r["id"]: r for r in body["data"]}
+        assert rows[a["id"]]["running"] is True
+        assert rows[b["id"]]["running"] is False
+        # 同一个空间可以有多个任务，且各自独立
+        assert rows[a["id"]]["workspace"] == rows[b["id"]]["workspace"]
+        assert a["id"] != b["id"]
+    finally:
+        with ass._lock:
+            ass._running.pop(a["id"], None)
+
+
+def test_sessions_list_reports_running_flag(env):
+    """GET /sessions 每行带 running：多任务并行的运行状态由后端权威给出。"""
+    import asyncio
+    from routers import assistant as api
+
+    ass = api.get_assistant()
+    a = ass.new_session(workspace=str(env["workspace"]))
+    b = ass.new_session(workspace=str(env["workspace"]))
+    with ass._lock:
+        ass._running[a["id"]] = True           # 模拟 A 正在跑
+    try:
+        body = asyncio.run(api.sessions(False))
+        assert body["code"] == 0
+        rows = {r["id"]: r for r in body["data"]}
+        assert rows[a["id"]]["running"] is True
+        assert rows[b["id"]]["running"] is False
+        # 同一个空间可以有多个任务，且各自独立
+        assert rows[a["id"]]["workspace"] == rows[b["id"]]["workspace"]
+        assert a["id"] != b["id"]
+    finally:
+        with ass._lock:
+            ass._running.pop(a["id"], None)
