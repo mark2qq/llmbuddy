@@ -1422,26 +1422,135 @@ def test_extract_enhanced_prompt_falls_back_to_full_text():
     assert _extract_enhanced_prompt("") == ""
 
 
-def test_enhance_instr_carries_structured_contract():
-    """增强指令必须带三个小节标题与关键约束（模板单一来源 = _ENHANCE_INSTR）。"""
-    from ui.pages import assistant_page as mod
-    instr = mod._EnhanceDialog._ENHANCE_INSTR
-    for kw in ("增强版提示词", "主要改动", "待确认",
-               "不改变原任务的目标", "不得编造", "保持原意与原语言"):
-        assert kw in instr, kw
+class _FakeEnhanceStream(QObject):
+    """替身 `AssistantStream`：只记录请求，事件由用例手动 emit。"""
+
+    event = Signal(dict)
+    failed = Signal(str)
+    closed = Signal()
+
+    last = {}
+
+    def __init__(self, base_url, api_key, payload, parent=None, path=""):
+        super().__init__(parent)
+        _FakeEnhanceStream.last = {"url": base_url, "api_key": api_key,
+                                   "payload": payload, "path": path}
+        self.cancelled = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
 
 
-def test_enhance_adopt_pastes_only_prompt_body(page, monkeypatch):
-    """点「采用」只把提示词正文贴回输入框（改动表留在对话框里）。"""
+def test_enhance_prompt_streams_into_input_inline(page, monkeypatch):
+    """✨ 不弹窗：结果直接在输入框里流式长出来，结束后是增强版正文。
+
+    这是 2026-10-27 用户反馈的核心回归点——旧版弹对话框，且把 delta 用
+    `appendPlainText` 逐 token 追加，结果碎成「一\\n个\\n字\\n一\\n行」。
+    """
     from ui.pages import assistant_page as mod
-    monkeypatch.setattr(mod._EnhanceDialog, "_start", lambda self: None)
-    p, fake = page
-    p._input.setPlainText("")
-    dlg = mod._EnhanceDialog(fake, "", "", "原文", p)
-    dlg._out.setPlainText("## 一、增强版提示词\n# 任务\n写周报。\n"
-                          "## 二、主要改动\n| a | b | c |\n")
-    dlg._adopt()
+    monkeypatch.setattr(mod, "AssistantStream", _FakeEnhanceStream)
+    p, _fake = page
+    p._input.setPlainText("画一副江南水乡的图")
+    p._enhance_btn.click()
+
+    # 请求打到专用端点，且带原文
+    assert _FakeEnhanceStream.last["path"] == "/api/v1/assistant/enhance"
+    assert _FakeEnhanceStream.last["payload"]["text"] == "画一副江南水乡的图"
+    # 增强中：只读 + 按钮变取消 + 暂时不能发送
+    assert p._enhancing is True
+    assert p._input.isReadOnly() is True
+    assert p._enhance_btn.text() == "⏹"
+    assert p._send_btn.isEnabled() is False
+
+    # 思考阶段：状态行给进度，思考内容绝不写进输入框
+    p._enhance_stream.event.emit({"type": "reasoning", "text": "想一想"})
+    assert p._status.text().startswith("✨ 模型思考中")
+    assert p._input.toPlainText() == ""
+
+    # 逐 token 到达 → 累积后整体 setPlainText（不是一字一行）
+    for piece in ("# 角色\n", "你是画师。\n", "画一幅江南水乡的水墨画。"):
+        p._enhance_stream.event.emit({"type": "delta", "text": piece})
+        assert "\n\n" not in p._input.toPlainText()   # 没有按 token 换行
+    assert p._input.toPlainText() == "# 角色\n你是画师。\n画一幅江南水乡的水墨画。"
+
+    # 后端 done 以完整正文为准（比逐字拼接更可靠）
+    p._enhance_stream.event.emit({"type": "done", "text": "# 角色\n你是画师。"})
+    p._enhance_stream.closed.emit()
+    assert p._enhancing is False
+    assert p._input.toPlainText() == "# 角色\n你是画师。"
+    assert p._input.isReadOnly() is False
+    assert p._enhance_btn.text() == "✨"
+    assert p._send_btn.isEnabled() is True
+    assert "已增强" in p._status.text()
+
+
+def test_enhance_uses_current_provider_and_model(page, monkeypatch):
+    """必须用**当前选中的模型**：旧版留空 → 后端回落默认，看着就像没反应。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeEnhanceStream)
+    p, _fake = page
+    p._active_provider = "siliconflow"
+    p._active_model = "Qwen3-8B"
+    p._input.setPlainText("写个周报")
+    p._enhance_prompt()
+    payload = _FakeEnhanceStream.last["payload"]
+    assert payload["provider"] == "siliconflow"
+    assert payload["model"] == "Qwen3-8B"
+
+
+def test_enhance_cancel_restores_origin(page, monkeypatch):
+    """增强中再点 ✨（⏹）= 取消：停流并还原原文，不留半截内容。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeEnhanceStream)
+    p, _fake = page
+    p._input.setPlainText("原始提示词")
+    p._enhance_prompt()
+    stream = p._enhance_stream
+    p._enhance_stream.event.emit({"type": "delta", "text": "半截内容"})
+    assert p._input.toPlainText() == "半截内容"
+
+    p._enhance_prompt()                     # 再点一次 = 取消
+    assert stream.cancelled is True
+    assert p._enhancing is False
+    assert p._input.toPlainText() == "原始提示词"
+    assert p._enhance_btn.text() == "✨"
+    assert "已取消" in p._status.text()
+
+
+def test_enhance_failure_restores_origin(page, monkeypatch):
+    """连接失败 / 模型报错：输入框还原原文，状态行说明原因。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeEnhanceStream)
+    p, _fake = page
+    p._input.setPlainText("原始提示词")
+    p._enhance_prompt()
+    p._enhance_stream.failed.emit("HTTP 502: bad gateway")
+    assert p._enhancing is False
+    assert p._input.toPlainText() == "原始提示词"
+    assert "增强失败" in p._status.text()
+    assert p._input.isReadOnly() is False
+
+
+def test_enhance_closed_without_done_keeps_partial(page, monkeypatch):
+    """流被提前关掉：已收到的内容当成功保留，一点没收到才还原原文。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeEnhanceStream)
+    p, _fake = page
+    p._input.setPlainText("原文")
+    p._enhance_prompt()
+    p._enhance_stream.event.emit({"type": "delta", "text": "# 任务\n写周报。"})
+    p._enhance_stream.closed.emit()
     assert p._input.toPlainText() == "# 任务\n写周报。"
+
+    # 一个字节都没收到 → 还原原文，绝不留空
+    p._input.setPlainText("原文二")
+    p._enhance_prompt()
+    p._enhance_stream.closed.emit()
+    assert p._input.toPlainText() == "原文二"
+    assert "增强失败" in p._status.text()
 
 
 

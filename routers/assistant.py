@@ -52,6 +52,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core.assistant import catalog as catalog_mod
 from core.assistant import context as context_mod
+from core.assistant import enhance as enhance_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
 from core.assistant import store as store_mod
@@ -62,6 +63,7 @@ from core.assistant.mcp import MCPError, get_mcp_manager
 from core.assistant.parallel import (ERR_NOTHING_TO_RESUME, ERR_PARAM,
                                      ERR_PLAN_BUSY, ERR_PLAN_NOT_FOUND,
                                      MAX_TASKS, ParallelError, get_runner)
+from core.assistant.providers import get_provider as make_provider
 from core.assistant.queue import (ERR_GUIDED_READONLY, ERR_ITEM_DISPATCHED,
                                   ERR_ITEM_NOT_FOUND, ERR_QUEUE_EMPTY,
                                   ERR_SESSION_BUSY, EV_DEQUEUED, EV_GUIDED,
@@ -69,6 +71,7 @@ from core.assistant.queue import (ERR_GUIDED_READONLY, ERR_ITEM_DISPATCHED,
                                   QueueError, get_queue, hhmm)
 from core.assistant.store import (load_config, read_audit, save_config)
 from core.assistant.store import audit
+from core.assistant.store import get_provider as cfg_provider
 
 API_KEY = os.environ.get("LLM_API_KEY", "")
 
@@ -440,6 +443,82 @@ async def chat(body: Dict[str, Any]):
             # 防双流互踩：sink 仍是自己才注销（resume 新流会覆盖旧槽位）
             if _STREAM_SINKS.get(session_id) is q:
                 _STREAM_SINKS.pop(session_id, None)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@router.post("/enhance")
+async def enhance(body: Dict[str, Any]):
+    """✨ 增强提示词：单轮纯文本改写。
+
+    与 `/chat` 的区别（对齐 WorkBuddy 的实现方式）：**不建会话、不落库、
+    不调工具、不改标题**，只是一次 LLM 调用。客户端把输入框里的一段话
+    发过来，流式收正文，直接把结果回填输入框。
+
+    为什么必须独立端点：旧实现借道 `/chat` + 临时会话，事件要经过 agent
+    主循环与阶段闸门，正文 delta 到达慢且被前端按 token 换行；这里只做
+    「provider.chat → 转发 delta」，首字延迟就是模型的首字延迟。
+
+    请求：`{text, provider?, model?}`，provider/model 留空 → 用配置里的默认。
+    响应：SSE，事件 `type` ∈ start / delta / reasoning / reset / done / error。
+    """
+    body = body or {}
+    raw = str(body.get("text") or "")
+    if enhance_mod.is_blank(raw):
+        return fail(2002, "text 不能为空")
+    text = enhance_mod.clip(raw)
+    provider_id = str(body.get("provider") or "")
+    model = str(body.get("model") or "")
+
+    async def gen():
+        q: "asyncio.Queue" = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def emit(ev: Optional[Dict[str, Any]]) -> None:
+            loop.call_soon_threadsafe(q.put_nowait, ev)
+
+        def worker() -> None:
+            try:
+                cfg = load_config()
+                pcfg = cfg_provider(cfg, provider_id)
+                prov = make_provider(pcfg)
+                emit({"type": "start", "provider": pcfg.get("id") or "",
+                      "label": pcfg.get("label") or pcfg.get("id") or "模型",
+                      "model": model or pcfg.get("model") or ""})
+
+                def on_delta(channel: str, piece: str) -> None:
+                    if channel == "reset":
+                        emit({"type": "reset"})
+                    elif channel == "reasoning":
+                        emit({"type": "reasoning", "text": piece})
+                    else:
+                        emit({"type": "delta", "text": piece})
+
+                reply = prov.chat(
+                    enhance_mod.build_messages(text), model=model,
+                    temperature=enhance_mod.TEMPERATURE,
+                    max_tokens=enhance_mod.MAX_OUTPUT_TOKENS,
+                    on_delta=on_delta, timeout=240.0)
+                if not reply.ok:
+                    emit({"type": "error",
+                          "message": reply.error or "模型没有返回内容"})
+                else:
+                    emit({"type": "done", "text": reply.content or "",
+                          "reasoning": reply.reasoning or ""})
+            except Exception as e:  # noqa: BLE001
+                emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
+            finally:
+                emit(None)      # 结束哨兵
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            ev = await q.get()
+            if ev is None:
+                break
+            yield _sse(ev)
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

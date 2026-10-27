@@ -924,6 +924,145 @@ def test_http_prompt_rejects_empty(env):
 
 
 # ----------------------------------------------------------------------------
+# ✨ 增强提示词（2026-10-27：改为单轮纯改写 + 流式，不建会话）
+# ----------------------------------------------------------------------------
+def test_enhance_template_carries_contract():
+    """模板是单一来源（core/assistant/enhance.py），必须带六条改写要求。"""
+    from core.assistant import enhance as em
+
+    for kw in ("明确目标与范围", "补充必要上下文", "添加约束条件",
+               "规范输出格式", "去除冗余", "保持原意与原语言",
+               "不得编造", "只输出改写后的提示词正文"):
+        assert kw in em.SYSTEM_PROMPT, kw
+    # 结果要直接回填输入框：不该再要求「主要改动 / 待确认」两段小节
+    # （这两词只作为**禁止项**出现在输出要求里）
+    assert "## 二、主要改动" not in em.SYSTEM_PROMPT
+    assert "## 三、待确认" not in em.SYSTEM_PROMPT
+
+
+def test_enhance_clip_caps_input_length():
+    """超长输入截断而不是拒绝：本地小模型吃长文容易跑题/超时。"""
+    from core.assistant import enhance as em
+
+    assert em.clip("  hi  ") == "hi"
+    assert len(em.clip("字" * (em.MAX_INPUT_CHARS + 500))) == em.MAX_INPUT_CHARS
+    assert em.is_blank("   ") and not em.is_blank("x")
+
+
+def test_enhance_endpoint_streams_deltas(env, monkeypatch):
+    """POST /enhance：SSE 依次给 start → reasoning/delta → done，且用当前模型。"""
+    import asyncio
+    import json as _json
+    from routers import assistant as api
+    from core.assistant.providers import ChatReply
+
+    seen: dict = {}
+
+    class FakeProv:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def chat(self, messages, model="", on_delta=None, **kw):
+            seen["messages"] = messages
+            seen["model"] = model
+            seen["max_tokens"] = kw.get("max_tokens")
+            if on_delta:
+                on_delta("reasoning", "先想一下")
+                on_delta("content", "# 角色\n")
+                on_delta("content", "你是水墨画师。")
+            return ChatReply(content="# 角色\n你是水墨画师。")
+
+    monkeypatch.setattr(api, "make_provider", lambda cfg: FakeProv(cfg))
+
+    async def collect(body):
+        resp = await api.enhance(body)
+        chunks = []
+        async for part in resp.body_iterator:
+            chunks.append(part if isinstance(part, str) else part.decode())
+        return "".join(chunks)
+
+    raw = asyncio.run(collect({"text": "画一副江南水乡的图",
+                               "provider": "siliconflow", "model": "Qwen3-8B"}))
+    events = [_json.loads(ln[5:]) for ln in raw.splitlines()
+              if ln.startswith("data:") and "[DONE]" not in ln]
+    kinds = [e["type"] for e in events]
+    assert kinds[0] == "start"
+    assert "reasoning" in kinds and "delta" in kinds
+    assert kinds[-1] == "done"
+    assert events[-1]["text"] == "# 角色\n你是水墨画师。"
+    assert "[DONE]" in raw
+
+    # 原文进 user 段，system 段是模板；当前模型名与预算透传
+    assert seen["messages"][-1]["content"] == "画一副江南水乡的图"
+    assert "增强版提示词" in seen["messages"][0]["content"]
+    assert seen["model"] == "Qwen3-8B"
+    assert seen["max_tokens"] and seen["max_tokens"] >= 2048
+
+
+def test_enhance_endpoint_reports_provider_error(env, monkeypatch):
+    """模型报错 → SSE 里给 error（客户端据此还原原文），不是静默卡住。"""
+    import asyncio
+    import json as _json
+    from routers import assistant as api
+    from core.assistant.providers import ChatReply
+
+    class BadProv:
+        def __init__(self, cfg):
+            pass
+
+        def chat(self, messages, **kw):
+            return ChatReply(error="HTTP 401: bad key")
+
+    monkeypatch.setattr(api, "make_provider", lambda cfg: BadProv(cfg))
+
+    async def collect():
+        resp = await api.enhance({"text": "写个周报"})
+        chunks = []
+        async for part in resp.body_iterator:
+            chunks.append(part if isinstance(part, str) else part.decode())
+        return "".join(chunks)
+
+    raw = asyncio.run(collect())
+    events = [_json.loads(ln[5:]) for ln in raw.splitlines()
+              if ln.startswith("data:") and "[DONE]" not in ln]
+    err = [e for e in events if e["type"] == "error"]
+    assert err and "401" in err[0]["message"]
+
+
+def test_enhance_endpoint_rejects_empty_text(env):
+    import asyncio
+    from routers import assistant as api
+    res = asyncio.run(api.enhance({"text": "   "}))
+    assert isinstance(res, dict) and res["code"] == 2002
+
+
+def test_enhance_does_not_create_session(env, monkeypatch):
+    """纯改写：不建会话、不落库 —— 左栏不该因为点 ✨ 冒出任务。"""
+    import asyncio
+    from routers import assistant as api
+    from core.assistant import store as store_mod
+    from core.assistant.providers import ChatReply
+
+    class FakeProv:
+        def __init__(self, cfg):
+            pass
+
+        def chat(self, messages, **kw):
+            return ChatReply(content="# 任务\n写周报。")
+
+    monkeypatch.setattr(api, "make_provider", lambda cfg: FakeProv(cfg))
+    before = len(store_mod.list_sessions())
+
+    async def drain():
+        resp = await api.enhance({"text": "写周报"})
+        async for _ in resp.body_iterator:
+            pass
+
+    asyncio.run(drain())
+    assert len(store_mod.list_sessions()) == before
+
+
+# ----------------------------------------------------------------------------
 # HTTP 层
 # ----------------------------------------------------------------------------
 def test_http_state_and_tools(env):

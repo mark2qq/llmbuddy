@@ -501,144 +501,6 @@ class _PromptPicker(QDialog):
         self._load()
 
 
-class _EnhanceDialog(QDialog):
-    """✨ 用模型把当前输入改写为「增强版提示词」（临时会话，用完即删）。
-
-    输出的三段式（增强版提示词 / 主要改动 / 待确认）对齐 WorkBuddy 的写法：
-    用户既能看到改了什么，点「采用」时又只把第一段正文贴回输入框（见
-    `_extract_enhanced_prompt`），不会把改动说明一起带进去。
-    """
-
-    #: 增强指令（模板的单一来源）。要求与输出格式对齐 docs 里的「增强版提示词」规范。
-    _ENHANCE_INSTR = (
-        "你是提示词工程专家。请把用户提供的原文改写为「增强版提示词」，"
-        "只做改写与补全，不改变原任务的目标。\n\n"
-        "改写要求：\n"
-        "1. 明确目标与范围：一句话写清要达成的结果（可判定是否达成），"
-        "并界定「做什么 / 不做什么」，防止范围外扩。\n"
-        "2. 补充必要上下文：补全执行所需的角色、输入材料、已知条件、使用场景、"
-        "目标读者；原文缺失的信息用【假设】显式标注，不得编造事实、数据或来源。\n"
-        "3. 添加约束条件：篇幅、语气、必须包含的要点、禁止出现的内容、"
-        "信息不足时的处理方式。\n"
-        "4. 规范输出格式：指定交付物形态（Markdown / 表格 / JSON / 清单 / 代码块），"
-        "需要分节时给出固定的小节顺序与标题。\n"
-        "5. 去除冗余：删掉重复表述、空泛形容词、无法验证的要求，同类约束合并。\n"
-        "6. 保持原意与原语言：原文为中文则输出中文，不新增需求、不删关键条件、"
-        "不改变判断标准。\n\n"
-        "严格按以下三段输出，不要开场白、不要额外解释：\n"
-        "## 一、增强版提示词\n"
-        "直接给出可复制使用的提示词正文（Markdown 分节，不要用代码块包裹，"
-        "不要写「以下是」之类的话）。\n"
-        "## 二、主要改动\n"
-        "三列表格：维度 / 原文情况 / 增强后，3-6 行，只列实质性变化。\n"
-        "## 三、待确认\n"
-        "最多 3 条原文含糊、需用户补充才能更精准的点；没有就写「无」。\n\n"
-        "用户原文如下：\n")
-
-    def __init__(self, api, gateway_url, api_key, text, parent=None):
-        super().__init__(parent)
-        self._api = api
-        self._gateway_url = gateway_url
-        self._api_key = api_key
-        self._text = text
-        self._stream = None
-        self._temp_sid = ""
-        self.setWindowTitle("增强提示词")
-        self.setObjectName("EnhanceDialog")
-        self.setMinimumSize(560, 420)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
-        src = QPlainTextEdit(text)
-        src.setObjectName("EnhanceSrc")
-        src.setReadOnly(True)
-        src.setMaximumHeight(80)
-        self._out = QPlainTextEdit()
-        self._out.setObjectName("EnhanceOut")
-        self._out.setPlaceholderText("正在生成增强版提示词…")
-        btns = QHBoxLayout()
-        btns.setSpacing(6)
-        self._hint = QLabel("采用时只取「增强版提示词」正文")
-        self._hint.setObjectName("CtxHint")
-        self._cancel_btn = QPushButton("取消")
-        self._cancel_btn.setObjectName("BarBtn")
-        self._cancel_btn.clicked.connect(self.reject)
-        self._adopt_btn = QPushButton("采用")
-        self._adopt_btn.setObjectName("BarBtn")
-        self._adopt_btn.setEnabled(False)
-        self._adopt_btn.clicked.connect(self._adopt)
-        btns.addWidget(self._hint)
-        btns.addStretch(1)
-        btns.addWidget(self._cancel_btn)
-        btns.addWidget(self._adopt_btn)
-        lay.addWidget(QLabel("原文"))
-        lay.addWidget(src)
-        lay.addWidget(QLabel("增强后"))
-        lay.addWidget(self._out, 1)
-        lay.addLayout(btns)
-        self._start()
-
-
-    def _start(self) -> None:
-        try:
-            sess = self._api.new_session()
-            if not isinstance(sess, dict) or not sess.get("id"):
-                self._out.setPlainText("（创建增强会话失败）")
-                return
-            self._temp_sid = str(sess["id"])
-            payload = {
-                "session_id": self._temp_sid,
-                "message": self._ENHANCE_INSTR + self._text,
-                "mode": "chat", "stream": True,
-                "provider": "", "model": "",
-            }
-            from ui.pages.assistant_page import AssistantStream   # noqa: F401
-            self._stream = AssistantStream(
-                self._gateway_url, self._api_key, payload)
-            self._stream.event.connect(self._on_event)
-            self._stream.failed.connect(
-                lambda m: self._out.setPlainText(f"（增强失败：{m}）"))
-            self._stream.closed.connect(lambda: self._adopt_btn.setEnabled(True))
-            self._stream.start()
-        except Exception as e:  # noqa: BLE001
-            self._out.setPlainText(f"（增强失败：{e}）")
-
-    def _on_event(self, ev: Dict[str, Any]) -> None:
-        if not isinstance(ev, dict):
-            return
-        kind = ev.get("type")
-        if kind == "delta":
-            self._out.appendPlainText(ev.get("text") or "")
-        elif kind == "replace":
-            self._out.setPlainText(ev.get("text") or "")
-
-    def _adopt(self) -> None:
-        # 只把「一、增强版提示词」的正文贴回输入框，改动说明与待确认留在对话框里。
-        text = _extract_enhanced_prompt(self._out.toPlainText())
-        if text and isinstance(self.parent(), AssistantPage):
-            self.parent()._input.setPlainText(text)   # type: ignore[attr-defined]
-        self._cleanup()
-        self.accept()
-
-    def _cleanup(self) -> None:
-        if self._stream is not None:
-            try:
-                self._stream.cancel()
-            except Exception:  # noqa: BLE001
-                pass
-            self._stream = None
-        if self._temp_sid:
-            try:
-                self._api.delete_session(self._temp_sid)
-            except Exception:  # noqa: BLE001
-                pass
-            self._temp_sid = ""
-
-    def closeEvent(self, ev) -> None:       # noqa: N802 - Qt 回调
-        self._cleanup()
-        super().closeEvent(ev)
-
-
 def _extract_enhanced_prompt(text: str) -> str:
     """从三段式增强结果里只取出可复用的提示词正文。
 
@@ -842,6 +704,16 @@ class AssistantPage(QWidget):
         #: 底栏状态（1.0.8 界面提审）：模型来源 / 模型名 / 挂载的技能
         self._active_provider = "local"
         self._active_model = ""
+        #: ✨ 增强提示词（输入框级操作，**不属于任何任务**，所以不放 TaskRun）：
+        #:   _enhancing       正在流式增强（再点 ✨ 即取消）
+        #:   _enhance_origin  原文快照（失败/取消时原样还原，绝不丢用户输入）
+        #:   _enhance_acc     累积正文（整体 setPlainText 回填，不逐 token 追加）
+        #:   _enhance_think   思考阶段已收到的字数（仅用于状态行进度提示）
+        self._enhancing = False
+        self._enhance_origin = ""
+        self._enhance_acc = ""
+        self._enhance_think = 0
+        self._enhance_stream = None
         self._skill_slugs: List[str] = []
         self._model_cache: Dict[str, List[str]] = {}
         #: 1.0.9 修复「PUT settings 死循环」：state 接口**不下发 api_key**
@@ -1512,16 +1384,163 @@ class AssistantPage(QWidget):
         dlg.exec()
 
     def _enhance_prompt(self) -> None:
-        """✨ 用模型把当前输入框文字润色成更好的提示词（临时会话）。"""
+        """✨ 用**当前模型**把输入框内容原地改写成增强版提示词。
+
+        对齐 WorkBuddy 的实现方式（2026-10-27 用户反馈后重做）：
+
+          - **不弹窗**：结果直接在输入框里流式长出来，结束后整段替换为正文；
+          - **不建会话**：直连 `POST /api/v1/assistant/enhance`（单轮纯文本
+            改写，不落库、不调工具、不在左栏冒任务），首字延迟 = 模型首字延迟；
+          - **用当前选中的模型**：显式带上 `_active_provider` / `_active_model`，
+            不再留空让后端回落到配置默认（旧版就是这里导致「点了没反应」——
+            实际是在用另一个模型思考，界面上又什么都不显示）；
+          - 再点一次（图标变 ⏹）＝ 取消并还原原文。
+
+        旧版两个硬伤（1.0.12 及以前）：插件的 delta 用 `appendPlainText`
+        逐 token 追加 → 结果碎成「一\n个\n字\n一\n行」；且只处理
+        delta/replace，思考阶段的 `reasoning` 全被丢弃，几十秒内界面一片
+        空白，看起来就是「功能没反应」。
+        """
+        if self._enhancing:
+            self._cancel_enhance()
+            return
         text = self._input.toPlainText().strip()
         if not text:
             QMessageBox.information(
-                self, "优化提示词", "输入框是空的，先写点内容再优化吧。")
+                self, "增强提示词", "输入框是空的，先写点内容再增强吧。")
             return
-        dlg = _EnhanceDialog(
-            self._assist, self.config.gateway_url(), self.config.api_key,
-            text, self)
-        dlg.exec()
+
+        self._enhancing = True
+        self._enhance_origin = self._input.toPlainText()
+        self._enhance_acc = ""
+        self._enhance_think = 0
+        # 增强期间输入框只读：内容由流式回填，避免和用户抢同一个光标
+        self._input.setReadOnly(True)
+        self._input.setPlainText("")
+        self._input.setPlaceholderText(
+            "✨ 正在增强提示词…（模型思考中，本地小模型可能要几十秒）")
+        self._enhance_btn.setText("⏹")
+        self._enhance_btn.setToolTip("取消增强，还原原文")
+        self._send_btn.setEnabled(False)
+        self._set_status("✨ 正在增强提示词…（用当前模型；点 ⏹ 取消并还原原文）")
+
+        payload = {
+            "text": text,
+            "provider": self._active_provider or "",
+            "model": self._active_model or "",
+        }
+        stream = AssistantStream(
+            self.config.gateway_url(), self.config.api_key, payload,
+            path="/api/v1/assistant/enhance")
+        stream.event.connect(self._on_enhance_event)
+        stream.failed.connect(self._on_enhance_failed)
+        stream.closed.connect(self._on_enhance_closed)
+        self._enhance_stream = stream
+        stream.start()
+
+    # ---- ✨ 增强：流式回填输入框（输入框级状态，不属于任何任务） ----
+    def _on_enhance_event(self, ev: Dict[str, Any]) -> None:
+        if not self._enhancing or not isinstance(ev, dict):
+            return
+        kind = ev.get("type")
+        if kind == "delta":
+            self._enhance_acc += ev.get("text") or ""
+            self._render_enhance()
+        elif kind == "reset":
+            # provider 自愈（空正文放大预算重试）会先发 reset，从头再来
+            self._enhance_acc = ""
+            self._enhance_think = 0
+            self._render_enhance()
+        elif kind == "reasoning":
+            self._enhance_think += len(ev.get("text") or "")
+            self._set_status(
+                f"✨ 模型思考中…（已 {self._enhance_think} 字，正文稍后出现；"
+                "点 ⏹ 可取消）")
+        elif kind == "done":
+            final = str(ev.get("text") or "").strip() or self._enhance_acc
+            self._finish_enhance(final, "")
+        elif kind == "error":
+            self._finish_enhance("", str(ev.get("message") or "模型没有返回内容"))
+
+    def _render_enhance(self) -> None:
+        """把累积正文整体写回输入框。
+
+        **必须 `setPlainText` 而不是 `appendPlainText`**：后者的语义是「加一段
+        新段落」，逐 token 调用就会一字一行，正是用户截图里那堆碎字的来源。
+        """
+        if not self._enhancing:
+            return
+        self._input.setPlainText(self._enhance_acc)
+        self._input.moveCursor(QTextCursor.End)
+
+    def _on_enhance_failed(self, msg: str) -> None:
+        if self._enhancing:
+            self._finish_enhance("", msg or "连接失败")
+
+    def _on_enhance_closed(self) -> None:
+        self._enhance_stream = None
+        # 流结束却没收到 done/error（后端提前关流 / 网络断）：有内容就当成功，
+        # 没内容才还原原文 —— 绝不把用户原来的输入弄丢。
+        if self._enhancing:
+            acc = self._enhance_acc
+            self._finish_enhance(
+                acc, "" if acc.strip() else "连接中断，没有收到内容")
+
+    def _finish_enhance(self, text: str, error: str) -> None:
+        """收尾：成功落正文，失败还原原文。两处都关掉「增强中」的界面态。"""
+        if not self._enhancing:
+            return
+        origin = self._enhance_origin
+        self._enhancing = False
+        self._enhance_origin = ""
+        self._enhance_acc = ""
+        self._reset_enhance_ui()
+        if error:
+            self._input.setPlainText(origin)
+            self._input.moveCursor(QTextCursor.End)
+            self._set_status(f"✨ 增强失败：{error}（已还原原文）")
+            return
+        # 模型偶尔仍会带「一、增强版提示词」标题 / ``` 围栏 / 引导语，剥一次
+        body = _extract_enhanced_prompt(text or "")
+        if not body.strip():
+            self._input.setPlainText(origin)
+            self._input.moveCursor(QTextCursor.End)
+            self._set_status("✨ 模型没有返回内容（已还原原文）")
+            return
+        self._input.setPlainText(body)
+        self._input.moveCursor(QTextCursor.End)
+        self._set_status(
+            f"✨ 已增强（{len(origin.strip())} → {len(body.strip())} 字），"
+            "可直接发送或继续修改")
+
+    def _cancel_enhance(self) -> None:
+        """取消增强：停流并还原原文（用户再点一次 ✨/⏹）。"""
+        if not self._enhancing:
+            return
+        stream = self._enhance_stream
+        if stream is not None:
+            try:
+                stream.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        origin = self._enhance_origin
+        self._enhancing = False
+        self._enhance_origin = ""
+        self._enhance_acc = ""
+        self._reset_enhance_ui()
+        self._input.setPlainText(origin)
+        self._input.moveCursor(QTextCursor.End)
+        self._set_status("✨ 已取消增强（原文已还原）")
+
+    def _reset_enhance_ui(self) -> None:
+        """恢复输入框可编辑与底栏按钮 —— 成功/失败/取消三条路都必须走这里。"""
+        self._input.setReadOnly(False)
+        self._send_btn.setEnabled(True)
+        btn = getattr(self, "_enhance_btn", None)
+        if btn is not None:
+            btn.setText("✨")
+            btn.setToolTip("增强提示词：把当前输入原地改写成更清晰的提示词")
+        self._set_busy_controls()      # 恢复 placeholder 与发送按钮语义
 
     def _insert_prompt(self, text: str) -> None:
         """把所选提示词插入输入框：已有内容则换行追加。"""

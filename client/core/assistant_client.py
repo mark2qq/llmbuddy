@@ -369,18 +369,26 @@ class AssistantApi:
 
 
 class AssistantStream(QThread):
-    """一轮对话的 SSE 事件流。每个事件是一个 dict，类型见后端 agent.py。"""
+    """一轮对话的 SSE 事件流。每个事件是一个 dict，类型见后端 agent.py。
+
+    `path` 默认是对话端点；✨ 增强提示词走 `POST /api/v1/assistant/enhance`
+    （单轮纯文本改写，不建会话），复用同一条流式实现。
+    """
 
     event = Signal(dict)
     failed = Signal(str)
     closed = Signal()
 
+    #: 默认端点（对话）
+    CHAT_PATH = "/api/v1/assistant/chat"
+
     def __init__(self, base_url: str, api_key: str, payload: Dict[str, Any],
-                 parent=None):
+                 parent=None, path: str = ""):
         super().__init__(parent)
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._payload = payload
+        self._path = (path or self.CHAT_PATH)
         self._cancelled = False
         # 线程真正结束后再释放引用并销毁（在 run() 里 deleteLater 会销毁运行中的
         # QThread，同样会触发原生崩溃）
@@ -409,7 +417,7 @@ class AssistantStream(QThread):
             with httpx.Client(trust_env=False,
                               timeout=httpx.Timeout(connect=15.0, read=None,
                                                     write=30.0, pool=15.0)) as c:
-                with c.stream("POST", f"{self._base_url}/api/v1/assistant/chat",
+                with c.stream("POST", f"{self._base_url}{self._path}",
                               json=self._payload, headers=headers) as resp:
                     if resp.status_code >= 400:
                         resp.read()
