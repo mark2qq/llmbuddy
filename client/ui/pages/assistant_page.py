@@ -39,6 +39,7 @@
 """
 import json
 import os
+import re
 import time
 import tempfile
 import traceback
@@ -501,12 +502,38 @@ class _PromptPicker(QDialog):
 
 
 class _EnhanceDialog(QDialog):
-    """✨ 用模型把当前输入润色成更好的提示词（临时会话，用完即删）。"""
+    """✨ 用模型把当前输入改写为「增强版提示词」（临时会话，用完即删）。
 
+    输出的三段式（增强版提示词 / 主要改动 / 待确认）对齐 WorkBuddy 的写法：
+    用户既能看到改了什么，点「采用」时又只把第一段正文贴回输入框（见
+    `_extract_enhanced_prompt`），不会把改动说明一起带进去。
+    """
+
+    #: 增强指令（模板的单一来源）。要求与输出格式对齐 docs 里的「增强版提示词」规范。
     _ENHANCE_INSTR = (
-        "请在不改变用户原意的前提下，把下面这段用户输入优化成更清晰、更具体、"
-        "更利于大模型理解的提示词。只输出优化后的提示词本身，不要任何解释、"
-        "不要前后缀、不要引号：\n\n")
+        "你是提示词工程专家。请把用户提供的原文改写为「增强版提示词」，"
+        "只做改写与补全，不改变原任务的目标。\n\n"
+        "改写要求：\n"
+        "1. 明确目标与范围：一句话写清要达成的结果（可判定是否达成），"
+        "并界定「做什么 / 不做什么」，防止范围外扩。\n"
+        "2. 补充必要上下文：补全执行所需的角色、输入材料、已知条件、使用场景、"
+        "目标读者；原文缺失的信息用【假设】显式标注，不得编造事实、数据或来源。\n"
+        "3. 添加约束条件：篇幅、语气、必须包含的要点、禁止出现的内容、"
+        "信息不足时的处理方式。\n"
+        "4. 规范输出格式：指定交付物形态（Markdown / 表格 / JSON / 清单 / 代码块），"
+        "需要分节时给出固定的小节顺序与标题。\n"
+        "5. 去除冗余：删掉重复表述、空泛形容词、无法验证的要求，同类约束合并。\n"
+        "6. 保持原意与原语言：原文为中文则输出中文，不新增需求、不删关键条件、"
+        "不改变判断标准。\n\n"
+        "严格按以下三段输出，不要开场白、不要额外解释：\n"
+        "## 一、增强版提示词\n"
+        "直接给出可复制使用的提示词正文（Markdown 分节，不要用代码块包裹，"
+        "不要写「以下是」之类的话）。\n"
+        "## 二、主要改动\n"
+        "三列表格：维度 / 原文情况 / 增强后，3-6 行，只列实质性变化。\n"
+        "## 三、待确认\n"
+        "最多 3 条原文含糊、需用户补充才能更精准的点；没有就写「无」。\n\n"
+        "用户原文如下：\n")
 
     def __init__(self, api, gateway_url, api_key, text, parent=None):
         super().__init__(parent)
@@ -516,21 +543,23 @@ class _EnhanceDialog(QDialog):
         self._text = text
         self._stream = None
         self._temp_sid = ""
-        self.setWindowTitle("优化提示词")
+        self.setWindowTitle("增强提示词")
         self.setObjectName("EnhanceDialog")
-        self.setMinimumSize(520, 360)
+        self.setMinimumSize(560, 420)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
         src = QPlainTextEdit(text)
         src.setObjectName("EnhanceSrc")
         src.setReadOnly(True)
-        src.setMaximumHeight(90)
+        src.setMaximumHeight(80)
         self._out = QPlainTextEdit()
         self._out.setObjectName("EnhanceOut")
-        self._out.setPlaceholderText("正在生成优化后的提示词…")
+        self._out.setPlaceholderText("正在生成增强版提示词…")
         btns = QHBoxLayout()
         btns.setSpacing(6)
+        self._hint = QLabel("采用时只取「增强版提示词」正文")
+        self._hint.setObjectName("CtxHint")
         self._cancel_btn = QPushButton("取消")
         self._cancel_btn.setObjectName("BarBtn")
         self._cancel_btn.clicked.connect(self.reject)
@@ -538,21 +567,23 @@ class _EnhanceDialog(QDialog):
         self._adopt_btn.setObjectName("BarBtn")
         self._adopt_btn.setEnabled(False)
         self._adopt_btn.clicked.connect(self._adopt)
+        btns.addWidget(self._hint)
         btns.addStretch(1)
         btns.addWidget(self._cancel_btn)
         btns.addWidget(self._adopt_btn)
         lay.addWidget(QLabel("原文"))
         lay.addWidget(src)
-        lay.addWidget(QLabel("优化后"))
+        lay.addWidget(QLabel("增强后"))
         lay.addWidget(self._out, 1)
         lay.addLayout(btns)
         self._start()
+
 
     def _start(self) -> None:
         try:
             sess = self._api.new_session()
             if not isinstance(sess, dict) or not sess.get("id"):
-                self._out.setPlainText("（创建优化会话失败）")
+                self._out.setPlainText("（创建增强会话失败）")
                 return
             self._temp_sid = str(sess["id"])
             payload = {
@@ -566,11 +597,11 @@ class _EnhanceDialog(QDialog):
                 self._gateway_url, self._api_key, payload)
             self._stream.event.connect(self._on_event)
             self._stream.failed.connect(
-                lambda m: self._out.setPlainText(f"（优化失败：{m}）"))
+                lambda m: self._out.setPlainText(f"（增强失败：{m}）"))
             self._stream.closed.connect(lambda: self._adopt_btn.setEnabled(True))
             self._stream.start()
         except Exception as e:  # noqa: BLE001
-            self._out.setPlainText(f"（优化失败：{e}）")
+            self._out.setPlainText(f"（增强失败：{e}）")
 
     def _on_event(self, ev: Dict[str, Any]) -> None:
         if not isinstance(ev, dict):
@@ -582,7 +613,8 @@ class _EnhanceDialog(QDialog):
             self._out.setPlainText(ev.get("text") or "")
 
     def _adopt(self) -> None:
-        text = self._out.toPlainText().strip()
+        # 只把「一、增强版提示词」的正文贴回输入框，改动说明与待确认留在对话框里。
+        text = _extract_enhanced_prompt(self._out.toPlainText())
         if text and isinstance(self.parent(), AssistantPage):
             self.parent()._input.setPlainText(text)   # type: ignore[attr-defined]
         self._cleanup()
@@ -605,6 +637,45 @@ class _EnhanceDialog(QDialog):
     def closeEvent(self, ev) -> None:       # noqa: N802 - Qt 回调
         self._cleanup()
         super().closeEvent(ev)
+
+
+def _extract_enhanced_prompt(text: str) -> str:
+    """从三段式增强结果里只取出可复用的提示词正文。
+
+    模型输出形如「## 一、增强版提示词 / ## 二、主要改动 / ## 三、待确认」。
+    「采用」只应把第一段贴回输入框，否则改动表格会混进下一轮提问里。
+
+    容错（本地小模型经常不严格按格式走）：
+      - 找不到「增强版提示词」标题 → 原样返回全文，保证不丢内容；
+      - 顺手剥掉 ```markdown 围栏与「以下是…：」这类引导语。
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        s = ln.strip().lstrip("#").strip()
+        # 标题行：含「增强版提示词」且是短标题（避免误命中正文里的一句描述）
+        if "增强版提示词" in s and len(s) <= 24:
+            start = i + 1
+            break
+    if start is None:
+        return text
+    end = len(lines)
+    for j in range(start, len(lines)):
+        s = lines[j].strip()
+        if s.startswith("#") and ("主要改动" in s or "待确认" in s):
+            end = j
+            break
+    body = "\n".join(lines[start:end]).strip()
+    # 引导语与围栏可能互相嵌套（「以下是…：」后面才跟 ```markdown），
+    # 来回剥两轮足够，别写成死循环。
+    for _ in range(2):
+        body = re.sub(r"^(以下是|这是)[^\n]{0,24}[：:]\s*\n+", "", body).strip()
+        body = re.sub(r"^```[a-zA-Z]*\s*\n?", "", body)
+        body = re.sub(r"\n?```\s*$", "", body).strip()
+    return body or text
 
 
 def _compact_chip(btn) -> None:

@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,  # noqa: E402
                                QInputDialog, QLabel, QPushButton, QMessageBox)
 from ui.widgets.assistant_cards import ChatBubble  # noqa: E402
 from ui.pages.assistant_page import (_ellipsis, _norm_ws,  # noqa: E402
+                                     _extract_enhanced_prompt,
                                      parse_mcp_json)
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -1373,6 +1374,63 @@ def test_enhance_prompt_empty_input_shows_hint(page, monkeypatch):
     p._input.setPlainText("")
     p._enhance_prompt()
     assert _FakeMB.calls and _FakeMB.calls[-1][0] == "information"
+
+
+def test_extract_enhanced_prompt_takes_first_section_only():
+    """三段式输出 → 只取「一、增强版提示词」正文。
+
+    「采用」不能把改动表格一起贴回输入框，否则会混进下一轮提问。
+    """
+    text = ("## 一、增强版提示词\n"
+            "# 角色\n你是提示词工程专家。\n\n"
+            "## 二、主要改动\n"
+            "| 维度 | 原文情况 | 增强后 |\n|---|---|---|\n| 角色 | 未指定 | 专家 |\n\n"
+            "## 三、待确认\n无\n")
+    body = _extract_enhanced_prompt(text)
+    assert body.startswith("# 角色")
+    assert "提示词工程专家" in body
+    assert "主要改动" not in body and "待确认" not in body
+
+
+def test_extract_enhanced_prompt_strips_fence_and_leadin():
+    """模型多给 ```markdown 围栏 / 「以下是…：」引导语时也要剥干净。"""
+    text = ("## 增强版提示词\n"
+            "以下是增强后的提示词：\n"
+            "```markdown\n"
+            "# 任务\n写周报。\n"
+            "```\n"
+            "## 主要改动\n略\n")
+    assert _extract_enhanced_prompt(text) == "# 任务\n写周报。"
+
+
+def test_extract_enhanced_prompt_falls_back_to_full_text():
+    """模型不按格式输出（找不到标题）→ 原样返回全文，绝不丢内容。"""
+    raw = "帮我把这段写清楚：明天开会。"
+    assert _extract_enhanced_prompt(raw) == raw
+    assert _extract_enhanced_prompt("") == ""
+
+
+def test_enhance_instr_carries_structured_contract():
+    """增强指令必须带三个小节标题与关键约束（模板单一来源 = _ENHANCE_INSTR）。"""
+    from ui.pages import assistant_page as mod
+    instr = mod._EnhanceDialog._ENHANCE_INSTR
+    for kw in ("增强版提示词", "主要改动", "待确认",
+               "不改变原任务的目标", "不得编造", "保持原意与原语言"):
+        assert kw in instr, kw
+
+
+def test_enhance_adopt_pastes_only_prompt_body(page, monkeypatch):
+    """点「采用」只把提示词正文贴回输入框（改动表留在对话框里）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod._EnhanceDialog, "_start", lambda self: None)
+    p, fake = page
+    p._input.setPlainText("")
+    dlg = mod._EnhanceDialog(fake, "", "", "原文", p)
+    dlg._out.setPlainText("## 一、增强版提示词\n# 任务\n写周报。\n"
+                          "## 二、主要改动\n| a | b | c |\n")
+    dlg._adopt()
+    assert p._input.toPlainText() == "# 任务\n写周报。"
+
 
 
 def test_prompt_picker_inserts_into_input(page, monkeypatch):

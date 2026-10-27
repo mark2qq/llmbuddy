@@ -233,7 +233,7 @@ class Assistant:
         # 一次读盘，任务列表与空间分组共用（左栏要同时渲染「任务」和「空间」两区）
         rows = list_sessions(500)
         return {
-            "version": "1.0.11",
+            "version": "1.0.12",
             "policy": cfg.get("policy"),
             "policies": [{"id": k, "label": v} for k, v in POLICY_TEXT.items()],
             "workspace": cfg.get("workspace"),

@@ -72,9 +72,12 @@ class FakeAssistant:
     接口与 core/assistant/agent.py 的 Assistant 保持一致。
     """
 
-    def __init__(self, results=None, delay=0.0, default=None):
+    def __init__(self, results=None, delay=0.0, default=None, by_prompt=None):
         self.results = list(results or [])      # 依次取用；取完用 default
         self.default = default                  # 兜底结果（默认成功）
+        # prompt 关键字 → 结果：并发下 results 的取用顺序取决于线程调度，
+        # 想断言「第 N 个子任务失败」必须按 prompt 分流，不能靠列表顺序。
+        self.by_prompt = dict(by_prompt or {})
         self.delay = delay
         self.calls = []                          # (session_id, prompt, provider, model)
         self.stopped = []
@@ -105,7 +108,14 @@ class FakeAssistant:
                 time.sleep(self.delay)
             with self._lock:
                 idx = len(self.calls) - 1
-                res = self.results[idx] if idx < len(self.results) else self.default
+            # by_prompt 优先：按 prompt 里出现的子任务标题命中，绕开并发取用顺序
+            hit = next((k for k in self.by_prompt if k in text), None)
+            if hit is not None:
+                res = self.by_prompt[hit]
+            else:
+                with self._lock:
+                    res = (self.results[idx]
+                           if idx < len(self.results) else self.default)
             if callable(res):
                 res = res(session_id, text)
             if res is None:
@@ -248,12 +258,16 @@ def test_aggregate_reports_partial_failure(env):
 
     这里不装假模型：聚合时 provider 不可用 → 按设计降级为拼接子任务结论，
     正好验证「模型不可用也不丢信息、不编造」这条降级路径。
+
+    结果按 **prompt 里的子任务标题** 分流（`by_prompt`）：三个子任务并发跑，
+    谁先登记谁拿 results[0]，靠列表顺序断言「第 2 个失败」会在负载高时
+    偶发乱序（历史上出现过一次全量跑失败、单跑通过）。
     """
-    assistant = FakeAssistant(results=[
-        {"ok": True, "content": "A 完成"},
-        {"ok": False, "error": "文件不存在"},
-        {"ok": True, "content": "C 完成"},
-    ])
+    assistant = FakeAssistant(by_prompt={
+        "子任务1": {"ok": True, "content": "A 完成"},
+        "子任务2": {"ok": False, "error": "文件不存在"},
+        "子任务3": {"ok": True, "content": "C 完成"},
+    })
     runner = ParallelRunner(assistant)
     plan = _plan(runner, assistant)
     runner.run(plan)
