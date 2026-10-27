@@ -33,6 +33,7 @@ from core.assistant import mcp as mcp_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
 from core.assistant import tools as tools_mod
+from core.assistant import turn_phase
 from core.assistant.approval import get_approval_manager
 from core.assistant.providers import MAX_TOKENS_CAP, ProviderError, get_provider
 from core.assistant.store import (audit, delete_session, ensure_dirs, get_provider as cfg_provider,
@@ -218,7 +219,7 @@ class Assistant:
         # 一次读盘，任务列表与空间分组共用（左栏要同时渲染「任务」和「空间」两区）
         rows = list_sessions(500)
         return {
-            "version": "1.0.9",
+            "version": "1.0.10",
             "policy": cfg.get("policy"),
             "policies": [{"id": k, "label": v} for k, v in POLICY_TEXT.items()],
             "workspace": cfg.get("workspace"),
@@ -243,7 +244,7 @@ class Assistant:
             "spaces": group_spaces(rows, fallback=cfg.get("workspace") or ""),
             "pending_approvals": self._approval.list_pending(),
             "orchestrator": "langgraph" if _has_langgraph() else "sequential",
-            "running": list(k for k, v in self._running.items() if v),
+            "running": self.running_ids(),
         }
 
     def _maybe_autostart_mcp(self) -> None:
@@ -263,7 +264,13 @@ class Assistant:
     # 会话
     # ------------------------------------------------------------------ #
     def new_session(self, title: str = "", workspace: str = "") -> Dict[str, Any]:
-        """新建任务。workspace 为空时归属当前工作区（空间 = 工作区目录）。"""
+        """新建任务。workspace 为空时归属当前工作区（空间 = 工作区目录）。
+
+        任务 id 由后端生成（`s` + uuid4 前 12 位）：同一工作空间可以同时有多个
+        任务，id 全局唯一才能保证两条 SSE 流互不覆盖（客户端并发创建也不会
+        撞号）。`workspace` 是任务与空间的唯一关联字段，落库后不再改变
+        （改名/移动走 PATCH /sessions/{id}）。
+        """
         sid = "s" + uuid.uuid4().hex[:12]
         now = time.time()
         cur_ws = norm_workspace(workspace) or norm_workspace(load_config().get("workspace"))
@@ -272,6 +279,11 @@ class Assistant:
                    "workspace": cur_ws, "pinned": False, "archived": False}
         save_session(session)
         return session
+
+    def running_ids(self) -> List[str]:
+        """当前正在跑的任务 id（多任务并行下的运行状态查询）。"""
+        with self._lock:
+            return [k for k, v in self._running.items() if v]
 
     def get_session(self, sid: str) -> Optional[Dict[str, Any]]:
         return load_session(sid)
@@ -327,6 +339,11 @@ class Assistant:
         打开。**不塞 base64**：会污染历史并瞬间吃满上下文窗口。
         """
         emit = emit or (lambda ev: None)
+        # 思考/执行阶段闸门（2026-10-27）：之后所有事件都过闸门，
+        # 保证「思考 → 执行 → 再思考 → 再执行」在事件流上严格串行，
+        # 执行阶段不会冒出思考/正文事件（详见 core/assistant/turn_phase.py）。
+        gate = turn_phase.install(emit)
+        emit = gate.emit
         cfg = load_config()
         registry = self.registry()
         provider_cfg = cfg_provider(cfg, provider_id)
@@ -485,6 +502,9 @@ class Assistant:
                     emit({"type": "error", "message": error})
                     break
                 rounds += 1
+                # 阶段 boundary（第 rounds 轮思考）：前端据此新建一个思考块，
+                # 不与上一轮的工具执行行混在一起。
+                gate.enter_thinking(rounds)
                 reply = provider.chat(
                     messages, tools=schemas, model=model_name,
                     temperature=float(cfg.get("temperature") or 0.3),
@@ -576,6 +596,9 @@ class Assistant:
                 if self._cancelled(session_id):
                     emit({"type": "stopped"})
                     break
+                # 阶段 boundary（第 rounds 轮执行）：从这里到本批工具全部返回，
+                # 事件流上只有执行类事件，思考/正文一律被闸门挡住。
+                gate.enter_executing(rounds)
                 results: List[Optional[tuple]] = [None] * len(calls)
                 aborted = False
                 for start in range(0, len(calls), MAX_PARALLEL):
@@ -613,6 +636,9 @@ class Assistant:
             error = f"{type(e).__name__}: {e}"
             emit({"type": "error", "message": error})
         finally:
+            # 收尾：执行阶段缓存下来的模型事件（正常为空）在结束前补发，
+            # 绝不因为闸门丢内容
+            gate.flush()
             with self._lock:
                 self._running[session_id] = False
                 self._cancel.pop(session_id, None)

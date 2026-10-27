@@ -91,6 +91,8 @@ class _FakeAssistApi:
         self.save_error = ""      # 非空则 save_settings 抛错（模拟后端拒绝）
         self.approvals = []
         self.deleted = []
+        self.stopped = []         # 停止过哪些任务（多任务并行：只能停目标任务）
+        self.new_session_error = ""   # 非空则 new_session 抛错（模拟后端失败）
         self.created = 0
         self.created_ws = ""
         self.patches = []         # (sid, patch)：置顶/重命名/归档走这里
@@ -174,6 +176,8 @@ class _FakeAssistApi:
         return [dict(t) for t in self.tasks]
 
     def new_session(self, workspace=""):
+        if self.new_session_error:
+            raise RuntimeError(self.new_session_error)
         self.created += 1
         self.created_ws = workspace
         return {"id": "s-new", "title": "新任务",
@@ -196,6 +200,7 @@ class _FakeAssistApi:
         return patch
 
     def stop(self, sid):
+        self.stopped.append(sid)
         return {"stopped": True}
 
     # ---------------- 引导会话队列（1.0.9） ----------------
@@ -2598,3 +2603,263 @@ def test_tool_call_events_never_render_widgets(page):
     assert p._tools_used == 3
     # 内容列不超出视口 → 横向量程为 0
     assert p._scroll.horizontalScrollBar().maximum() == 0
+
+
+# ---------------------------------------------------------------------------
+# 1.0.10：同一工作空间内多任务并行（运行态按任务隔离）
+# ---------------------------------------------------------------------------
+def _run_widgets(p, sid):
+    """某个任务容器里的控件（按插入顺序）。"""
+    run = p._runs.get(sid)
+    assert run is not None, f"没有 {sid} 的运行态"
+    lay = run.layout
+    out = []
+    for i in range(lay.count()):
+        w = lay.itemAt(i).widget()
+        if w is not None:
+            out.append(w)
+    return out
+
+
+def _texts(p, sid):
+    """把任务容器里的控件压成 (类型名, 文本) 便于断言顺序。"""
+    from ui.widgets.assistant_cards import (ChatBubble, ProcessLine,
+                                            StepLine, ThinkingBlock)
+    out = []
+    for w in _run_widgets(p, sid):
+        if isinstance(w, ThinkingBlock):
+            out.append(("think", w.body.text()))
+        elif isinstance(w, ProcessLine):
+            out.append(("proc", w.head.text()))
+        elif isinstance(w, ChatBubble):
+            out.append(("bubble", w.label.text()))
+        elif isinstance(w, StepLine):
+            out.append(("step", ""))
+        else:
+            out.append((type(w).__name__, ""))
+    return out
+
+
+def test_new_task_does_not_touch_running_task(page, monkeypatch):
+    """用户在 A 任务执行中点 + 新建 B：A 的流、内容、忙碌态都不能动。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, fake = page
+    p._session_id = "A"
+    p._send_with_session({"id": "A"}, "第一条", [])
+    run_a = p._runs["A"]
+    assert run_a.busy and run_a.stream is not None
+    stream_a = run_a.stream
+    stream_a.event.emit({"type": "delta", "text": "A 正在输出的内容"})
+    assert "A 正在输出的内容" in run_a.bubble.label.text()
+
+    p._new_session()
+    assert _pump(lambda: p._session_id not in ("", "A"))
+    sid_b = p._session_id
+    # A 原样在后台跑
+    assert p._runs["A"].busy is True
+    assert p._runs["A"].stream is stream_a
+    assert "A 正在输出的内容" in p._runs["A"].bubble.label.text()
+    # 页面显示的是 B 的容器
+    assert p._scroll.widget() is p._runs[sid_b].container
+    assert p._bubble is None            # 当前任务（B）没有在写的助手气泡
+
+    # 后台事件只落到 A 自己的容器里，不串到 B
+    stream_a.event.emit({"type": "delta", "text": "，还在继续"})
+    assert "还在继续" in p._runs["A"].bubble.label.text()
+    assert not any("还在继续" in t for _k, t in _texts(p, sid_b))
+
+
+def test_switch_back_restores_background_task_live_output(page, monkeypatch):
+    """A→B→A：切回来直接接着看 A 的实时输出，不按历史重建。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    p._session_id = "A"
+    p._send_with_session({"id": "A"}, "跑起来", [])
+    p._runs["A"].stream.event.emit({"type": "delta", "text": "第一步完成"})
+    p._new_session()
+    assert _pump(lambda: p._session_id not in ("", "A"))
+    sid_b = p._session_id
+
+    p._open_task("A")
+    assert _pump(lambda: p._session_id == "A")
+    assert p._scroll.widget() is p._runs["A"].container
+    assert "第一步完成" in p._runs["A"].bubble.label.text()
+    # 切回来还能继续收流
+    p._runs["A"].stream.event.emit({"type": "delta", "text": "，第二步"})
+    assert "第二步" in p._runs["A"].bubble.label.text()
+    assert sid_b in p._runs
+
+
+def test_busy_flag_is_per_task(page, monkeypatch):
+    """B 在跑不影响 A 发送（槽位按任务算，不再全局忙碌）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    p._session_id = "A"
+    p._send_with_session({"id": "A"}, "A 的活", [])
+    assert p._available_send_slots() == 0        # A 自己在跑 → 排队
+    p._new_session()
+    assert _pump(lambda: p._session_id not in ("", "A"))
+    assert p._available_send_slots() == 1        # B 空闲 → 可以直接发
+    before = len(_FakeStream.instances)
+    p._send_with_session({"id": p._session_id}, "B 的活", [])
+    assert len(_FakeStream.instances) == before + 1
+    assert p._running_count() == 2
+
+
+def test_parallel_cap_refuses_extra_stream(page, monkeypatch):
+    """超过并行上限：不发流、给出明确提示（不静默吞消息）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, _fake = page
+    p._session_id = "A"
+    for i in range(mod.MAX_PARALLEL_RUNS):
+        r = p._new_run(f"r{i}")
+        r.busy = True
+    assert p._can_start_stream() is False
+    before = len(_FakeStream.instances)
+    p._input.setPlainText("再来一条")
+    p._on_send_clicked()
+    assert len(_FakeStream.instances) == before
+    assert str(mod.MAX_PARALLEL_RUNS) in p._status.text()
+    assert p._input.toPlainText() == "再来一条"      # 消息保留，不丢
+
+
+def test_duplicate_new_task_click_is_guarded(page):
+    """连点 + ：只建一个任务，第二次提示稍候（防并发建出空任务）。"""
+    p, fake = page
+    before = fake.created
+    p._new_session()
+    p._new_session()
+    assert "正在创建任务" in p._status.text()
+    assert _pump(lambda: fake.created == before + 1)
+    assert _pump(lambda: not p._creating)
+    # 名额已释放：可以再建
+    p._new_session()
+    assert _pump(lambda: fake.created == before + 2)
+
+
+def test_create_failure_releases_guard(page):
+    """创建失败必须放开名额，否则用户要等 20s 才能重试。"""
+    p, fake = page
+    fake.new_session_error = "后端 500"
+    before = fake.created
+    p._new_session()
+    assert _pump(lambda: "新建任务失败" in p._status.text())
+    assert p._creating == {}
+    fake.new_session_error = ""
+    p._new_session()
+    assert _pump(lambda: fake.created == before + 1)
+
+
+def test_stop_only_affects_target_task(page, monkeypatch):
+    """后台任务可以单独停（右键「停止运行」），不影响正在显示的任务。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "AssistantStream", _FakeStream)
+    p, fake = page
+    p._session_id = "A"
+    p._send_with_session({"id": "A"}, "A 的活", [])
+    p._new_session()
+    assert _pump(lambda: p._session_id not in ("", "A"))
+    sid_b = p._session_id
+    p._send_with_session({"id": sid_b}, "B 的活", [])
+    assert p._running_count() == 2
+
+    p._stop("A")
+    assert p._runs["A"].busy is False
+    assert p._runs[sid_b].busy is True
+    assert p._session_id == sid_b            # 显示的任务没变
+    assert _pump(lambda: "A" in [s for s in fake.stopped])
+
+
+def test_switch_task_keeps_queue_per_task(page, monkeypatch):
+    """队列快照按任务存：后台任务的快照不会画到当前任务的面板上。"""
+    p, _fake = page
+    p._session_id = "A"
+    p._apply_queue([{"id": "qa", "text": "A 的排队", "guided": False,
+                     "time": "10:00"}], False)
+    assert p._queue_panel.isVisibleTo(p)
+    p._session_id = "B"
+    assert p._queue_items == []              # B 自己一份空队列
+    p._on_queue_fetched({"items": [{"id": "qa", "text": "A 的排队",
+                                    "guided": False, "time": "10:00"}],
+                         "paused": False}, 99, "A")
+    assert p._queue_items == []              # A 的快照不落到 B 上
+    assert p._runs["A"].q_items[0]["id"] == "qa"
+    p._session_id = "A"
+    assert p._queue_items[0]["id"] == "qa"
+
+
+# ---------------------------------------------------------------------------
+# 1.0.10：思考区与执行区分组、排序（思考 → 执行 → 再思考 → 再执行）
+# ---------------------------------------------------------------------------
+def test_phase_events_group_thinking_and_execution(page):
+    """每轮思考独立成块：顺序必须是 思考1 → 执行1 → 思考2 → 回答。"""
+    from ui.widgets.assistant_cards import ChatBubble, ProcessLine, ThinkingBlock
+    p, _fake = page
+    p._session_id = "T"
+    p._begin_streaming()
+    ev = lambda **kw: p._on_event(kw)  # noqa: E731
+    ev(type="phase", phase="thinking", round=1)
+    ev(type="reasoning", text="第一轮：先看看目录")
+    ev(type="phase", phase="executing", round=1)
+    ev(type="tool_call", name="fs_list", args={"path": "."}, index=0)
+    ev(type="tool_result", name="fs_list", ok=True, index=0, content="a.txt")
+    ev(type="phase", phase="thinking", round=2)
+    ev(type="reasoning", text="第二轮：拿到结果了")
+    ev(type="delta", text="目录里只有一个文件")
+    _pump(lambda: False, 0.15)          # 等思考块节流刷新
+
+    kinds = [k for k, _t in _texts(p, "T")]
+    assert kinds == ["think", "proc", "think", "bubble"], kinds
+    thinks = [w for w in _run_widgets(p, "T") if isinstance(w, ThinkingBlock)]
+    assert [t.body.text() for t in thinks] == ["第一轮：先看看目录",
+                                               "第二轮：拿到结果了"]
+    procs = [w for w in _run_widgets(p, "T") if isinstance(w, ProcessLine)]
+    assert len(procs) == 1
+    bubble = next(w for w in _run_widgets(p, "T") if isinstance(w, ChatBubble))
+    assert "只有一个文件" in bubble.label.text()
+
+
+def test_tool_call_without_phase_still_starts_new_group(page):
+    """老后端没有 phase 事件：按「tool_call = 执行开始」推断，一样分组。"""
+    from ui.widgets.assistant_cards import ProcessLine, ThinkingBlock
+    p, _fake = page
+    p._session_id = "T2"
+    p._begin_streaming()
+    p._on_event({"type": "reasoning", "text": "旧后端的思考"})
+    p._on_event({"type": "tool_call", "name": "fs_read",
+                 "args": {"path": "a.txt"}, "index": 0})
+    p._on_event({"type": "tool_result", "name": "fs_read", "ok": True,
+                 "index": 0})
+    p._on_event({"type": "reasoning", "text": "执行后的思考"})
+    _pump(lambda: False, 0.15)
+    kinds = [k for k, _t in _texts(p, "T2")]
+    assert kinds == ["think", "proc", "think"], kinds
+    thinks = [w for w in _run_widgets(p, "T2") if isinstance(w, ThinkingBlock)]
+    assert thinks[0].body.text() == "旧后端的思考"
+    assert thinks[1].body.text() == "执行后的思考"
+    assert any(isinstance(w, ProcessLine) for w in _run_widgets(p, "T2"))
+
+
+def test_second_execution_round_gets_own_process_line(page):
+    """两轮工具调用 = 两行进程呈现，中间夹着第二轮思考（不合并成一行）。"""
+    from ui.widgets.assistant_cards import ProcessLine
+    p, _fake = page
+    p._session_id = "T3"
+    p._begin_streaming()
+    for rnd in (1, 2):
+        p._on_event({"type": "phase", "phase": "thinking", "round": rnd})
+        p._on_event({"type": "reasoning", "text": f"第{rnd}轮思考"})
+        p._on_event({"type": "phase", "phase": "executing", "round": rnd})
+        p._on_event({"type": "tool_call", "name": "fs_list",
+                     "args": {"path": "."}, "index": rnd})
+        p._on_event({"type": "tool_result", "name": "fs_list", "ok": True,
+                     "index": rnd})
+    _pump(lambda: False, 0.15)
+    kinds = [k for k, _t in _texts(p, "T3")]
+    assert kinds == ["think", "proc", "think", "proc"], kinds
+    assert len([w for w in _run_widgets(p, "T3")
+                if isinstance(w, ProcessLine)]) == 2

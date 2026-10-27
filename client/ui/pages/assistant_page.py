@@ -42,7 +42,9 @@ import os
 import time
 import tempfile
 import traceback
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Optional
 
 from PySide6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QDesktopServices, QIcon, QPainter,
@@ -78,6 +80,80 @@ POLICY_ICON = {"readonly_auto": "⊘", "ask_all": "✓", "yolo": "⚡"}
 #: 底栏按钮上的策略短名（宽度压缩：底栏可用 504px，完整名只在 tooltip）
 POLICY_SHORT = {"readonly_auto": "自动", "ask_all": "确认", "yolo": "放行"}
 RISK_TEXT = {"low": "只读", "medium": "写入", "high": "高危"}
+
+#: 任务运行状态（1.0.9 工作空间内多任务并行）
+TASK_IDLE = "idle"          # 空闲
+TASK_RUNNING = "running"    # 正在跑
+TASK_PAUSED = "paused"      # 队列暂停（可继续）
+TASK_ERROR = "error"        # 出错
+TASK_STOPPED = "stopped"    # 被用户停止
+
+#: 阶段（与后端 core/assistant/turn_phase.py 的常量一一对应）
+TASK_PHASE_THINKING = "thinking"      # 模型在思考 / 写正文
+TASK_PHASE_EXECUTING = "executing"    # 工具 / 技能在执行
+PHASE_TEXT = {TASK_PHASE_THINKING: "深度思考中…",
+              TASK_PHASE_EXECUTING: "正在使用工具处理…"}
+
+#: 同时允许跑几个任务（同一工作空间内并行）
+#: 本地引擎通常只有一个模型实例，开太多会互相抢显存/排队；4 个是「够用且不炸」的档位。
+MAX_PARALLEL_RUNS = 4
+#: 新建任务的防重窗口（秒）：后端挂住时不能永久卡死，超时自动放行重试
+CREATE_TIMEOUT = 20.0
+
+
+@dataclass
+class TaskRun:
+    """一个任务的独立运行态（工作空间内多任务并行的最小单元）。
+
+    为什么要「每任务一份」而不是页面级单例：
+        同一工作空间里可以同时跑多个任务，页面切换 / 新建任务时**不能**动别的
+        任务的流。新建任务只新建一个 TaskRun，旧任务继续在后台跑；
+        切到某个任务时直接把它的容器换上来（内容、滚动位置、流状态原样都在）。
+
+    关键字段分三组：
+        - 运行态：stream / busy / status / phase（后端阶段）/ gen（流代次）
+        - 界面：container / col / layout 一整块**每任务独立**的对话区，
+          外加 bubble / thinking / proc（思考块、执行行）等流内游标
+        - 队列：q_items / q_paused / q_seq（引导会话队列同样按任务隔离）
+
+    `gen`（流代次）的作用：同一任务重启流（停止后继续、重试）时旧流的迟到
+    事件必须丢掉，否则会把新流的内容冲掉。
+    """
+
+    sid: str
+    # ---------------- 运行态 ----------------
+    stream: Any = None                  # 该任务自己的 SSE 流
+    busy: bool = False
+    status: str = TASK_IDLE
+    error: str = ""
+    started_at: float = 0.0
+    last_used: float = 0.0
+    phase: str = ""                     # thinking / executing（后端 phase 事件）
+    round: int = 0
+    gen: int = 0
+    # ---------------- 界面（每任务一套） ----------------
+    container: Any = None               # 挂到 QScrollArea 上的根容器
+    col: Any = None                     # 内容列（最大 940）
+    layout: Any = None                  # 消息布局（等同于页面的 _msg_layout）
+    bubble: Any = None                  # 正在流式输出的助手气泡
+    thinking: Any = None                # 本轮正在长的那块思考
+    thinking_last: Any = None           # 最近一块（reasoning_replace 要能回填）
+    proc: Any = None                    # 本组「进程呈现」行
+    proc_steps: List[Dict[str, Any]] = field(default_factory=list)
+    tools_used: int = 0
+    approvals: Dict[str, Any] = field(default_factory=dict)
+    follow: bool = True                 # 是否贴着底部
+    scroll_pos: int = 0                 # 切走时的阅读位置
+    # ---------------- 队列（每任务一套） ----------------
+    q_items: List[Dict[str, Any]] = field(default_factory=list)
+    q_paused: bool = False
+    q_seq: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"sid": self.sid, "busy": self.busy, "status": self.status,
+                "phase": self.phase, "round": self.round, "error": self.error,
+                "started_at": self.started_at}
+
 
 # 在线目录条目的「零配置 / 需密钥 / 需注册 / 未知」徽标（PRD §5.3 判定规则）
 #   zero_config    green  默认可见
@@ -279,6 +355,8 @@ class AssistantPage(QWidget):
 
     #: 滚动合并窗口（毫秒）：流式输出时合并滚动请求，避免整屏闪动
     SCROLL_MS = 40
+    #: 同时最多保留几个「空闲任务」的界面缓存（切回来秒开；再多就从后端历史重建）
+    RUN_CACHE_MAX = 4
 
     def __init__(self, api, launcher, config, parent=None):
         super().__init__(parent)
@@ -288,25 +366,29 @@ class AssistantPage(QWidget):
         self._settings = QSettings("llmBuddy", "llmBuddy")
         self._assist = AssistantApi(config.gateway_url(), config.api_key)
 
-        self._session_id = ""
-        self._stream: Optional[AssistantStream] = None
+        # 1.0.9（2026-10-27）：工作空间内多任务并行 —— **每个任务一套独立运行态**。
+        #   _runs        sid → TaskRun（流 / 忙碌 / 界面容器 / 队列，全按任务隔离）
+        #   _active_sid  当前**显示**在页面上的任务
+        #   _cur_sid     当前**事件处理上下文**的任务（后台任务事件处理时临时切换）
+        # 关键约束：新建或切换任务不得覆盖、复用或中断别的任务的运行状态，
+        # 所以运行态不能挂在页面级字段上（页面只有一个 _stream 就会串台）。
+        # 页面上的 self._stream / self._bubble / self._busy … 都是**属性**，
+        # 代理到 _cur_sid 那个 TaskRun，天然不会串台。
+        self._runs: Dict[str, "TaskRun"] = {}
+        self._active_sid = ""
+        self._cur_sid = ""
+        # 注意：_session_id 是 _active_sid 的属性别名（见下方属性定义），
+        # 赋值即「切到那个任务」，保证「显示的任务」与「当前会话 id」永不脱节。
+        #: 新建任务防重：ws 键 → 发起时间（后端挂住时按 CREATE_TIMEOUT 自动放行）
+        self._creating: Dict[str, float] = {}
+        #: 打开任务的请求序号：慢响应不能把用户后来点的任务覆盖掉
+        self._open_seq = 0
         self._state: Dict[str, Any] = {}
-        self._bubble: Optional[ChatBubble] = None
-        self._thinking: Optional[ThinkingBlock] = None
-        #: 1.0.9：本轮已执行的工具步数（仅底栏状态提示用，不渲染卡片）
-        self._tools_used = 0
-        #: 1.0.9：进程呈现行（WorkBuddy 式聚合摘要 + 可展开明细）
-        self._proc: Optional[ProcessLine] = None
-        self._proc_steps: List[Dict[str, Any]] = []
         #: 1.0.9：忙碌期间的待生效模型切换 (label, apply_fn)；任务结束/终止后应用
         self._pending_model: Optional[tuple] = None
-        self._approvals: Dict[str, ApprovalCard] = {}
-        self._busy = False
         self._loading = False
-        # 引导会话队列（1.0.9）：_queue_items 是后端 queue 全量快照的镜像
-        # （单一事实来源，不做局部增删）；面板只在队列非空时可见、不占布局
-        self._queue_items: List[Dict[str, Any]] = []
-        self._queue_paused = False
+        # 引导会话队列（1.0.9）：快照镜像存在 TaskRun.q_items 里（单一事实来源，
+        # 不做局部增删）；面板只在队列非空时可见、不占布局
         self._queue_panel: Optional[QWidget] = None
         self._queue_head_lbl: Optional[QLabel] = None
         self._queue_clear_btn: Optional[QPushButton] = None
@@ -315,9 +397,8 @@ class AssistantPage(QWidget):
         self._queue_body_lay: Optional[QVBoxLayout] = None
         self._queue_rows: Dict[str, QueueItemRow] = {}
         # 流式输出时不要频繁重绘/滚动（用户反馈「思考时屏幕闪得厉害」）：
-        #   _follow    用户是否还贴着底部（往上翻过就别再硬拽回去）
+        #   follow       用户是否还贴着底部（按任务记，见 TaskRun.follow）
         #   _scroll_timer 合并滚动请求，SCROLL_MS 内只滚一次
-        self._follow = True
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._do_scroll_bottom)
@@ -376,6 +457,261 @@ class AssistantPage(QWidget):
         # 通过 _switch_page(0) 触发，后端就绪时 _refresh_all 也会调用 refresh()。
 
     # ------------------------------------------------------------------ #
+    # 多任务运行态（每个任务一套，页面字段全是「当前上下文任务」的代理）
+    # ------------------------------------------------------------------ #
+    def _run(self) -> "TaskRun":
+        """当前事件处理上下文的任务运行态（没有就现建一个草稿）。
+
+        草稿（sid=""）是「还没落库的新任务」：首次进页、或点了 + 还没创建成功时，
+        对话区里先有一块容器，等真实 sid 回来再 adopt 成正式任务。
+        """
+        run = self._runs.get(self._cur_sid)
+        if run is None:
+            run = self._new_run(self._cur_sid)
+        return run
+
+    def _new_run(self, sid: str) -> "TaskRun":
+        run = TaskRun(sid=sid)
+        self._runs[sid] = run
+        self._run_widgets(run)
+        return run
+
+    def _run_widgets(self, run: "TaskRun") -> "TaskRun":
+        """给任务建一套**独立**的对话容器（内容列居中，最宽 940）。"""
+        if run.container is not None:
+            return run
+        run.container = QWidget()
+        row = QHBoxLayout(run.container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        run.col = QWidget()
+        run.col.setObjectName("ChatColumn")
+        run.col.setMaximumWidth(940)
+        run.col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        run.layout = QVBoxLayout(run.col)
+        run.layout.setContentsMargins(2, 2, 8, 2)
+        run.layout.setSpacing(6)
+        run.layout.addStretch(1)
+        row.addStretch(1)
+        row.addWidget(run.col, 100)   # 先抢满，被 maximumWidth 限住后两侧等分
+        row.addStretch(1)
+        return run
+
+    def _show_run(self, sid: str) -> "TaskRun":
+        """把某个任务的对话区换到页面上（整块容器替换，不重建内容）。"""
+        run = self._runs.get(sid) or self._new_run(sid)
+        old = self._runs.get(self._active_sid)
+        if (old is not None and old is not run and old.container is not None
+                and getattr(self, "_scroll", None) is not None):
+            old.scroll_pos = self._scroll.verticalScrollBar().value()
+        self._active_sid = sid
+        self._cur_sid = sid
+        self._session_id = sid
+        run.last_used = time.time()
+        if getattr(self, "_scroll", None) is not None:
+            if (old is not None and old is not run and old.container is not None
+                    and self._scroll.widget() is old.container):
+                self._scroll.takeWidget()
+            if self._scroll.widget() is not run.container:
+                self._scroll.setWidget(run.container)
+            bar = self._scroll.verticalScrollBar()
+            bar.setValue(bar.maximum() if run.follow
+                         else max(0, min(run.scroll_pos, bar.maximum())))
+        self._render_queue()
+        self._set_busy_controls()
+        self._prune_runs()
+        return run
+
+    def _adopt_draft(self, sid: str) -> "TaskRun":
+        """把草稿任务（sid=""）转成真实任务：容器与内容原样保留。"""
+        draft = self._runs.get("")
+        if draft is not None and sid not in self._runs:
+            self._runs.pop("", None)
+            draft.sid = sid
+            self._runs[sid] = draft
+            if self._active_sid == "":
+                self._active_sid = sid
+            if self._cur_sid == "":
+                self._cur_sid = sid
+            if self._session_id == "":
+                self._session_id = sid
+            return draft
+        if draft is not None and sid in self._runs:
+            self._dispose_run("")      # 已经有同 id 的运行态：草稿丢弃
+        return self._runs.get(sid) or self._new_run(sid)
+
+    def _dispose_run(self, sid: str) -> None:
+        """销毁一个任务的运行态（切走缓存过多 / 任务被删除时）。"""
+        run = self._runs.pop(sid, None)
+        if run is None:
+            return
+        if run.stream is not None:
+            try:
+                run.stream.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            run.stream = None
+        run.gen += 1                    # 旧流的迟到事件全部作废
+        if run.container is not None:
+            if (getattr(self, "_scroll", None) is not None
+                    and self._scroll.widget() is run.container):
+                self._scroll.takeWidget()
+            run.container.setParent(None)
+            run.container.deleteLater()
+            run.container = None
+        if self._active_sid == sid:
+            self._active_sid = ""
+            if self._cur_sid == sid:
+                self._cur_sid = ""
+            self._show_run("")          # 别让对话区停在「没有容器」的状态
+
+    def _prune_runs(self) -> None:
+        """空闲任务只留最近用过的几个（内容可随时从后端历史重建）。"""
+        idle = [(r.last_used, s) for s, r in self._runs.items()
+                if s and s != self._active_sid and not r.busy
+                and s != self._cur_sid]
+        over = len(idle) - self.RUN_CACHE_MAX
+        if over <= 0:
+            return
+        idle.sort()
+        for _ts, sid in idle[:over]:
+            self._dispose_run(sid)
+
+    def _running_runs(self) -> List["TaskRun"]:
+        return [r for r in self._runs.values() if r.busy]
+
+    def _running_count(self) -> int:
+        return len(self._running_runs())
+
+    def _can_start_stream(self) -> bool:
+        return self._running_count() < MAX_PARALLEL_RUNS
+
+    @contextmanager
+    def _using(self, sid: str) -> Iterator["TaskRun"]:
+        """临时把「当前上下文」切到某个任务（处理它的流事件），不换可见容器。"""
+        old = self._cur_sid
+        self._cur_sid = sid
+        try:
+            yield self._run()
+        finally:
+            self._cur_sid = old
+
+    # ---------------- 页面字段 → 当前任务运行态（属性代理） ----------------
+    @property
+    def _session_id(self) -> str:
+        return self._active_sid
+
+    @_session_id.setter
+    def _session_id(self, sid: str) -> None:
+        """给 `_session_id` 赋值 = 切到那个任务（显示与读写永远同一个任务）。
+
+        老代码 / 测试里有不少 `page._session_id = "s1"` 的写法；统一走
+        `_show_run` 才能保证 `_active_sid`、`_cur_sid`、可见容器三者一致。
+        """
+        if not hasattr(self, "_runs"):
+            self._active_sid = str(sid or "")
+            return
+        sid = str(sid or "")
+        if sid != self._active_sid:
+            self._show_run(sid)
+
+    @property
+    def _stream(self):
+        return self._run().stream
+
+    @_stream.setter
+    def _stream(self, v):
+        self._run().stream = v
+
+    @property
+    def _busy(self) -> bool:
+        return self._run().busy
+
+    @_busy.setter
+    def _busy(self, v: bool) -> None:
+        self._run().busy = bool(v)
+
+    @property
+    def _bubble(self):
+        return self._run().bubble
+
+    @_bubble.setter
+    def _bubble(self, v):
+        self._run().bubble = v
+
+    @property
+    def _thinking(self):
+        return self._run().thinking
+
+    @_thinking.setter
+    def _thinking(self, v):
+        self._run().thinking = v
+
+    @property
+    def _proc(self):
+        return self._run().proc
+
+    @_proc.setter
+    def _proc(self, v):
+        self._run().proc = v
+
+    @property
+    def _proc_steps(self) -> List[Dict[str, Any]]:
+        return self._run().proc_steps
+
+    @_proc_steps.setter
+    def _proc_steps(self, v: List[Dict[str, Any]]) -> None:
+        self._run().proc_steps = v
+
+    @property
+    def _tools_used(self) -> int:
+        return self._run().tools_used
+
+    @_tools_used.setter
+    def _tools_used(self, v: int) -> None:
+        self._run().tools_used = int(v)
+
+    @property
+    def _approvals(self) -> Dict[str, ApprovalCard]:
+        return self._run().approvals
+
+    @property
+    def _follow(self) -> bool:
+        return self._run().follow
+
+    @_follow.setter
+    def _follow(self, v: bool) -> None:
+        self._run().follow = bool(v)
+
+    @property
+    def _queue_items(self) -> List[Dict[str, Any]]:
+        return self._run().q_items
+
+    @property
+    def _queue_paused(self) -> bool:
+        return self._run().q_paused
+
+    @property
+    def _queue_seq(self) -> int:
+        return self._run().q_seq
+
+    @_queue_seq.setter
+    def _queue_seq(self, v: int) -> None:
+        self._run().q_seq = int(v)
+
+    @property
+    def _container(self):
+        return self._run().container
+
+    @property
+    def _col(self):
+        return self._run().col
+
+    @property
+    def _msg_layout(self):
+        return self._run().layout
+
+    # ------------------------------------------------------------------ #
     # UI
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
@@ -424,24 +760,10 @@ class AssistantPage(QWidget):
         self._scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_value)
         # 量程变化（新内容撑高）时贴底：光靠 40ms 定时器会因布局未完成而差一截
         self._scroll.verticalScrollBar().rangeChanged.connect(self._on_scroll_range)
-        self._container = QWidget()
-        row = QHBoxLayout(self._container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
-        # 内容列最宽 940：窗口拉宽后对话与输入框居中，不横向铺满整个屏幕
-        self._col = QWidget()
-        self._col.setObjectName("ChatColumn")
-        self._col.setMaximumWidth(940)
-        self._col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._msg_layout = QVBoxLayout(self._col)
-        self._msg_layout.setContentsMargins(2, 2, 8, 2)
-        self._msg_layout.setSpacing(6)
-        self._msg_layout.addStretch(1)
-        row.addStretch(1)
-        row.addWidget(self._col, 100)   # 先抢满，被 maximumWidth 限住后两侧等分
-        row.addStretch(1)
-        self._scroll.setWidget(self._container)
+        # 对话区内容按任务隔离：每个任务一整块容器（_run_widgets 建），
+        # 切任务只是把另一块换上来，后台任务继续往自己那块里写
         lay.addWidget(self._scroll, 1)
+        self._show_run("")          # 首屏草稿任务（等真实 sid 回来再 adopt）
 
         lay.addWidget(self._build_footer())
         return panel
@@ -691,7 +1013,7 @@ class AssistantPage(QWidget):
         self._stop_btn.setToolTip("停止生成")
         self._stop_btn.setEnabled(False)
         self._stop_btn.setVisible(False)
-        self._stop_btn.clicked.connect(self._stop)
+        self._stop_btn.clicked.connect(lambda: self._stop())
         bar.addWidget(self._stop_btn)
 
         # ⚡ 引导发送（1.0.9）：↑ 左侧的次级按钮，仅忙碌时可见。
@@ -1072,9 +1394,13 @@ class AssistantPage(QWidget):
         # 13px 字号下 11 个汉字约 143px，加上 20px 左内边距正好卡住 200px 的左栏，
         # 再多就会被 QPushButton 直接裁掉（它不会自动省略）
         text = _ellipsis(t.get("title"), 10 if sub else 11)
-        btn = QPushButton(("📌 " if t.get("pinned") else "") + text)
+        run = self._runs.get(sid)
+        running = bool((run is not None and run.busy) or t.get("running"))
+        btn = QPushButton(("📌 " if t.get("pinned") else "")
+                          + ("● " if running else "") + text)
         btn.setObjectName("NavTaskItem")
         btn.setProperty("sub", "true" if sub else "false")
+        btn.setProperty("running", "true" if running else "false")
         btn.setProperty("active", "true" if sid == self._session_id else "false")
         btn.setCursor(Qt.PointingHandCursor)
         btn.setFixedHeight(NAV_ROW)
@@ -1149,9 +1475,12 @@ class AssistantPage(QWidget):
         # 内容签名：refresh 可能被高频触发（状态轮询 / 切页 / 流式结束），
         # 每次清空重建会让左栏闪烁且丢鼠标 hover 态，签名没变就直接返回。
         sig = (tuple((r.get("id"), r.get("title"), r.get("pinned"),
-                      r.get("message_count"), r.get("workspace")) for r in tasks),
+                      r.get("message_count"), r.get("workspace"),
+                      bool(r.get("running"))) for r in tasks),
                tuple((sp.get("path"), sp.get("count")) for sp in spaces),
-               self._session_id)
+               self._session_id,
+               # 哪些任务正在后台跑（行首 ● 与配色）：状态变了就要重画
+               tuple(sorted(s for s, r in self._runs.items() if r.busy)))
         if sig == getattr(self, "_nav_sig", None):
             return
         self._nav_sig = sig
@@ -1364,8 +1693,10 @@ class AssistantPage(QWidget):
         if not sid:
             return
         self._sel_sid = sid
+        self._open_seq = int(getattr(self, "_open_seq", 0) or 0) + 1
+        seq = self._open_seq
         w = Worker(self._assist.session, sid)
-        w.result.connect(self._apply_session_detail)
+        w.result.connect(lambda d, s=seq: self._apply_session_detail(d, s))
         w.error.connect(lambda m: self._set_status(f"打开任务失败：{m}"))
         w.start()
 
@@ -1425,6 +1756,11 @@ class AssistantPage(QWidget):
         ws = str(row.get("workspace") or "")
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")
+        run = self._runs.get(sid)
+        if run is not None and run.busy:
+            # 多任务并行后，后台任务也要能单独停（不用先切过去）
+            menu.addAction("停止运行", lambda: self._stop(sid))
+            menu.addSeparator()
         menu.addAction("取消置顶" if pinned else "置顶",
                        lambda: self._patch_task(sid, {"pinned": not pinned}))
         menu.addAction("重命名…", lambda: self._rename_task(sid, title))
@@ -1462,13 +1798,20 @@ class AssistantPage(QWidget):
     def _new_task_in_space(self, path: str) -> None:
         """在该空间下新建任务，并把工作区切过去（文件工具落在同一目录）。"""
         name = _ellipsis(path.rsplit("/", 1)[-1] or path, 8)
+        key = _norm_ws(path) or "__space__"
+        if not self._claim_create(key):
+            self._set_status("正在创建任务，请稍候…（不要重复点击）")
+            return
         self._set_status(f"正在「{name}」中新建任务…")
         w = Worker(self._assist.new_session, path)
-        w.result.connect(lambda s, p=path: self._on_space_task_created(s, p))
-        w.error.connect(lambda m: self._set_status(f"新建任务失败：{m}"))
+        w.result.connect(
+            lambda s, p=path, k=key: self._on_space_task_created(s, p, k))
+        w.error.connect(lambda m, k=key: self._create_failed(m, k))
         w.start()
 
-    def _on_space_task_created(self, session: Any, path: str) -> None:
+    def _on_space_task_created(self, session: Any, path: str,
+                               key: str = "") -> None:
+        self._release_create(key)
         if not isinstance(session, dict) or not session.get("id"):
             self._set_status("任务创建失败，请确认后端已启动")
             return
@@ -1673,9 +2016,10 @@ class AssistantPage(QWidget):
             return
         if self._sel_sid == sid:
             self._sel_sid = ""
-        if sid == self._session_id:
+        # 这个任务的运行态（含后台流）一并销毁，别让它继续往看不见的地方写
+        self._dispose_run(sid)
+        if sid == self._session_id or not self._session_id:
             # 删的是当前任务：清空并新开一个，否则界面停在一条已删除的任务上
-            self._session_id = ""
             self._clear_chat()
             self._new_session(silent=True)
         else:
@@ -2355,16 +2699,26 @@ class AssistantPage(QWidget):
             rows = [s for s in (st.get("sessions") or []) if isinstance(s, dict)]
             idle = next((s for s in rows if not s.get("message_count")), None)
             if idle is not None:
-                self._session_id = str(idle.get("id") or "")
-                self._sel_sid = self._session_id
+                sid = str(idle.get("id") or "")
+                self._adopt_draft(sid)      # 草稿容器直接变成这个任务
+                self._show_run(sid)
+                self._sel_sid = sid
                 self._greet()
             else:
                 self._new_session(silent=True)
 
     def _set_status(self, text: str) -> None:
-        """状态行：有内容才占位，避免底栏上方常驻一条空白。"""
-        self._status.setText(text or "")
-        self._status.setVisible(bool((text or "").strip()))
+        """状态行：有内容才占位，避免底栏上方常驻一条空白。
+
+        后台任务的事件不刷状态栏（会把当前任务的状态盖成别人的）。
+        """
+        if self._cur_sid != self._active_sid:
+            return
+        label = getattr(self, "_status", None)
+        if label is None:
+            return
+        label.setText(text or "")
+        label.setVisible(bool((text or "").strip()))
 
     # ---------------- 底栏按钮文本 ----------------
     WS_LABEL_MAX = 4            # 宽度压缩规则 ①：12 → 4 字（完整路径进 tooltip）
@@ -2724,8 +3078,12 @@ class AssistantPage(QWidget):
         # 只留在管理面板里，否则「任务」区那几个位置会被一串「新任务」占满，
         # 真正在聊的任务反而看不到。当前任务无论空不空都保留。
         # 注意用 get(..., 1)：字段缺失视为「有内容」，宁可多显示也不要把任务藏掉
+        # 1.0.10：正在跑的任务（含 0 条消息的新任务）一定要留在左栏，否则
+        # 用户在后台跑着的任务会从列表里「消失」，只能去管理面板找。
         self._nav_rows = [s for s in items
-                          if s.get("message_count", 1) or s.get("id") == self._session_id]
+                          if s.get("message_count", 1)
+                          or s.get("id") == self._session_id
+                          or s.get("running")]
         self._nav_spaces = self._group_spaces(self._nav_rows, self._default_ws())
         self._rebuild_nav_tasks()
 
@@ -2761,9 +3119,11 @@ class AssistantPage(QWidget):
         # 例外：空任务在别的空间 —— 左栏「+」的语义是「在系统默认工作区新建」，
         # 复用会把用户带回那个空间（截图反馈：点 + 后新任务落到 newspace，
         # 「任务 (0)」永远不变）。
+        # 多任务并行补充：当前任务**正在跑**时绝不复用（那会顶掉正在生成的回答）。
         cur = next((s for s in self._session_rows
                     if s.get("id") == self._session_id), None)
         if (not silent and cur is not None and not cur.get("message_count")
+                and not self._busy
                 and self._task_ws(cur) == self._default_ws()):
             self._clear_chat()
             self._greet()
@@ -2773,23 +3133,40 @@ class AssistantPage(QWidget):
         # 想落在自定义空间走空间右键「在此空间新建任务」。silent 是后台自动
         # 建任务（首次进页 / 删任务兜底），跟随后端当前工作区即可。
         ws = "" if silent else self._default_ws()
+        key = _norm_ws(ws) or "__default__"
+        if not self._claim_create(key):
+            self._set_status("正在创建任务，请稍候…（不要重复点击）")
+            return
         w = Worker(self._assist.new_session, ws)
-        w.result.connect(lambda s: self._on_session_created(s, silent))
-        w.error.connect(lambda m: self._set_status(f"新建任务失败：{m}"))
+        w.result.connect(lambda s, k=key: self._on_session_created(s, silent, k))
+        w.error.connect(lambda m, k=key: self._create_failed(m, k))
         w.start()
 
-    def _on_session_created(self, session: Dict[str, Any], silent: bool) -> None:
+    def _on_session_created(self, session: Dict[str, Any], silent: bool,
+                            key: str = "") -> None:
+        self._release_create(key)
         if not isinstance(session, dict) or not session.get("id"):
             return
-        self._session_id = session["id"]
-        self._sel_sid = str(session["id"])      # 新任务立刻成为列表选中项
+        sid = str(session["id"])
+        if sid in self._runs and self._runs[sid].busy:
+            # 这个 id 正在跑（重试 / 重放打到了同一个任务）：切过去，不覆盖内容
+            self._show_run(sid)
+            self._sel_sid = sid
+            self._set_status("已切换到该任务")
+            self._fill_sessions()
+            return
+        # 同 id 的空闲缓存作废（内容以新建的任务为准），再接管草稿容器
+        self._dispose_run(sid)
+        self._adopt_draft(sid)
+        self._show_run(sid)
+        self._sel_sid = sid           # 新任务立刻成为列表选中项
         # 任务落在哪个空间，工作区就指到哪（+ → 默认空间 / 右键 → 该空间），
         # 文件工具和底栏 chip 与任务归属保持一致（截图反馈：重新指向就可以）
         self._sync_workspace_to_task(str(session.get("workspace") or ""))
         self._clear_chat()
         self._greet()
         self._fill_sessions()
-        self._fetch_queue(self._session_id)     # 新任务按 sid 同步队列快照
+        self._fetch_queue(sid)        # 新任务按 sid 同步队列快照
 
     def _greet(self) -> None:
         tools = len(self._state.get("tools") or [])
@@ -2804,15 +3181,35 @@ class AssistantPage(QWidget):
         sid = item.data(Qt.UserRole)
         if not sid:
             return
+        self._open_seq = int(getattr(self, "_open_seq", 0) or 0) + 1
+        seq = self._open_seq
         w = Worker(self._assist.session, sid)
-        w.result.connect(self._apply_session_detail)
+        w.result.connect(lambda d, s=seq: self._apply_session_detail(d, s))
         w.error.connect(lambda m: self._set_status(f"加载任务失败：{m}"))
         w.start()
 
-    def _apply_session_detail(self, data: Dict[str, Any]) -> None:
+    def _apply_session_detail(self, data: Dict[str, Any],
+                              seq: int = 0) -> None:
         if not isinstance(data, dict):
             return
-        self._session_id = data.get("id") or ""
+        if seq and seq != int(getattr(self, "_open_seq", 0) or 0):
+            # 慢响应：用户后来点了别的任务，这份历史不能盖上去
+            return
+        sid = str(data.get("id") or "")
+        if not sid:
+            return
+        run = self._runs.get(sid)
+        if run is not None and run.busy:
+            # 这个任务正在后台跑：直接把它的实时容器换上来，不按历史重建
+            self._show_run(sid)
+            self._sel_sid = sid
+            self._set_status("该任务正在运行，已切换到实时输出")
+            self._fill_sessions()
+            return
+        if run is not None:
+            # 空闲缓存可能已过时（队列跑完 / 别的窗口改过）→ 丢弃，按历史重建
+            self._dispose_run(sid)
+        self._show_run(sid)
         # 任务属于某个空间：切过去，否则文件工具还在上一个目录里干活
         self._sync_workspace_to_task(str(data.get("workspace") or ""))
         self._clear_chat()
@@ -2834,10 +3231,10 @@ class AssistantPage(QWidget):
         if isinstance(usage, dict):
             self._apply_context(usage)
         self._add_step("已载入历史任务")
-        self._sel_sid = str(self._session_id or "")
+        self._sel_sid = sid
         self._fill_sessions()      # 同步左栏的选中态与「任务 / 空间」两区
-        # 队列跟着任务走：先重置（旧任务的排队不是这个任务的），再按新 sid 拉快照
-        self._fetch_queue(str(self._session_id or ""))
+        # 队列跟着任务走：按新 sid 拉快照（每个任务各自一份，互不作废）
+        self._fetch_queue(sid)
 
     # ------------------------------------------------------------------ #
     # 对话
@@ -2881,24 +3278,61 @@ class AssistantPage(QWidget):
             text = "（请看我发的图片）"
         slots = self._available_send_slots()
         if slots <= 0:
-            # 1.0.8：后端按队列模型串行处理（同一时刻只有 1 个活跃流），
-            # 所以忙碌态 Enter 一律走「排队」，不再丢弃消息（1.0.9 行为保持）
+            # 当前任务在跑：Enter 一律走「排队」，不丢弃消息（队列按任务隔离）
             self._enqueue_message(text, guided=False, images=images)
             return
+        if not self._can_start_stream():
+            # 别的任务占满了并行名额：不要静默吞掉，明确告知
+            self._set_status(
+                f"同时最多 {MAX_PARALLEL_RUNS} 个任务在跑，"
+                "先等一个结束（或停掉一个）再发送")
+            return
         if not self._session_id:
+            key = "__send__"
+            if not self._claim_create(key):
+                self._set_status("正在创建任务，请稍候…")
+                return
             w = Worker(self._assist.new_session)
-            w.result.connect(lambda s: self._send_with_session(s, text, images))
+            w.result.connect(
+                lambda s, k=key: self._on_send_session(s, text, images, k))
+            w.error.connect(lambda m, k=key: self._create_failed(m, k))
             w.start()
             return
         self._send_with_session({"id": self._session_id}, text, images)
 
-    def _available_send_slots(self) -> int:
-        """当前还能并发起几条对话流：忙碌中 0，空闲 1。
+    def _on_send_session(self, session: Any, text: str,
+                         images: Optional[List[str]], key: str = "") -> None:
+        self._release_create(key)
+        self._send_with_session(session, text, images)
 
-        抽成方法便于测试断言「忙碌态 = 0 槽 → 一定入队」，也便于将来后端
-        支持并行流时只改这一处。
+    def _available_send_slots(self) -> int:
+        """**当前任务**还能起几条对话流：它在跑就是 0。
+
+        1.0.9 起多任务并行，槽位按任务算 —— A 在跑不影响 B 发送；
+        全局并行上限由 `_can_start_stream()` 单独把关。
         """
         return 0 if self._busy else 1
+
+    # ---------------- 新建任务防重（并发点击 / 后端挂住） ----------------
+    def _claim_create(self, key: str) -> bool:
+        """占一个创建名额；已有在途请求返回 False（防重复建出空任务）。"""
+        now = time.time()
+        for k, ts in list(self._creating.items()):
+            if now - ts > CREATE_TIMEOUT:      # 后端挂住：超时自动放行
+                self._creating.pop(k, None)
+        key = key or "__default__"
+        if key in self._creating:
+            return False
+        self._creating[key] = now
+        return True
+
+    def _release_create(self, key: str = "") -> None:
+        self._creating.pop(key or "__default__", None)
+
+    def _create_failed(self, msg: str, key: str = "") -> None:
+        """创建失败：放开名额（否则用户要等 20s 才能重试）。"""
+        self._release_create(key)
+        self._set_status(f"新建任务失败：{msg}")
 
     def _on_guide_clicked(self) -> None:
         """⚡ / Shift+Enter：引导发送——立即登记进对话流，不中断当前轮。"""
@@ -2958,7 +3392,12 @@ class AssistantPage(QWidget):
         if not isinstance(session, dict) or not session.get("id"):
             self._set_status("任务创建失败，请检查后端服务")
             return
-        self._session_id = session["id"]
+        sid = str(session["id"])
+        # 草稿任务刚拿到真实 id：容器与招呼语原样保留，不闪屏、不重建
+        if sid != self._session_id:
+            if self._session_id == "" and sid not in self._runs:
+                self._adopt_draft(sid)
+            self._show_run(sid)
         self._input.clear()
         images = [p for p in (images or []) if str(p).strip()]
         self._add_bubble("user", text)
@@ -2984,12 +3423,59 @@ class AssistantPage(QWidget):
             # 后端把路径挂到 message.images（历史可回看），并在本轮上下文里
             # 以文本形式告诉模型「这些图片在本机，用 fs_read / OCR 处理」
             payload["attachments"] = list(images)
-        self._stream = AssistantStream(
+        self._start_stream(self._session_id, payload)
+
+    def _start_stream(self, sid: str, payload: Dict[str, Any]) -> None:
+        """给某个任务起一条 SSE 流（事件只回流到**这个任务**的上下文）。
+
+        多任务并行的关键点：连接用的是带 sid + 代次的 lambda，而不是页面级
+        `self._on_event`。这样后台任务的事件处理时 `_cur_sid` 会临时切到它
+        自己的 TaskRun，内容写进它自己的容器，绝不串到当前显示的任务上。
+        """
+        run = self._runs.get(sid) or self._new_run(sid)
+        run.gen += 1
+        gen = run.gen
+        stream = AssistantStream(
             self.config.gateway_url(), self.config.api_key, payload)
-        self._stream.event.connect(self._on_event)
-        self._stream.failed.connect(self._on_stream_failed)
-        self._stream.closed.connect(self._on_stream_closed)
-        self._stream.start()
+        stream.event.connect(
+            lambda ev, s=sid, g=gen: self._on_run_event(s, g, ev))
+        stream.failed.connect(
+            lambda m, s=sid, g=gen: self._on_run_failed(s, g, m))
+        stream.closed.connect(lambda s=sid, g=gen: self._on_run_closed(s, g))
+        run.stream = stream
+        stream.start()
+
+    def _on_run_event(self, sid: str, gen: int, ev: Dict[str, Any]) -> None:
+        run = self._runs.get(sid)
+        if run is None or gen != run.gen:
+            return                      # 任务已销毁 / 旧流迟到事件：直接丢
+        with self._using(sid):
+            self._on_event(ev)
+
+    def _on_run_failed(self, sid: str, gen: int, msg: str) -> None:
+        run = self._runs.get(sid)
+        if run is None or gen != run.gen:
+            return
+        with self._using(sid):
+            run.status = TASK_ERROR
+            run.error = msg or "连接失败"
+            self._on_stream_failed(msg)
+
+    def _on_run_closed(self, sid: str, gen: int) -> None:
+        run = self._runs.get(sid)
+        if run is None or gen != run.gen:
+            return
+        with self._using(sid):
+            run.stream = None
+            if run.busy:
+                self._end_streaming()
+            if run.status == TASK_RUNNING:
+                run.status = TASK_ERROR if run.error else TASK_IDLE
+        if sid == self._active_sid:
+            self._fill_sessions()
+        else:
+            # 后台任务跑完：左栏的「运行中」圆点与消息数都要收敛
+            self._fill_sessions()
 
     def _set_busy_controls(self) -> None:
         """忙碌态发送区状态机（PRD 4.2 / 架构设计 3.6，P1-3）。
@@ -2997,9 +3483,14 @@ class AssistantPage(QWidget):
         空闲：↑ 发送（Enter）、⚡ 隐藏、placeholder「今天帮你做些什么？」
         忙碌：↑ 排队入队（Enter）、⚡ 引导发送（Shift+Enter）、■ 停止显示，
               placeholder 明示两种语义差异
+
+        只反映**当前显示任务**的状态：别的任务在后台跑不影响这里的输入框。
         """
+        btn = getattr(self, "_send_btn", None)
+        if btn is None:                 # 构造期（底栏还没建）直接跳过
+            return
         busy = bool(self._busy)
-        self._send_btn.setToolTip(
+        btn.setToolTip(
             "排队发送（Enter）：不打断当前生成，本轮结束后按序自动发送"
             if busy else "发送（Enter）")
         self._guide_btn.setVisible(busy)
@@ -3008,61 +3499,83 @@ class AssistantPage(QWidget):
             if busy else "今天帮你做些什么？（Enter 发送，Shift+Enter 换行）")
 
     def _begin_streaming(self) -> None:
-        self._busy = True
-        self._stop_btn.setVisible(True)
-        self._stop_btn.setEnabled(True)
-        self._set_busy_controls()
-        self._start_spin()
-        self._set_status("助理正在工作…")
-        self._bubble = None
-        self._thinking = None
-        self._tools_used = 0
-        self._proc = None
-        self._proc_steps = []
+        """开一轮：**只**重置当前任务的流内游标（别的任务的不动）。"""
+        run = self._run()
+        run.busy = True
+        run.status = TASK_RUNNING
+        run.started_at = time.time()
+        run.error = ""
+        run.phase = TASK_PHASE_THINKING
+        run.round = 0
+        run.bubble = None
+        run.thinking = None
+        run.thinking_last = None
+        run.tools_used = 0
+        run.proc = None
+        run.proc_steps = []
+        if self._cur_sid == self._active_sid:
+            self._stop_btn.setVisible(True)
+            self._stop_btn.setEnabled(True)
+            self._set_busy_controls()
+            self._start_spin()
+            self._set_status("助理正在工作…")
+        self._rebuild_nav_tasks()       # 左栏任务行上的「运行中」圆点
 
     def _end_streaming(self) -> None:
-        self._busy = False
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.setVisible(False)
-        self._set_busy_controls()
-        self._stop_spin()
-        if self._thinking is not None:
-            self._thinking.finish()
-        if self._bubble is not None:
-            self._bubble.end_stream()      # 收尾贴合宽度
-        self._scroll_bottom(force=True)    # 答完了，回到底部看全文
+        run = self._run()
+        run.busy = False
+        if run.status == TASK_RUNNING:
+            run.status = TASK_IDLE
+        if run.thinking is not None:
+            run.thinking.finish()
+        if run.bubble is not None:
+            run.bubble.end_stream()      # 收尾贴合宽度
+        visible = self._cur_sid == self._active_sid
+        if visible:
+            self._stop_btn.setEnabled(False)
+            self._stop_btn.setVisible(False)
+            self._set_busy_controls()
+            self._stop_spin()
+            self._scroll_bottom(force=True)    # 答完了，回到底部看全文
         # 1.0.9：本轮完成或被终止 → 现在才真正应用忙碌期间挂起的模型切换
-        self._apply_pending_model()
+        # 1.0.10：按「挂起时占着模型的那个任务」判，后台任务结束也能生效
+        self._apply_pending_model(run.sid)
+        self._rebuild_nav_tasks()
 
-    def _stop(self) -> None:
-        """停止 = 本地断流 + 取消当前轮 + 队列暂停（1.0.9：不出队、不清空）。
+    def _stop(self, sid: str = "") -> None:
+        """停止 = 本地断流 + 取消该任务当前轮 + 队列暂停（不出队、不清空）。
 
-        串行化：stop 成功回调里再拉一次队列快照，面板保留并显示「继续」。
+        多任务下可以只停某一个：`sid` 省略时停当前显示的任务。
         """
-        if self._stream is not None:
-            self._stream.cancel()
-        sid = self._session_id
-        self._add_step("已请求停止")
-        # 界面先立刻脱离忙碌态（乐观），快照回来后补「继续」按钮
-        self._end_streaming()
-        self._set_status("已停止")
-        if sid:
+        target = sid or self._session_id
+        run = self._runs.get(target)
+        if run is None:
+            return
+        if run.stream is not None:
+            run.stream.cancel()
+        with self._using(target):
+            self._add_step("已请求停止")
+            run.status = TASK_STOPPED
+            # 界面先立刻脱离忙碌态（乐观），快照回来后补「继续」按钮
+            self._end_streaming()
+            if self._cur_sid == self._active_sid:
+                self._set_status("已停止")
+        if target:
             def _after_stop(_res):
-                self._fetch_queue(sid)
-            w = Worker(lambda s=sid: self._assist.stop(s))
+                self._fetch_queue(target)
+            w = Worker(lambda s=target: self._assist.stop(s))
             w.result.connect(_after_stop)
             w.error.connect(lambda m: self._set_status(f"停止请求失败：{m}"))
             w.start()
 
     def _on_stream_failed(self, msg: str) -> None:
         self._add_step(f"连接失败：{msg}")
-        self._set_status("请求失败，请确认后端已启动")
+        if self._cur_sid == self._active_sid:
+            self._set_status("请求失败，请确认后端已启动")
 
     def _on_stream_closed(self) -> None:
-        self._stream = None
-        if self._busy:
-            self._end_streaming()
-        self._fill_sessions()
+        """兼容入口（老路径 / 测试直接调用）：等价于当前任务流关闭。"""
+        self._on_run_closed(self._cur_sid, self._run().gen)
 
     # ---------------- 事件分发 ----------------
     def _on_event(self, ev: Dict[str, Any]) -> None:
@@ -3098,7 +3611,15 @@ class AssistantPage(QWidget):
             self._set_status(f"{ev.get('message')}（可稍后重试）")
             return
         if kind == "session":
-            self._session_id = ev.get("session_id") or self._session_id
+            # 后台任务的事件不能改写「当前显示任务」的 id
+            if self._cur_sid == self._active_sid:
+                sid = ev.get("session_id") or ""
+                if sid and sid != self._active_sid:
+                    self._adopt_draft(sid)
+        elif kind == "phase":
+            # 后端阶段边界（turn_phase）：思考 / 执行严格串行，前端据此分组
+            self._on_phase(str(ev.get("phase") or ""),
+                           int(ev.get("round") or 0))
         elif kind == "start":
             # 1.0.8 自动加载：start 事件新增 auto_loaded（架构 §7「start 事件扩展」）。
             # 空 dict = 未命中 profile / auto_load=false → 什么都不显示。
@@ -3116,11 +3637,15 @@ class AssistantPage(QWidget):
             self._ensure_bubble().append_text(ev.get("text") or "")
             self._scroll_bottom()
         elif kind == "reasoning":
-            if self._thinking is None:
+            # 每个阶段的思考各起一块（关键修正）：旧实现只建一次，
+            # 于是「执行完再思考」的文字会追加到最上面那块里 —— 顺序全乱，
+            # 看起来就像思考和执行同时在进行。
+            run = self._run()
+            if run.thinking is None:
                 # WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠
-                self._thinking = ThinkingBlock()
-                self._append_widget(self._thinking)
-            self._thinking.append(ev.get("text") or "")
+                run.thinking = ThinkingBlock()
+                self._append_widget(run.thinking)
+            run.thinking.append(ev.get("text") or "")
             self._scroll_bottom()
         elif kind == "replace":
             if self._bubble is not None:
@@ -3128,13 +3653,18 @@ class AssistantPage(QWidget):
         elif kind == "reasoning_replace":
             # 思考里混进了工具调用标记（本地思考型模型常这样）：把原文清掉，
             # 否则用户仍会看到一行 <tool_call>skill_list</tool_call>
-            if self._thinking is not None:
-                self._thinking.set_text(ev.get("text") or "")
+            block = self._thinking or self._run().thinking_last
+            if block is not None:
+                block.set_text(ev.get("text") or "")
                 self._scroll_bottom()
         elif kind == "tool_call":
             # 1.0.9（参照 WorkBuddy）：工具调用不再铺开成卡片，而是收进一行
             # 「进程呈现」（聚合摘要 + 可展开明细）。默认只看到一行摘要，
             # 调用参数与结果要点开才有。
+            run = self._run()
+            if run.phase != TASK_PHASE_EXECUTING:
+                # 老后端没有 phase 事件：按「第一个 tool_call = 执行开始」推断
+                self._enter_phase(TASK_PHASE_EXECUTING)
             self._finish_bubble()
             self._tools_used += 1
             self._on_tool_call(ev)
@@ -3159,6 +3689,8 @@ class AssistantPage(QWidget):
                 card.close_now()
         elif kind == "skill_step":
             # 1.0.9：技能执行阶段同样只进审计，不在对话流里暴露细节
+            if self._run().phase != TASK_PHASE_EXECUTING:
+                self._enter_phase(TASK_PHASE_EXECUTING)
             self._set_status("正在执行技能…")
         elif kind == "title":
             self._fill_sessions()
@@ -3207,6 +3739,7 @@ class AssistantPage(QWidget):
             self._add_step("已停止生成")
         elif kind == "end":
             # 整条流唯一一次 end：队列耗尽或暂停时才下发
+            self._run().phase = ""
             self._end_streaming()
             if ev.get("paused"):
                 self._set_status("已暂停：队列消息保留，点「继续」按序发送")
@@ -3216,6 +3749,44 @@ class AssistantPage(QWidget):
             elif not ev.get("error"):
                 self._set_status("就绪")
             self._approvals.clear()
+
+    # ---------------- 阶段（思考 / 执行）分组 ----------------
+    def _close_thinking(self) -> None:
+        """封口当前思考块：下一个 reasoning 事件另起一块（保证时间顺序）。
+
+        关键修正在这里 —— 旧实现整条流只有一个思考块，第二轮（工具执行之后）
+        的思考会追加到**最上面**那块里，用户看到的顺序就成了
+        「思考 → 执行 → 思考(仍在上面长)」，像是思考和执行同时在跑。
+        """
+        run = self._run()
+        if run.thinking is not None:
+            run.thinking_last = run.thinking
+            run.thinking = None
+
+    def _enter_phase(self, phase: str) -> None:
+        """阶段切换（不带事件，供老后端推断路径 / 内部调用）。"""
+        run = self._run()
+        run.phase = phase
+        if phase == TASK_PHASE_EXECUTING:
+            self._finish_bubble()      # 本轮的过渡文字先定稿
+            self._close_thinking()     # 执行开始：思考封口
+        else:
+            run.proc = None            # 执行行封口：下一次工具调用另起一行
+            self._close_thinking()
+
+    def _on_phase(self, phase: str, round_no: int = 0) -> None:
+        """后端 `phase` 事件：思考阶段与执行阶段互斥，前端按阶段分组。
+
+        渲染顺序由此严格成立：
+            思考块(第1轮) → 执行行(第1轮) → 思考块(第2轮) → 执行行(第2轮) → 回答
+        """
+        if phase not in (TASK_PHASE_THINKING, TASK_PHASE_EXECUTING):
+            return
+        run = self._run()
+        run.round = round_no or run.round
+        self._enter_phase(phase)
+        if self._cur_sid == self._active_sid:
+            self._set_status(PHASE_TEXT.get(phase, "助理正在工作…"))
 
     # ---------------- 自动加载（1.0.8，P0-6） ----------------
     def _on_auto_loaded(self, info: Dict[str, Any]) -> None:
@@ -3266,33 +3837,46 @@ class AssistantPage(QWidget):
 
     def _on_queue_state(self, paused: bool, reason: str) -> None:
         """暂停/恢复transition：切 StepLine + 「继续」按钮显隐。"""
-        self._queue_paused = bool(paused)
+        run = self._run()
+        run.q_paused = bool(paused)
+        if self._cur_sid != self._active_sid:
+            return                       # 后台任务的队列只存快照，不画面板
         if self._queue_resume_btn is not None:
             self._queue_resume_btn.setVisible(
-                bool(paused) and bool(self._queue_items))
+                bool(paused) and bool(run.q_items))
         if paused:
             self._add_step("队列已暂停（消息保留，点「继续」按序发送）")
         else:
             self._add_step("已恢复，继续按序处理排队消息")
 
     def _apply_queue(self, items: List[Dict[str, Any]], paused: bool) -> None:
-        """快照 -> 重渲染面板 + 显隐 + 「继续」按钮（不做局部增删）。"""
-        self._queue_items = [dict(it) for it in (items or [])
-                             if isinstance(it, dict)]
-        self._queue_paused = bool(paused)
+        """快照 → 存进**当前任务**；只有它是可见任务时才重渲染面板。"""
+        run = self._run()
+        run.q_items = [dict(it) for it in (items or [])
+                       if isinstance(it, dict)]
+        run.q_paused = bool(paused)
+        if self._cur_sid != self._active_sid:
+            return
+        self._render_queue()
+
+    def _render_queue(self) -> None:
+        """按当前任务的队列快照重渲染面板 + 显隐 + 「继续」按钮。"""
+        run = self._run()
+        items = run.q_items
+        if self._queue_panel is None:
+            return
         self._rebuild_queue_rows()
-        has = bool(self._queue_items)
-        if self._queue_panel is not None:
-            self._queue_panel.setVisible(has)
+        has = bool(items)
+        self._queue_panel.setVisible(has)
         if self._queue_head_lbl is not None:
             self._queue_head_lbl.setText(
-                f"排队中（{len(self._queue_items)}）· 本轮结束后按序发送")
+                f"排队中（{len(items)}）· 本轮结束后按序发送")
         if self._queue_resume_btn is not None:
-            self._queue_resume_btn.setVisible(bool(self._queue_paused and has))
+            self._queue_resume_btn.setVisible(bool(run.q_paused and has))
         if self._queue_clear_btn is not None:
             # 只剩引导消息时「全部清除」无可清（引导不可清）
             self._queue_clear_btn.setEnabled(
-                any(not it.get("guided") for it in self._queue_items))
+                any(not it.get("guided") for it in items))
 
     def _rebuild_queue_rows(self) -> None:
         """按快照重建行（序号重排、首条禁 ↑、末条禁 ↓、引导行只读）。"""
@@ -3375,12 +3959,14 @@ class AssistantPage(QWidget):
 
         会**乱序到达**：停止、切任务、行内编辑后都会各拉一次，慢的那个回来
         时可能把新快照覆盖成旧的（历史现象之一：编辑完队列面板突然空了）。
-        用递增序号做「只认最新一次请求」。
+        用**每任务一个**递增序号做「只认最新一次请求」——多任务并行后，两个
+        任务的快照各回各的，不能互相作废。
         """
         if not sid:
             return
-        self._queue_seq = int(getattr(self, "_queue_seq", 0) or 0) + 1
-        seq = self._queue_seq
+        run = self._runs.get(sid) or self._new_run(sid)
+        run.q_seq += 1
+        seq = run.q_seq
         w = Worker(self._assist.queue, sid)
         w.result.connect(lambda d, s=seq: self._on_queue_fetched(d, s, sid))
         w.error.connect(lambda m: self._set_status(f"队列同步失败：{m}"))
@@ -3389,11 +3975,18 @@ class AssistantPage(QWidget):
     def _on_queue_fetched(self, data: Any, seq: int = 0, sid: str = "") -> None:
         if not isinstance(data, dict):
             return
-        if seq and seq < int(getattr(self, "_queue_seq", 0) or 0):
+        if not sid:
+            sid = self._cur_sid
+        run = self._runs.get(sid)
+        if run is None:
+            return
+        if seq and seq < run.q_seq:
             return                      # 已有更新的请求发出，这份是旧快照
-        if sid and self._session_id and sid != self._session_id:
-            return                      # 切了任务：旧任务的队列不能画到新任务上
-        self._apply_queue(data.get("items") or [], bool(data.get("paused")))
+        run.q_items = [dict(it) for it in (data.get("items") or [])
+                       if isinstance(it, dict)]
+        run.q_paused = bool(data.get("paused"))
+        if sid == self._active_sid:
+            self._render_queue()
 
     def _resume_queue(self) -> None:
         """「继续」：POST /chat mode=resume -> 新 SSE 流回到自动消费路径。"""
@@ -3411,12 +4004,7 @@ class AssistantPage(QWidget):
             "model": self._active_model or "",
             "stream": True,
         }
-        self._stream = AssistantStream(
-            self.config.gateway_url(), self.config.api_key, payload)
-        self._stream.event.connect(self._on_event)
-        self._stream.failed.connect(self._on_stream_failed)
-        self._stream.closed.connect(self._on_stream_closed)
-        self._stream.start()
+        self._start_stream(self._session_id, payload)
 
     def _resolve_approval(self, aid: str, approve: bool, remember: bool) -> None:
         w = Worker(self._assist.resolve_approval, aid, approve, remember)
@@ -3669,18 +4257,24 @@ class AssistantPage(QWidget):
         self._msg_layout.insertWidget(self._msg_layout.count() - 1, w)
 
     def _clear_chat(self) -> None:
-        while self._msg_layout.count() > 1:
-            item = self._msg_layout.takeAt(0)
+        """清空**当前任务**的对话区（别的任务的容器不受影响）。"""
+        lay = self._msg_layout
+        while lay.count() > 1:
+            item = lay.takeAt(0)
             wid = item.widget()
             if wid is not None:
                 wid.deleteLater()
-        self._bubble = None
-        self._thinking = None
-        self._tools_used = 0
-        self._proc = None
-        self._proc_steps = []
-        self._approvals.clear()
-        self._follow = True
+        run = self._run()
+        run.bubble = None
+        run.thinking = None
+        run.thinking_last = None
+        run.proc = None
+        run.proc_steps = []
+        run.tools_used = 0
+        run.approvals.clear()
+        run.follow = True
+        run.phase = ""
+        run.round = 0
         # 新任务：待发送的图片与上下文占用都不再属于这个任务
         self._reset_attachments()
         if getattr(self, "_ctx_meter", None) is not None:
@@ -3689,16 +4283,22 @@ class AssistantPage(QWidget):
         self._auto_tips.clear()
         # 队列面板跟随任务重置（新任务的快照由 _fetch_queue 拉回）
         # 序号 +1 让「切任务前发出的在途快照」全部失效，不会画到新任务上
-        self._queue_seq = int(getattr(self, "_queue_seq", 0) or 0) + 1
+        run.q_seq += 1
         self._apply_queue([], False)
 
     def _scroll_bottom(self, force: bool = False) -> None:
         """滚到底部（合并请求，避免流式输出时画面狂跳）。
 
         - 40ms 内多次调用只滚一次：每个 token 都 setValue 会让整屏闪动
-        - 用户自己往上翻看过（_follow 为 False）时不再硬拽回底部
+        - 用户自己往上翻看过（follow 为 False）时不再硬拽回底部
+        - **后台任务不滚**：滚动条只有一条，滚了就是把当前显示的任务拽走
         """
-        if not force and not self._follow:
+        run = self._run()
+        if force:
+            run.follow = True
+        if self._cur_sid != self._active_sid:
+            return
+        if not force and not run.follow:
             return
         if not self._scroll_timer.isActive():
             self._scroll_timer.start(self.SCROLL_MS)
@@ -3915,25 +4515,36 @@ class AssistantPage(QWidget):
 
     # ---------------- 模型切换（1.0.9：忙碌期间延后生效） ----------------
     def _defer_model(self, label: str, apply_fn) -> None:
-        """任务进行中选了模型：只记账，等本轮结束/终止后由 `_end_streaming` 应用。
+        """任务进行中选了模型：只记账，等**那个任务**结束/终止后由 `_end_streaming` 应用。
 
         参照 WorkBuddy：切换立即改的是「下一轮用哪个模型」，正在跑的这一轮
         不能被打断换模型 —— 所以后端设置（save_settings）也要等任务结束才写，
         否则下一轮流（队列续跑）就用了新模型。
+
+        多任务并行后要记「是哪个任务占着」：A 在跑时挂起的切换，就该在 A 结束时
+        生效，而不是等用户切回来再等 B 结束（可能永远等不到）。
         """
-        self._pending_model = (label, apply_fn)
+        self._pending_model = (label, apply_fn, self._cur_sid)
         self._refresh_model_btn()
         self._set_status(f"{label}：将在当前任务结束后生效")
 
-    def _apply_pending_model(self) -> None:
-        """任务结束（完成或被终止）后应用挂起的模型切换。"""
+    def _apply_pending_model(self, sid: str = "") -> None:
+        """任务结束（完成或被终止）后应用挂起的模型切换。
+
+        `sid` 是本轮结束的任务：与挂起记录不符就什么都不做（别的任务还在跑）。
+        """
         pend = self._pending_model
+        if not pend:
+            self._refresh_model_btn()
+            return
+        owner = pend[2] if len(pend) > 2 else ""
+        if sid and owner and sid != owner:
+            return
         self._pending_model = None
         self._refresh_model_btn()          # 先摘掉「待生效」标记
-        if pend:
-            label, apply_fn = pend
-            self._set_status(f"模型已切换：{label}")
-            apply_fn()
+        label, apply_fn = pend[0], pend[1]
+        self._set_status(f"模型已切换：{label}")
+        apply_fn()
 
     def _set_provider(self, pid: str) -> None:
         if not pid or pid == self._active_provider:

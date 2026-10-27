@@ -872,6 +872,9 @@ QTabBar::tab:hover { color: #d6dbe8; }
 }
 #NavTaskItem:hover { background-color: #1d2230; color: #eef1fa; }
 #NavTaskItem[active="true"] { background-color: #20263a; color: #ffffff; }
+/* 1.0.10 多任务并行：后台正在跑的任务行首带 ● 并高亮（不抢当前任务的白字） */
+#NavTaskItem[running="true"] { color: #8fd3a6; }
+#NavTaskItem[running="true"][active="true"] { color: #ffffff; }
 #NavTaskItem[sub="true"] {
     padding-left: 36px;
     font-size: 12px;

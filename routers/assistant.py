@@ -103,7 +103,21 @@ async def state():
 
 @router.get("/sessions")
 async def sessions(include_archived: bool = False):
-    return ok(get_assistant().session_list(include_archived))
+    """任务列表。多任务并行后每行带 `running`：同一工作空间里哪些任务在跑。
+
+    `running` 来自后端的活跃轮次表（不是客户端推断），所以两个窗口 / 重启
+    客户端后左栏的运行圆点也是准的。
+    """
+    ass = get_assistant()
+    rows = ass.session_list(include_archived)
+    try:
+        running = set(ass.running_ids())
+    except Exception:  # noqa: BLE001
+        running = set()
+    for r in rows:
+        if isinstance(r, dict):
+            r["running"] = str(r.get("id")) in running
+    return ok(rows)
 
 
 @router.post("/sessions")

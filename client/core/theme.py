@@ -360,6 +360,9 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #NavTaskItem { color: #3a4152; }
 #NavTaskItem:hover { background-color: #e2e7f0; color: #12161f; }
 #NavTaskItem[active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
+/* 1.0.10 多任务并行：后台运行中任务的高亮色（浅色主题用深绿保证对比度） */
+#NavTaskItem[running="true"] { color: #14713c; }
+#NavTaskItem[running="true"][active="true"] { color: #1b3a8f; }
 #NavTaskItem[sub="true"] { color: #4d5567; }
 #NavTaskItem[sub="true"][active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
 #NavTaskItem[more="true"] { color: #6f7a8f; }

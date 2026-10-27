@@ -859,7 +859,7 @@ def test_http_state_and_tools(env):
     body = asyncio.run(api.state())
     assert body["code"] == 0
     data = body["data"]
-    assert data["version"] == "1.0.9"
+    assert data["version"].count(".") == 2      # 别硬编码版本号：每次发版都要改测试
     assert data["orchestrator"] in ("langgraph", "sequential")
     assert any(t["name"] == "fs_read" for t in data["tools"])
 
