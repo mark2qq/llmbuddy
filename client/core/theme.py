@@ -335,7 +335,8 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #BarChip[active="true"] { background-color: #dbe4fb; color: #1b3a8f; }
 #ModelChip { color: #2b3242; padding: 2px 6px; }
 #ModelChip:hover { background-color: #eceff6; color: #12161f; }
-#BusyDot { color: #6b7385; }
+#BusySpin { color: #4d5567; }
+#ComposerMeta { color: #6b7385; }
 #SendBtn { background-color: #1b2130; color: #ffffff; }
 #SendBtn:hover { background-color: #2b3242; }
 #SendBtn:disabled { background-color: #e6eaf2; color: #aab1c0; }

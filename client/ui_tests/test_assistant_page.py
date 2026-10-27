@@ -523,7 +523,7 @@ def test_bottom_bar_is_single_row_inside_composer(page):
     p, _fake = page
     assert p._composer is not None
     for w in (p._input, p._attach_btn, p._ws_btn, p._policy_btn, p._skill_btn,
-              p._model_btn, p._send_btn, p._stop_btn, p._busy_lbl):
+              p._model_btn, p._send_btn, p._stop_btn, p._busy_spin):
         assert p._composer.isAncestorOf(w), w.objectName()
     # 顶栏只留标题 + 管理入口
     assert not p._composer.isAncestorOf(p._manage_btn)
@@ -1411,14 +1411,76 @@ def test_space_menu_has_new_task_action(page):
 # ---------------------------------------------------------------------------
 # 1.0.11 新增：空间创建 / 提示词库（插入 + 管理 + ✨优化）
 # ---------------------------------------------------------------------------
-def test_composer_has_enhance_button_before_ctx_meter(page):
-    """底栏不再有「📝 提示词」，✨ 增强提示词挪到上下文占用左边。"""
+def test_composer_has_enhance_button_and_ctx_meter_moved_below(page):
+    """底栏不再有「📝 提示词」；✨ 留在底栏，上下文占用改到输入框下方。"""
     p, _fake = page
     assert not hasattr(p, "_prompt_btn"), "「📝 提示词」已按用户要求移除"
     assert hasattr(p, "_enhance_btn") and p._enhance_btn.text() == "✨"
     assert p._composer.isAncestorOf(p._enhance_btn)
-    lay = p._bar_lay
-    assert lay.indexOf(p._enhance_btn) < lay.indexOf(p._ctx_meter)
+    # 1.0.12：上下文圆环不再是底栏成员（挪到输入框下方信息行）
+    assert not p._composer.isAncestorOf(p._ctx_meter)
+    assert p._bar_lay.indexOf(p._ctx_meter) == -1
+    # 运行指示仍在底栏，且紧挨模型按钮之前
+    assert p._composer.isAncestorOf(p._busy_spin)
+    assert p._bar_lay.indexOf(p._busy_spin) < p._bar_lay.indexOf(p._model_btn)
+
+
+def test_enhance_button_only_shown_when_input_has_text(page):
+    """✨ 的显隐条件：输入框空 → 隐藏；有内容 → 出现；清空 → 再隐藏。"""
+    p, _fake = page
+    p._input.setPlainText("")
+    assert p._enhance_btn.isHidden()
+    p._input.setPlainText("帮我写周报")
+    assert not p._enhance_btn.isHidden()
+    # 纯空白也算空
+    p._input.setPlainText("   \n  ")
+    assert p._enhance_btn.isHidden()
+    # 重新输入后仍会出现（状态不粘）
+    p._input.setPlainText("再写一条")
+    assert not p._enhance_btn.isHidden()
+
+
+def test_enhance_button_stays_visible_while_enhancing(page):
+    """增强过程中即使输入框被清空/流式回填为空档，✨（此刻是 ⏹）也不能消失。"""
+    p, _fake = page
+    p._input.setPlainText("原始输入")
+    p._enhancing = True
+    p._input.setPlainText("")
+    assert not p._enhance_btn.isHidden()
+    p._enhancing = False
+    p._sync_enhance_visible()
+    assert p._enhance_btn.isHidden()
+
+
+def test_ctx_meter_renders_below_composer_with_text(page):
+    """上下文信息区域在输入框下方：圆环 + 文字（无数据时整块隐藏）。"""
+    p, _fake = page
+    p._apply_context({"used": 2640, "limit": 8000, "ratio": 0.33})
+    assert not p._ctx_meter.isHidden()
+    assert not p._ctx_meta.isHidden()
+    assert "上下文 33%" in p._ctx_meta.text()
+    # 位置：在 composer 之外（下方信息行里），与合规提示同一行
+    assert not p._composer.isAncestorOf(p._ctx_meta)
+    assert p._ctx_meta.parentWidget() is not None
+    # 无数据 → 圆环与文字一起隐藏
+    p._apply_context({"used": 0, "limit": 0})
+    assert p._ctx_meter.isHidden() and p._ctx_meta.isHidden()
+    assert p._ctx_meta.text() == ""
+
+
+def test_busy_spinner_is_larger_than_old_glyph_and_animates(page):
+    """加载环放大到 24×24 自绘圆弧，运行中真的在转。"""
+    p, _fake = page
+    spin = p._busy_spin
+    assert spin.width() >= 24 and spin.height() >= 24, "加载环要放大到 ≥24px"
+    assert spin.isHidden() and not spin.is_spinning()
+    p._begin_streaming()
+    assert not spin.isHidden() and spin.is_spinning()
+    a0 = spin.angle
+    spin._tick()                      # 手动走一帧，不依赖事件循环
+    assert spin.angle != a0
+    p._end_streaming()
+    assert spin.isHidden() and not spin.is_spinning()
 
 
 def test_input_has_prompt_requested_signal(page):
@@ -2214,17 +2276,18 @@ def test_send_stop_swap_while_streaming(page):
     p, _fake = page
     assert not p._send_btn.isHidden()
     assert p._stop_btn.isHidden()
-    assert p._busy_lbl.isHidden()
+    assert p._busy_spin.isHidden()
     assert p._guide_btn.isHidden()
     p._begin_streaming()
     assert not p._send_btn.isHidden()        # ↑ 变成排队入队（不再隐藏）
     assert not p._stop_btn.isHidden()
-    assert not p._busy_lbl.isHidden()       # 运行中显示旋转指示
+    assert not p._busy_spin.isHidden()      # 运行中显示旋转指示
+    assert p._busy_spin.is_spinning()
     assert not p._guide_btn.isHidden()      # ⚡ 引导发送（仅忙碌可见）
     p._end_streaming()
     assert not p._send_btn.isHidden()
     assert p._stop_btn.isHidden()
-    assert p._busy_lbl.isHidden()
+    assert p._busy_spin.isHidden()
     assert p._guide_btn.isHidden()
 
 
@@ -2234,7 +2297,7 @@ def test_send_stop_swap_while_streaming(page):
 def test_light_theme_covers_bottom_bar_and_nav(page):
     from core.theme import build_stylesheet
     css = build_stylesheet("#ffffff")
-    for sel in ("#BarChip", "#ModelChip", "#BarBtn", "#BusyDot", "#SendBtn",
+    for sel in ("#BarChip", "#ModelChip", "#BarBtn", "#BusySpin", "#SendBtn",
                 "#NavSubItem", "#NavSessList", "#ApprovalCard",
                 "#QueuePanel", "#QueueRow", "#QueueOp", "#GuideBtn",
                 "#BubbleTime", "#QueueResumeBtn"):

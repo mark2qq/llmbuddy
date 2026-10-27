@@ -339,6 +339,8 @@ def test_bottom_bar_fits_at_min_window(page):
     p.resize(770, 680)
     p._skill_slugs = []
     p._refresh_skill_chips()
+    # ✨ 只在输入框有内容时出现（1.0.12），量「最挤」的空闲态就先给它内容
+    p._input.setPlainText("占位")
     _settle()
     w = _bar_width(p)
     avail = p._composer.width() - 16
@@ -353,10 +355,9 @@ def test_bottom_bar_fits_at_min_window(page):
         assert btn.text().strip(), f"{btn.objectName()} 无文字"
     # 底栏不再有「提示词」按钮（功能仍在，入口改到输入框右键）
     assert not hasattr(p, "_prompt_btn")
-    # ✨ 在上下文占用左边（用户指定位置）
-    lay = p._bar_lay
-    assert lay.indexOf(p._enhance_btn) >= 0
-    assert lay.indexOf(p._enhance_btn) < lay.indexOf(p._ctx_meter)
+    # ✨ 在底栏内；上下文圆环已挪到输入框下方（1.0.12）
+    assert p._bar_lay.indexOf(p._enhance_btn) >= 0
+    assert p._bar_lay.indexOf(p._ctx_meter) == -1
 
 
 def test_bottom_bar_fits_in_busy_state(page):
@@ -368,8 +369,9 @@ def test_bottom_bar_fits_in_busy_state(page):
     p.resize(770, 680)
     p._skill_slugs = []
     p._refresh_skill_chips()
+    p._input.setPlainText("占位")      # 让 ✨ 也可见 = 最挤组合
     _settle()
-    p._busy_lbl.setVisible(True)
+    p._busy_spin.start()              # 24×24 加载环（1.0.12 放大）
     p._stop_btn.setVisible(True)
     p._guide_btn.setVisible(True)
     _settle()
@@ -377,7 +379,7 @@ def test_bottom_bar_fits_in_busy_state(page):
     avail = p._composer.width() - 16
     assert w <= avail, f"忙碌态底栏 {w}px 超实际可用宽 {avail}px"
     assert w <= BAR_BUDGET_W, f"忙碌态底栏 {w}px 超门禁 {BAR_BUDGET_W}px"
-    p._busy_lbl.setVisible(False)
+    p._busy_spin.stop()
     p._stop_btn.setVisible(False)
     p._guide_btn.setVisible(False)
     _settle()
@@ -1165,27 +1167,31 @@ def test_refresh_tools_failure_resets_button(page):
 
 
 def test_bottom_bar_fits_with_context_meter(page):
-    """上下文圆环显示 + 忙碌态全按钮：底栏仍不超可用宽度。
+    """上下文占用显示 + 忙碌态全按钮：底栏仍不超可用宽度。
 
-    1.0.11 把「上下文 6% · 453/8.2k」从输入框下方小字改成输入条右侧的图标
-    （圆环，数字进 tooltip），会真的占底栏宽度，所以要在最挤的组合下验一遍。
+    1.0.11 把「上下文 6% · 453/8.2k」从输入框下方小字改成输入条右侧的图标；
+    1.0.12 又按用户要求**挪回输入框下方**（圆环 + 文字都在信息行里），
+    所以它不再计入底栏宽度。本用例保留最挤组合回归：上下文有数据 + 忙碌态
+    三按钮 + ✨ 可见，底栏仍须 ≤ 770 面板的实测可用宽。
 
     宽度基准取**真实最窄面板**：主窗口最小宽 1000 - 左栏 200 - 页面边距 ≈ 770，
     而不是老的 720px 门禁（那是按 720 逻辑高推的保守场景，实际窗口到不了）。
-    另外钉一个「图标宽度 ≤ 22px」的上限：一旦有人往圆环里塞文字就会先在这里失败。
     """
     p, _fake = page
     p.resize(770, 680)
     p._skill_slugs = []
     p._refresh_skill_chips()
     p._apply_context({"used": 7000, "limit": 8000, "ratio": 0.875})
-    p._busy_lbl.setVisible(True)
+    p._input.setPlainText("占位")
+    p._busy_spin.start()
     p._stop_btn.setVisible(True)
     p._guide_btn.setVisible(True)
     _settle()
     assert p._ctx_meter.is_hot() is True
     assert not p._ctx_meter.isHidden()
-    assert p._ctx_meter.width() <= 22, "上下文圆环只能是图标（文字请放 tooltip）"
+    # 圆环在底栏之外（输入框下方信息行），文字标签跟着显示
+    assert p._bar_lay.indexOf(p._ctx_meter) == -1
+    assert not p._ctx_meta.isHidden() and "上下文" in p._ctx_meta.text()
     w = _bar_width(p)
     avail = p._composer.width() - 16      # 减去 composer 左右内边距
-    assert w <= avail, f"带上下文圆环的忙碌态底栏 {w}px 超可用宽 {avail}px"
+    assert w <= avail, f"带上下文占用的忙碌态底栏 {w}px 超可用宽 {avail}px"

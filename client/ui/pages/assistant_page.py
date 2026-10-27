@@ -65,6 +65,7 @@ from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
                                         ProcessLine, StepLine, ThinkingBlock)
 from ui.widgets.auto_scroll_area import AutoHideScrollArea
+from ui.widgets.busy_spinner import BusySpin
 from ui.widgets.context_meter import ContextMeter
 from ui.widgets.image_composer import (IMAGE_EXTS, AttachmentBar, PasteImageEdit,
                                        save_image)
@@ -644,8 +645,7 @@ def parse_mcp_json(text: str) -> List[Dict[str, Any]]:
     if not out:
         raise ValueError("没有找到任何 MCP 服务器配置（需要一个 command 或 url）。")
     return out
-# 运行中指示的旋转字符
-SPIN_FRAMES = "◐◓◑◒"
+# 运行中指示已改为自绘圆弧控件（`ui/widgets/busy_spinner.py`，1.0.12）
 
 
 class AssistantPage(QWidget):
@@ -742,7 +742,6 @@ class AssistantPage(QWidget):
         self._ws_synced = False
         # 管理面板懒创建（任务/技能/工具/MCP/审计 tab 在里面）
         self._manager: Optional["ManagerDialog"] = None
-        self._spin_i = 0
         # 各管理列表在面板未创建时为 None，填充函数都要判空
         self._all_sess_list = None
         self._skill_list = None
@@ -1104,10 +1103,20 @@ class AssistantPage(QWidget):
 
         il.addWidget(self._build_composer())
 
-        # 合规提示行（上下文占用已挪进输入条右侧，见 _build_composer）
+        # 输入框下方的信息行（1.0.12 按用户要求把上下文占用从底栏挪到这里）：
+        #   左：上下文占用（圆环 + 「上下文 33% · 2.6k/8.0k」，无数据整块隐藏）
+        #   右：AI 合规提示
+        # 单独占一行比塞在底栏内更好读：这一行可用宽度 ~940，不再受底栏
+        # BAR_BUDGET_W 限制，所以除了圆环还能带文字。
         meta = QHBoxLayout()
         meta.setContentsMargins(6, 0, 6, 0)
-        meta.setSpacing(6)
+        meta.setSpacing(4)
+        self._ctx_meter = ContextMeter()
+        meta.addWidget(self._ctx_meter, 0, Qt.AlignVCenter)
+        self._ctx_meta = QLabel("")
+        self._ctx_meta.setObjectName("ComposerMeta")
+        self._ctx_meta.setVisible(False)
+        meta.addWidget(self._ctx_meta, 0, Qt.AlignVCenter)
         meta.addStretch(1)
         tip = QLabel("内容由 AI 生成，请核实重要信息")
         tip.setObjectName("ComposerTip")
@@ -1178,18 +1187,23 @@ class AssistantPage(QWidget):
 
             ┌ 今天帮你做些什么？ ───────────────────────────────┐
             │                                                        │
-            │ [+] [工作区][⊘只读自动][技能][工具][MCP]  ◐  [模型▾] [⚡][↑] │
+            │ [+] [工作区][⊘自动][技能][工具][MCP]  ✨ ◌ [模型▾] [■][⚡][↑] │
             └────────────────────────────────────────────────────────┘
+              ◐ 上下文 33% · 2.6k/8.0k        内容由 AI 生成，请核实重要信息
+              └──── 输入框下方信息行，见 _build_footer ────┘
 
-        左侧是「动作与上下文」，右侧是「运行状态 / 模型 / 发送」。
+        左侧是「动作与上下文」，右侧是「增强 / 运行状态 / 模型 / 发送」。
         1.0.9 引导会话：忙碌态 ↑ 语义变为「排队入队」、左侧新增 ⚡
         「引导发送」、停止 ■ 同时可见；空闲态保持现状（■/⚡ 隐藏）。
+        1.0.12：上下文占用移到输入框下方；运行指示改为 24×24 自绘圆弧
+        （`BusySpin`）；✨ 只在输入框有内容时出现。
 
         1.0.8 清单中心宽度约束（架构 §5.4，逻辑屏宽 720 → 可用 504px）：
           ① 工作区文案压到 ≤4 字（`_refresh_ws_btn`）；② 模型名短名 ≤8 字
              （`_refresh_model_btn`）；③ 底栏 spacing 4→2、边距 8→6；
           ④ 挂载 chip ≥3 个时折行到输入框上方（`_reparent_skill_chips`）。
         **不做**任何宽度自适应隐藏 —— 三个按钮必须始终可见且带文字。
+        （✨ 的显隐是用户指定的**内容条件**，不是宽度自适应。）
         """
         box = QFrame()
         box.setObjectName("Composer")
@@ -1216,6 +1230,8 @@ class AssistantPage(QWidget):
         self._input.image_pasted.connect(self._on_image_pasted)
         # 提示词库入口（底栏不再放按钮）：输入框右键 →「插入提示词…」
         self._input.prompt_requested.connect(self._open_prompt_picker)
+        # ✨ 显隐跟随输入内容（空 → 隐藏；有字 → 出现），见 `_sync_enhance_visible`
+        self._input.textChanged.connect(self._sync_enhance_visible)
         lay.addWidget(self._input)
 
         bar = QHBoxLayout()
@@ -1293,9 +1309,10 @@ class AssistantPage(QWidget):
 
         bar.addStretch(1)
 
-        # ✨ 增强提示词（原在最右侧，按用户要求挪到上下文占用左边）：
+        # ✨ 增强提示词（右组最前）：
         # 把输入框里的文字交给模型改写为结构化「增强版提示词」。
-        # 位置在右组最前，`_ctx_meter` 无数据会隐藏，但 ✨ 始终可见。
+        # **只在输入框有内容时显示**（见 `_sync_enhance_visible`），空输入框
+        # 不占位——用户原话「对话框内没有内容时不显示，输入后才显示」。
         self._enhance_btn = QPushButton("✨")
         self._enhance_btn.setObjectName("GuideBtn")
         self._enhance_btn.setStyleSheet("padding: 0px;")
@@ -1303,25 +1320,15 @@ class AssistantPage(QWidget):
         self._enhance_btn.setCursor(Qt.PointingHandCursor)
         self._enhance_btn.setToolTip("增强提示词：把当前输入改写为结构化提示词")
         self._enhance_btn.clicked.connect(self._enhance_prompt)
+        self._enhance_btn.setVisible(False)     # 初始输入框为空 → 先不显示
         bar.addWidget(self._enhance_btn, 0, Qt.AlignVCenter)
 
-        # 右：上下文占用 / 运行指示 / 模型 / 发送
-        #
-        # 上下文占用（1.0.11 再调）：原来是输入框下面单独一行小字
-        # 「上下文 6% · 453/8.2k」，占高度、且挤压合规提示。按 WorkBuddy
-        # 的位置挪到最后一行右组的最前面，**只用一个圆环图标**表示占用比例，
-        # 具体数字（百分比 / 已用 / 上限）走 tooltip。无数据时 setVisible(False)，
-        # 不凭空占底栏宽度（底栏有 BAR_BUDGET_W 宽度门禁）。
-        self._ctx_meter = ContextMeter()
-        bar.addWidget(self._ctx_meter, 0, Qt.AlignVCenter)
+        # 运行中旋转指示（1.0.12 放大：13px 字符 ◐ → 24×24 自绘圆弧）
+        # 位置在 ✨ 与模型按钮之间（原上下文圆环的位置，圆环已挪到下方信息行）。
+        self._busy_spin = BusySpin()
+        bar.addWidget(self._busy_spin, 0, Qt.AlignVCenter)
 
-        self._busy_lbl = QLabel("")
-        self._busy_lbl.setObjectName("BusyDot")
-        self._busy_lbl.setFixedWidth(16)
-        self._busy_lbl.setToolTip("助理正在工作")
-        self._busy_lbl.setVisible(False)
-        bar.addWidget(self._busy_lbl)
-
+        # 右：运行指示 / 模型 / 发送
         self._model_btn = QPushButton("模型")
         self._model_btn.setObjectName("ModelChip")
         _compact_chip(self._model_btn)
@@ -1366,16 +1373,23 @@ class AssistantPage(QWidget):
         bar.addWidget(self._send_btn)
 
         lay.addLayout(bar)
-
-        self._spin_timer = QTimer(self)
-        self._spin_timer.setInterval(120)
-        self._spin_timer.timeout.connect(self._tick_spin)
         return box
 
-    # ---------------- 运行中指示（WorkBuddy 的加载环） ----------------
-    def _tick_spin(self) -> None:
-        self._spin_i = (self._spin_i + 1) % len(SPIN_FRAMES)
-        self._busy_lbl.setText(SPIN_FRAMES[self._spin_i])
+    # ---------------- 运行中指示（WorkBuddy 的加载环，1.0.12 放大） ----------------
+    def _sync_enhance_visible(self) -> None:
+        """✨ 增强按钮的显示条件（用户要求：空输入框不显示）。
+
+        生效条件：
+          · 输入框 trim 后**有内容** → 显示；
+          · 输入框为空（含发送后清空、点清空、切到空任务） → 隐藏；
+          · 正在增强（`_enhancing`）时**始终显示**——此时它已经是 ⏹ 取消键，
+            不能因为流式回填的中途空档闪没。
+        """
+        btn = getattr(self, "_enhance_btn", None)
+        if btn is None:
+            return
+        has_text = bool(self._input.toPlainText().strip())
+        btn.setVisible(has_text or bool(getattr(self, "_enhancing", False)))
 
     # ---------------- 提示词库（1.0.11，对齐 WorkBuddy ✨/提示词） ----------------
     def _open_prompt_picker(self) -> None:
@@ -1555,27 +1569,26 @@ class AssistantPage(QWidget):
         self._input.moveCursor(QTextCursor.End)
 
     def _start_spin(self) -> None:
-        self._spin_i = 0
-        self._busy_lbl.setText(SPIN_FRAMES[0])
-        self._busy_lbl.setVisible(True)
-        self._spin_timer.start()
+        self._busy_spin.start()
 
     def _stop_spin(self) -> None:
-        self._spin_timer.stop()
-        self._busy_lbl.setVisible(False)
+        self._busy_spin.stop()
 
     # ---------------- 挂载 chip：≥3 个折行到输入框上方（宽度压缩规则 ④） ----------------
     #: 底栏可用宽度（单一来源：测试从本类导入，不各自硬编码字面量）。
     #:
     #: 预算口径（2026-06 重算）：主窗口最小宽 **1000**、左栏 **200** → 右栏
-    #: 最窄约 **770**。底栏实测：空闲态（含 📝提示词 / ✨ 全部按钮带文字）
-    #: **542px**、忙碌态（再 + 运行指示 / 停止 / 引导）**614px**，均远低于 770。
+    #: 最窄约 **770**。底栏实测（1.0.12，QT_SCALE_FACTOR=2 抓图核对）：
+    #: 空闲态 + ✨ 可见 **384px**、忙碌态（+ 24px 加载环 / 停止 / 引导）**470px**、
+    #: 空闲态无内容（✨ 隐藏）**356px**，均远低于 770。
     #: 取 720 为门禁 = 770 - 50（页面边距 + style 抖动 + 挂载 chip 折行前的缓冲）。
     #: 三类状态（idle / busy / 5-chip 折行后）都满足 ≤720；芯片 ≥3 个时按本
     #: 预算提前折行到输入框上方（见 `_chips_width_over_budget`）。
     #:
     #: 注：旧的 514 是按「720 逻辑宽」推的保守场景，但本应用最小宽 1000、
     #: 右栏到不了 520，故 514 已不成立——空底栏本身就 542px，会误报。
+    #: 1.0.12 口径变化：上下文圆环挪到输入框下方（-19）、运行指示 16→24（+8）、
+    #: ✨ 空输入框时隐藏（-26），最坏情况仍按「✨ 可见 + 忙碌态」算 = 470。
     BAR_BUDGET_W = 720
 
     def _chips_width_over_budget(self, count: int) -> bool:
@@ -1596,10 +1609,9 @@ class AssistantPage(QWidget):
                 chips_w += w.sizeHint().width()
         chips_w += spacing * max(0, lay.count() - 1)
         # 底栏其它固定项（+ / 工作区 / 策略 / 技能 / 工具 / MCP / ✨ /
-        # 模型 / 发送…）。468 是实测的空底栏占用（770 右栏、9 个常驻按钮，
-        # 已去掉「📝 提示词」——提示词库入口在输入框右键）；忙碌态 540。
-        # 留 8px 余量吃掉 style 抖动。
-        base = 468
+        # 加载环 / 模型 / 发送…）。470 是 1.0.12 实测的**最挤**常驻占用
+        # （忙碌态 + ✨ 可见；空闲 384、✨ 隐藏 356）。留 8px 余量吃 style 抖动。
+        base = 470
         return (base + chips_w + 8) > self.BAR_BUDGET_W
 
     def _reparent_skill_chips(self, count: int) -> None:
@@ -4920,7 +4932,7 @@ class AssistantPage(QWidget):
         return f"{v / 1000:.1f}k" if v >= 1000 else str(v)
 
     def _apply_context(self, ev: Dict[str, Any]) -> None:
-        """更新输入条右侧的上下文小圆环，压缩时插入一行分隔提示。
+        """更新输入框**下方**信息行的上下文占用（1.0.12 从底栏挪下来）。
 
         事件来源：后端每轮开始发的 `context`，以及会话详情的 `context_usage`
         （切到旧任务也能显示，不必等下次发言）。
@@ -4935,12 +4947,29 @@ class AssistantPage(QWidget):
             used = limit = 0
         if limit <= 0:
             meter.clear()
+            self._sync_ctx_meta()
             return
         meter.set_usage(used, limit)
+        self._sync_ctx_meta()
         if ev.get("compressed") and "folded" in ev:
             # 只有真正的压缩事件才插提示行：`context_usage`（切旧任务时的
             # 摘要统计）也带 compressed=True，这里再插就重复了
             self._add_context_line(ev)
+
+    def _sync_ctx_meta(self) -> None:
+        """把上下文占用同步到信息行的文字标签（圆环图标 + 文字，无数据一起隐藏）。
+
+        文字口径与圆环 tooltip 首行同源（`ContextMeter.text()`），避免两处
+        百分比不一致。
+        """
+        meter = getattr(self, "_ctx_meter", None)
+        lab = getattr(self, "_ctx_meta", None)
+        if meter is None or lab is None:
+            return
+        text = meter.text()
+        lab.setText(text)
+        lab.setVisible(bool(text))
+        lab.setToolTip(meter.toolTip())
 
     def _add_context_line(self, ev: Dict[str, Any]) -> None:
         """对话流里的「✓ 上下文已压缩」分隔行（模仿 WorkBuddy）。"""
@@ -5008,6 +5037,7 @@ class AssistantPage(QWidget):
         self._reset_attachments()
         if getattr(self, "_ctx_meter", None) is not None:
             self._ctx_meter.clear()
+            self._sync_ctx_meta()
         # 自动加载提示的去重表跟着对话清空（换任务重新提示一次）
         self._auto_tips.clear()
         # 队列面板跟随任务重置（新任务的快照由 _fetch_queue 拉回）

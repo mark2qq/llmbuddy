@@ -696,10 +696,17 @@ QTabBar::tab:hover { color: #d6dbe8; }
 }
 #ModelChip:hover { background-color: #222839; color: #ffffff; }
 
-/* 运行中指示（WorkBuddy 的加载环位置） */
-#BusyDot {
-    color: #8b93a7;
-    font-size: 13px;
+/* 运行中指示（WorkBuddy 的加载环位置）：1.0.12 改自绘圆弧，24×24，颜色走 palette */
+#BusySpin {
+    color: #c2cbdd;
+    background: transparent;
+    border: none;
+}
+
+/* 输入框下方信息行的上下文文字（圆环右边；无数据时整行隐藏） */
+#ComposerMeta {
+    color: #7d8596;
+    font-size: 11px;
     background: transparent;
     border: none;
 }
