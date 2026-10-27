@@ -454,6 +454,10 @@ def page(monkeypatch):
     p.build_nav_panel()   # 主窗口会把这块挂到左栏「智能助理」下面
     p.refresh()           # 构造不自动刷新（避免 exec() 前起线程），测试里手动触发
     assert _pump(lambda: bool(p._state))
+    # 首次进入不再自动建任务：没有可复用的空任务就进空白草稿态（sid 为空）。
+    # 这里补一次显式「点 + 新建」，让各用例跑在一条真实的空任务上（与旧行为等价）。
+    if not p._session_id:
+        p._new_session()
     assert _pump(lambda: bool(p._session_id))
     assert _pump(lambda: "s1" in p._nav_task_btns)
     # 假任务的 workspace 就是 state.workspace（= 默认空间），所以「空间」区是空的；
@@ -999,14 +1003,76 @@ def test_delete_confirm_uses_visible_dialog_parent(page, monkeypatch):
         dlg.hide()
 
 
-def test_delete_current_session_recreates(page):
-    """删掉的正好是当前会话：清空对话并新开一个，界面不能停在已删除的会话上。"""
+def test_delete_current_session_switches_instead_of_creating(page):
+    """删掉当前任务时切到剩下的任务，**不许新建**。
+
+    旧实现删完当前任务会 `_new_session(silent=True)`，后端立刻在同一工作区
+    补一条 0 条消息的「新任务」——用户看到的就是「删了又回来、删不掉」。
+    """
     p, fake = page
     before = p._session_id
     created = fake.created
+    fake.tasks = [
+        {"id": "s1", "title": "聊过的", "message_count": 3, "updated_at": 300.0},
+        {"id": before, "title": "新任务", "message_count": 0, "updated_at": 100.0},
+    ]
+    p._apply_sessions([dict(t) for t in fake.tasks])
+    assert _pump(lambda: "s1" in p._nav_task_btns)
     p._on_session_deleted({"deleted": True}, before)
-    assert p._session_id != before
-    assert _pump(lambda: fake.created == created + 1)
+    assert p._session_id == "s1", "应切到剩下的任务，而不是新建一个"
+    assert fake.created == created, "删除任务时不得再自动新建空任务"
+
+
+def test_delete_last_session_enters_draft_without_creating(page):
+    """删掉最后一个任务：回到空白草稿态（不落盘、不新建）。"""
+    p, fake = page
+    before = p._session_id
+    created = fake.created
+    ws = p._state.get("workspace") or ""
+    p._apply_sessions([{"id": before, "title": "新任务", "message_count": 0,
+                        "workspace": ws, "updated_at": 1.0}])
+    p._on_session_deleted({"deleted": True}, before)
+    assert p._session_id == "", "没有任务时应进草稿态（sid 为空）"
+    assert "" in p._runs
+    assert fake.created == created, "没有任务时也不许自动新建（这就是删不掉的原因）"
+
+
+def test_sweep_empty_sessions_includes_current_task(page, monkeypatch):
+    """「清理空任务」必须能清掉当前那个空任务（旧实现把它永久排除 → 永远清不掉）。"""
+    from ui.pages import assistant_page as mod
+    monkeypatch.setattr(mod, "QMessageBox", _FakeMB)
+    _FakeMB.calls = []
+    p, fake = page
+    cur = p._session_id
+    ws = p._state.get("workspace") or ""
+    p._apply_sessions([
+        {"id": cur, "title": "新任务", "message_count": 0,
+         "workspace": ws, "updated_at": 2.0},
+        {"id": "s1", "title": "聊过的", "message_count": 3,
+         "workspace": ws, "updated_at": 3.0},
+    ])
+    p._sweep_empty_sessions()
+    assert _pump(lambda: cur in fake.deleted), "当前空任务也要被清理"
+    assert p._session_id == "", "清掉当前空任务后回到草稿态"
+
+
+def test_space_expansion_hides_zero_message_ghost_task(page):
+    """空间展开区不列 0 条消息的「新任务」幽灵（当前任务除外）。"""
+    p, _fake = page
+    p._session_id = "live"
+    ws = r"E://tmp//ws"
+    p._apply_spaces([{
+        "path": ws, "name": "ws", "exists": True, "current": True, "count": 2,
+        "tasks": [
+            {"id": "live", "title": "聊过的", "message_count": 3,
+             "updated_at": 300.0},
+            {"id": "ghost", "title": "新任务", "message_count": 0,
+             "updated_at": 100.0},
+        ],
+    }])
+    sp = p._nav_spaces[0]
+    assert [t["id"] for t in sp["tasks"]] == ["live"], "空任务不该出现在空间里"
+    assert sp["count"] == 1, "计数要按过滤后的可见任务算"
 
 
 def test_delete_failure_reports_instead_of_silent(page, monkeypatch):

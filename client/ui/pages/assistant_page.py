@@ -2558,15 +2558,41 @@ class AssistantPage(QWidget):
             return
         if self._sel_sid == sid:
             self._sel_sid = ""
+        # 注意：必须先记下「删的是不是当前任务」再 dispose —— `_dispose_run`
+        # 会把 `_active_sid` 清空（`_show_run("")`），之后 `_session_id` 已经是 ""，
+        # 再比较就永远不相等，切任务/草稿态的分支会被跳过。
+        was_current = (sid == self._session_id)
         # 这个任务的运行态（含后台流）一并销毁，别让它继续往看不见的地方写
         self._dispose_run(sid)
-        if sid == self._session_id or not self._session_id:
-            # 删的是当前任务：清空并新开一个，否则界面停在一条已删除的任务上
-            self._clear_chat()
-            self._new_session(silent=True)
+        if was_current:
+            # 删的是当前任务。**绝不能再自动新建**：旧实现在这里调
+            # `_new_session(silent=True)`，后端会立刻在「当前工作区」补一条
+            # 0 条消息的「新任务」——用户看到的就是「删了又回来、怎么也删不掉」
+            # （空任务还会被下次启动的「复用最近空任务」逻辑继续当前化）。
+            # 正确做法：先把当前任务切到剩下的最近一条；一条都不剩就回到
+            # **空白草稿态**（不落盘，用户真正发消息时才建任务）。
+            left = [s for s in self._session_rows
+                    if str(s.get("id")) != sid]
+            nxt = left[0] if left else None
+            if nxt is not None:
+                self._show_run(str(nxt.get("id")))
+                self._sel_sid = str(nxt.get("id"))
+                self._fill_sessions()
+            else:
+                self._enter_draft()
         else:
             self._fill_sessions()
         self._set_status("任务已删除")
+
+    def _enter_draft(self) -> None:
+        """回到「还没落库的空白任务」：清空对话区，不创建后端任务。
+
+        草稿态 sid 为空，`_on_send_clicked` 会先建任务再发（已有逻辑），
+        所以「没有任何任务」是合法状态，不需要拿一个空任务占位。
+        """
+        self._show_run("")
+        self._clear_chat()
+        self._greet()
 
     def _on_session_delete_failed(self, msg: str) -> None:
         self._set_status(f"删除失败：{msg}")
@@ -2577,10 +2603,11 @@ class AssistantPage(QWidget):
         """清掉 0 条消息的空任务。
 
         反复点「新建任务」或反复切页会自动建任务，列表里会攒一堆「新任务（0 条）」，
-        单个删除太慢，这里给个一键清理（当前任务永远保留）。
+        单个删除太慢，这里给个一键清理；当前任务也一并清理（旧实现把它排除在外，
+        于是「当前那个空任务」永远清不掉，正是用户说的「一直有个新任务删不掉」）。
+        清完回到空白草稿态，不新建。
         """
-        empties = [s for s in self._session_rows
-                   if not s.get("message_count") and s.get("id") != self._session_id]
+        empties = [s for s in self._session_rows if not s.get("message_count")]
         if not empties:
             QMessageBox.information(self._dialog_parent(), "清理空任务",
                                     "没有可清理的空任务。")
@@ -2592,6 +2619,12 @@ class AssistantPage(QWidget):
             QMessageBox.StandardButton.No)
         if ans != QMessageBox.StandardButton.Yes:
             return
+        cur = next((s for s in empties
+                    if str(s.get("id")) == self._session_id), None)
+        if cur is not None:
+            # 先切到草稿：否则第一条删除回调会把「当前任务」判成还在，
+            # 又去切一条别的任务回来
+            self._enter_draft()
         for s in empties:
             Worker(self._assist.delete_session, str(s.get("id"))).start()
         self._set_status(f"正在清理 {len(empties)} 个空任务…")
@@ -3236,7 +3269,10 @@ class AssistantPage(QWidget):
             self._load_profiles()
 
         # 首次进入不要无脑新建：先复用最近一个「0 条消息」的任务。
-        # 否则每启动一次就多一个空任务，左栏「任务 / 空间」两区很快被刷满。
+        # 一个都没有就进**空白草稿态**（不落盘）——旧实现在这里
+        # `_new_session(silent=True)`，于是「每启动一次就多一个空任务」，
+        # 左栏两区很快被一串「新任务」刷满，且它们还会被下次启动继续复用，
+        # 形成「永远有个新任务」的观感。任务只由用户点「+」或首次发消息产生。
         if not self._session_id:
             rows = [s for s in (st.get("sessions") or []) if isinstance(s, dict)]
             idle = next((s for s in rows if not s.get("message_count")), None)
@@ -3247,7 +3283,9 @@ class AssistantPage(QWidget):
                 self._sel_sid = sid
                 self._greet()
             else:
-                self._new_session(silent=True)
+                # 已经有草稿容器就不要重复清空（refresh 会多次进来）
+                if "" not in self._runs:
+                    self._enter_draft()
 
     def _set_status(self, text: str) -> None:
         """状态行：有内容才占位，避免底栏上方常驻一条空白。
@@ -3672,7 +3710,23 @@ class AssistantPage(QWidget):
             self._current_space = _norm_ws(cur)
         elif not self._current_space:
             self._current_space = _norm_ws(self._state.get("workspace") or "")
-        self._nav_spaces = spaces
+        # 展开区也过滤「0 条消息」的僵尸任务：后端按 workspace 全量分组下发，
+        # 连反复点「+」/ 自动兜底攒出来的空任务一起带回来，左栏就会显示成
+        # 一串「新任务」——看上去像删不掉的幽灵。保留三类：有内容的、正在跑的、
+        # 以及**当前任务**（否则「在此空间新建任务」后展开看不到它，像没反应）。
+        cur_sid = self._session_id
+        cleaned = []
+        for sp in spaces:
+            tasks = [t for t in (sp.get("tasks") or [])
+                     if not isinstance(t, dict)
+                     or t.get("message_count", 1)
+                     or str(t.get("id")) == cur_sid
+                     or t.get("running")]
+            sp = dict(sp)
+            sp["tasks"] = tasks
+            sp["count"] = sum(1 for t in tasks if isinstance(t, dict))
+            cleaned.append(sp)
+        self._nav_spaces = cleaned
         self._rebuild_nav_tasks()
 
     def _space_display(self, path: str) -> str:
