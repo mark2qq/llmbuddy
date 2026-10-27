@@ -1342,6 +1342,8 @@ class AssistantPage(QWidget):
         self._input.setFixedHeight(66)
         self._input.installEventFilter(self)
         self._input.image_pasted.connect(self._on_image_pasted)
+        # 提示词库入口（底栏不再放按钮）：输入框右键 →「插入提示词…」
+        self._input.prompt_requested.connect(self._open_prompt_picker)
         lay.addWidget(self._input)
 
         bar = QHBoxLayout()
@@ -1402,15 +1404,6 @@ class AssistantPage(QWidget):
         self._mcp_btn.clicked.connect(self._show_mcp_menu)
         bar.addWidget(self._mcp_btn)
 
-        # [提示词]：全局可复用提示词库，点击从库里插入到输入框（1.0.11）
-        self._prompt_btn = QPushButton("📝 提示词")
-        self._prompt_btn.setObjectName("BarChip")
-        _compact_chip(self._prompt_btn)
-        self._prompt_btn.setCursor(Qt.PointingHandCursor)
-        self._prompt_btn.setToolTip("从提示词库插入 / 管理提示词")
-        self._prompt_btn.clicked.connect(self._open_prompt_picker)
-        bar.addWidget(self._prompt_btn)
-
         # 多技能挂载区：每个已挂载技能一个可移除 chip（最多 5 个）。
         # ④ ≥3 个时 reparent 到输入框上方（`_reparent_skill_chips`），
         #    否则会顶出底栏 504px 门禁。
@@ -1427,6 +1420,18 @@ class AssistantPage(QWidget):
         self._skill_chips_row: Optional[QWidget] = None
 
         bar.addStretch(1)
+
+        # ✨ 增强提示词（原在最右侧，按用户要求挪到上下文占用左边）：
+        # 把输入框里的文字交给模型改写为结构化「增强版提示词」。
+        # 位置在右组最前，`_ctx_meter` 无数据会隐藏，但 ✨ 始终可见。
+        self._enhance_btn = QPushButton("✨")
+        self._enhance_btn.setObjectName("GuideBtn")
+        self._enhance_btn.setStyleSheet("padding: 0px;")
+        self._enhance_btn.setFixedSize(26, 26)
+        self._enhance_btn.setCursor(Qt.PointingHandCursor)
+        self._enhance_btn.setToolTip("增强提示词：把当前输入改写为结构化提示词")
+        self._enhance_btn.clicked.connect(self._enhance_prompt)
+        bar.addWidget(self._enhance_btn, 0, Qt.AlignVCenter)
 
         # 右：上下文占用 / 运行指示 / 模型 / 发送
         #
@@ -1487,16 +1492,6 @@ class AssistantPage(QWidget):
         self._send_btn.setToolTip("发送（Enter）")
         self._send_btn.clicked.connect(self._on_send_clicked)
         bar.addWidget(self._send_btn)
-
-        # ✨ 优化（1.0.11）：把当前输入框里的文字交给模型润色成更好的提示词
-        self._enhance_btn = QPushButton("✨")
-        self._enhance_btn.setObjectName("GuideBtn")
-        self._enhance_btn.setStyleSheet("padding: 0px;")
-        self._enhance_btn.setFixedSize(26, 26)
-        self._enhance_btn.setCursor(Qt.PointingHandCursor)
-        self._enhance_btn.setToolTip("用模型优化当前输入（润色成更好的提示词）")
-        self._enhance_btn.clicked.connect(self._enhance_prompt)
-        bar.addWidget(self._enhance_btn)
 
         lay.addLayout(bar)
 
@@ -1581,10 +1576,11 @@ class AssistantPage(QWidget):
             if w is not None:
                 chips_w += w.sizeHint().width()
         chips_w += spacing * max(0, lay.count() - 1)
-        # 底栏其它固定项（+ / 工作区 / 策略 / 技能 / 工具 / MCP / 📝提示词 /
-        # 模型 / 发送 / ✨…）。542 是 1.0.11 实测的空底栏 sizeHint（9 个常驻
-        # 按钮全带文字）；留 8px 余量吃掉 style 抖动。
-        base = 542
+        # 底栏其它固定项（+ / 工作区 / 策略 / 技能 / 工具 / MCP / ✨ /
+        # 模型 / 发送…）。468 是实测的空底栏占用（770 右栏、9 个常驻按钮，
+        # 已去掉「📝 提示词」——提示词库入口在输入框右键）；忙碌态 540。
+        # 留 8px 余量吃掉 style 抖动。
+        base = 468
         return (base + chips_w + 8) > self.BAR_BUDGET_W
 
     def _reparent_skill_chips(self, count: int) -> None:
@@ -1983,8 +1979,13 @@ class AssistantPage(QWidget):
         if rows is None:
             rows = self._session_rows or []
         rows = [r for r in rows if isinstance(r, dict)]
-        # 「任务」区 = 全局最近任务（跨空间），不按工作区过滤，避免重复列
-        tasks = [r for r in rows if not r.get("archived")]
+        # 「任务」区口径：**只列系统默认工作区**的任务。
+        # 跨空间全列会让同一个任务在左栏出现两次（任务区一条 + 空间展开区一条），
+        # 用户会误以为「建了 2 个任务」。具名空间的任务统一到下方「空间」区看，
+        # 两区互不重复；「空间内建任务像覆盖」由空间可展开列全部任务解决。
+        dws = self._default_ws()
+        tasks = [r for r in rows
+                 if not r.get("archived") and self._task_ws(r) == dws]
         spaces = self._nav_spaces or []
         # 内容签名：expand 状态 / 当前空间 / 各空间任务列表都变了就要重画
         sig = (
@@ -2026,7 +2027,8 @@ class AssistantPage(QWidget):
             lay.addWidget(more)
             lines += 1
         if not tasks:
-            empty = QLabel("还没有任务，点上方 + 新建")
+            empty = QLabel("默认工作区还没有任务，点上方 + 新建"
+                           "（其他空间的任务见下方）")
             empty.setObjectName("NavEmpty")
             empty.setWordWrap(True)
             lay.addWidget(empty)

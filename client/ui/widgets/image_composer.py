@@ -114,6 +114,20 @@ class PasteImageEdit(QTextEdit):
     """
 
     image_pasted = Signal(object)   # QImage
+    prompt_requested = Signal()     # 右键菜单「插入提示词…」被点
+
+    def contextMenuEvent(self, ev) -> None:      # noqa: N802 (Qt 命名)
+        """标准右键菜单 + 一条「插入提示词…」。
+
+        底栏不再放「📝 提示词」按钮（用户要求收紧底栏），提示词库入口改到这里：
+        输入框右键 → 插入提示词，功能不失联，也不占底栏宽度。
+        """
+        menu = self.createStandardContextMenu()
+        menu.addSeparator()
+        act = menu.addAction("插入提示词…")
+        act.triggered.connect(self.prompt_requested.emit)
+        menu.exec(ev.globalPos())
+        menu.deleteLater()
 
     def canInsertFromMimeData(self, source) -> bool:  # noqa: N802 (Qt 命名)
         if _image_from_mime(source) is not None:

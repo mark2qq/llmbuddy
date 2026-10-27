@@ -1156,10 +1156,11 @@ def test_space_click_opens_latest_task(page):
     assert opened == ["b"]
 
 
-def test_task_area_lists_recent_across_spaces(page):
-    """1.0.11：「任务」区 = 跨空间最近任务（默认工作区与其它的都列），
+def test_task_area_lists_only_default_workspace_tasks(page):
+    """「任务」区只列**默认工作区**的任务，其他空间的任务只在「空间」区出现。
 
-    空间分组只在「空间」区呈现，避免同一批任务在「任务」和「空间」两处各列一遍。
+    两区同时列同一个任务会让用户误以为「建了 2 个新任务」（用户截图反馈）。
+    「空间内建任务像覆盖」由空间行可展开列全部任务解决，不靠任务区兜。
     """
     p, fake = page
     default = p._default_ws()
@@ -1171,15 +1172,16 @@ def test_task_area_lists_recent_across_spaces(page):
          "workspace": r"E://other-ws", "updated_at": 200.0},
     ]
     p._apply_sessions([dict(t) for t in fake.tasks])
-    # 「任务」区跨空间列出两条最近任务
-    assert _pump(lambda: "d1" in p._nav_task_btns and "w1" in p._nav_task_btns)
-    assert p._nav_task_title.text() == "任务 (2)"
-    # 「空间」区按工作区分组（other-ws 与默认工作区）
+    # 「任务」区只有默认工作区那条
+    assert _pump(lambda: "d1" in p._nav_task_btns)
+    assert "w1" not in p._nav_task_btns, "跨空间任务不应再重复进「任务」区"
+    assert p._nav_task_title.text() == "任务 (1)"
+    # 但它仍在「空间」区里（other-ws 与默认工作区都算空间候选）
     assert _pump(lambda: {sp["name"] for sp in p._nav_spaces}
                  >= {"other-ws", default.rsplit("/", 1)[-1]})
     texts = [b.text() for b in p._nav_body.findChildren(QPushButton)]
     assert any("默认区任务" in t for t in texts)
-    assert any("空间任务" in t for t in texts)
+    assert not any("空间任务" in t for t in texts)   # 未展开空间时不铺子行
 
 
 def test_new_task_in_space_passes_workspace(page, tmp_path):
@@ -1343,14 +1345,24 @@ def test_space_menu_has_new_task_action(page):
 # ---------------------------------------------------------------------------
 # 1.0.11 新增：空间创建 / 提示词库（插入 + 管理 + ✨优化）
 # ---------------------------------------------------------------------------
-def test_composer_has_prompt_and_enhance_buttons(page):
-    """底栏左侧「📝 提示词」、右侧「✨」优化按钮（对齐 WorkBuddy）。"""
+def test_composer_has_enhance_button_before_ctx_meter(page):
+    """底栏不再有「📝 提示词」，✨ 增强提示词挪到上下文占用左边。"""
     p, _fake = page
-    assert hasattr(p, "_prompt_btn") and p._prompt_btn.text() == "📝 提示词"
+    assert not hasattr(p, "_prompt_btn"), "「📝 提示词」已按用户要求移除"
     assert hasattr(p, "_enhance_btn") and p._enhance_btn.text() == "✨"
-    # 这两个按钮确实挂在底栏输入容器里（不是飘在别处）
-    assert p._composer.isAncestorOf(p._prompt_btn)
     assert p._composer.isAncestorOf(p._enhance_btn)
+    lay = p._bar_lay
+    assert lay.indexOf(p._enhance_btn) < lay.indexOf(p._ctx_meter)
+
+
+def test_input_has_prompt_requested_signal(page):
+    """提示词库入口改到输入框右键：`PasteImageEdit.prompt_requested` 可用。"""
+    p, _fake = page
+    got = []
+    p._input.prompt_requested.disconnect()
+    p._input.prompt_requested.connect(lambda: got.append(1))
+    p._input.prompt_requested.emit()
+    assert got == [1]
 
 
 def test_insert_prompt_appends_to_input(page):

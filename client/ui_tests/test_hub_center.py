@@ -332,9 +332,8 @@ def _bar_width(p) -> int:
 def test_bottom_bar_fits_at_min_window(page):
     """App 最小宽 1000 → 右栏 ~770：空闲态底栏 ≤ 实际可用宽，且全部按钮恒可见带文字。
 
-    1.0.11 新增 📝提示词 / ✨ 后空底栏实测 542px（9 个常驻按钮全带文字），
-    仍远低于右栏 ~770 的可用宽；旧的 514（720 逻辑宽假设）已不成立，改以
-    真实最窄面板的实测可用宽（composer.width - 16）做硬断言。
+    按用户要求底栏去掉「📝 提示词」（提示词库入口改到输入框右键），
+    ✨ 增强提示词挪到上下文占用左边。空底栏因此比 542 更窄。
     """
     p, _fake = page
     p.resize(770, 680)
@@ -348,10 +347,16 @@ def test_bottom_bar_fits_at_min_window(page):
     assert w <= BAR_BUDGET_W + 80, "空闲态底栏宽得离谱，疑似布局损坏"
     # 全部常驻功能按钮：恒可见 + 带文字（规则：绝不按宽度隐藏、不带空文案）
     for btn in (p._attach_btn, p._ws_btn, p._policy_btn, p._skill_btn,
-                p._tool_btn, p._mcp_btn, p._prompt_btn, p._model_btn,
+                p._tool_btn, p._mcp_btn, p._model_btn,
                 p._send_btn, p._enhance_btn):
         assert btn.isVisibleTo(p) and not btn.isHidden(), btn.objectName()
         assert btn.text().strip(), f"{btn.objectName()} 无文字"
+    # 底栏不再有「提示词」按钮（功能仍在，入口改到输入框右键）
+    assert not hasattr(p, "_prompt_btn")
+    # ✨ 在上下文占用左边（用户指定位置）
+    lay = p._bar_lay
+    assert lay.indexOf(p._enhance_btn) >= 0
+    assert lay.indexOf(p._enhance_btn) < lay.indexOf(p._ctx_meter)
 
 
 def test_bottom_bar_fits_in_busy_state(page):
