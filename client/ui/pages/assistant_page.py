@@ -242,6 +242,371 @@ def _latest_task(tasks: Any) -> Optional[Dict[str, Any]]:
     return best
 
 
+class _SpaceDialog(QDialog):
+    """新建 / 重命名空间的小对话框：名字 + 可选目录。"""
+
+    def __init__(self, parent=None, name: str = "", workspace: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("新建空间" if not name else "重命名空间")
+        self.setObjectName("SpaceDialog")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 12)
+        lay.setSpacing(10)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        self._name = QLineEdit(name)
+        self._name.setPlaceholderText("给空间起个名字，如「学习助手」")
+        self._name.setMaxLength(40)
+        form.addRow("名称", self._name)
+        self._ws = QLineEdit(workspace)
+        self._ws.setPlaceholderText("留空自动在助手目录下建一个目录")
+        self._ws.setReadOnly(True)
+        form.addRow("目录", self._ws)
+        lay.addLayout(form)
+
+        browse = QPushButton("选择目录…")
+        browse.setObjectName("BarBtn")
+        browse.setCursor(Qt.PointingHandCursor)
+        browse.clicked.connect(self._pick)
+        lay.addWidget(browse, 0, Qt.AlignRight)
+
+        tip = QLabel("空间是独立的工作区：任务与文件都隔离，互不影响。")
+        tip.setObjectName("ComposerTip")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+        self._name.setFocus()
+
+    @property
+    def name(self) -> str:
+        return self._name.text().strip()
+
+    @property
+    def workspace(self) -> str:
+        return self._ws.text().strip()
+
+    def _pick(self) -> None:
+        start = self._ws.text() or os.path.expanduser("~")
+        try:
+            dlg = QFileDialog(self, "选择空间目录", start)
+            dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+            dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+            dlg.setFileMode(QFileDialog.FileMode.Directory)
+            dlg.setLabelText(QFileDialog.DialogLabel.Accept, "选择此文件夹")
+            dlg.setLabelText(QFileDialog.DialogLabel.Reject, "取消")
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                picked = dlg.selectedFiles()
+                if picked:
+                    self._ws.setText(str(picked[0]))
+        except Exception as e:  # noqa: BLE001
+            self._ws.setText("")
+
+
+class _PromptManagerDialog(QDialog):
+    """提示词库管理：新建 / 编辑 / 保存 / 删除（全局可复用）。"""
+
+    def __init__(self, api, parent=None):
+        super().__init__(parent)
+        self._api = api
+        self._cur: Optional[str] = None      # 当前编辑的提示词 id
+        self.setWindowTitle("提示词库")
+        self.setObjectName("PromptManager")
+        self.setMinimumSize(700, 460)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        self._list = QListWidget()
+        self._list.setObjectName("PromptList")
+        self._list.setSortingEnabled(False)
+        self._list.currentItemChanged.connect(self._on_select)
+        left.addWidget(self._list, 1)
+        self._new_btn = QPushButton("+ 新建")
+        self._new_btn.setObjectName("BarBtn")
+        self._new_btn.setCursor(Qt.PointingHandCursor)
+        self._new_btn.clicked.connect(self._on_new)
+        left.addWidget(self._new_btn)
+        lay.addLayout(left, 0)
+
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        self._title = QLineEdit()
+        self._title.setPlaceholderText("标题（必填）")
+        self._title.setMaxLength(60)
+        self._tags = QLineEdit()
+        self._tags.setPlaceholderText("标签，逗号分隔（可选，便于搜索）")
+        self._content = QPlainTextEdit()
+        self._content.setPlaceholderText("提示词内容……")
+        self._content.setMinimumHeight(180)
+        right.addWidget(QLabel("标题"))
+        right.addWidget(self._title)
+        right.addWidget(QLabel("标签"))
+        right.addWidget(self._tags)
+        right.addWidget(QLabel("内容"))
+        right.addWidget(self._content, 1)
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        self._del_btn = QPushButton("删除")
+        self._del_btn.setObjectName("BarBtn")
+        self._del_btn.setCursor(Qt.PointingHandCursor)
+        self._del_btn.clicked.connect(self._on_delete)
+        self._save_btn = QPushButton("保存")
+        self._save_btn.setObjectName("BarBtn")
+        self._save_btn.setCursor(Qt.PointingHandCursor)
+        self._save_btn.clicked.connect(self._on_save)
+        btns.addStretch(1)
+        btns.addWidget(self._del_btn)
+        btns.addWidget(self._save_btn)
+        right.addLayout(btns)
+        lay.addLayout(right, 1)
+
+        self._load()
+
+    def _load(self) -> None:
+        self._list.blockSignals(True)
+        self._list.clear()
+        for p in (self._api.prompts() or []):
+            if not isinstance(p, dict):
+                continue
+            item = QListWidgetItem(p.get("title") or "未命名提示词")
+            item.setData(Qt.UserRole, p)
+            item.setToolTip((p.get("content") or "")[:120])
+            self._list.addItem(item)
+        self._list.blockSignals(False)
+        if self._list.count():
+            self._list.setCurrentRow(0)
+
+    def _on_select(self, cur, _prev) -> None:
+        if cur is None:
+            return
+        p = cur.data(Qt.UserRole) or {}
+        self._cur = p.get("id")
+        self._title.setText(p.get("title") or "")
+        self._tags.setText(", ".join(p.get("tags") or []))
+        self._content.setPlainText(p.get("content") or "")
+
+    def _on_new(self) -> None:
+        self._cur = None
+        self._title.clear()
+        self._tags.clear()
+        self._content.clear()
+        self._title.setFocus()
+
+    def _on_save(self) -> None:
+        title = self._title.text().strip()
+        content = self._content.toPlainText()
+        if not title and not content.strip():
+            QMessageBox.warning(self, "无法保存",
+                                 "标题和内容不能都为空。")
+            return
+        tags = [t.strip() for t in self._tags.text().split(",") if t.strip()]
+        if self._cur:
+            self._api.update_prompt(self._cur, title, content, tags)
+        else:
+            res = self._api.new_prompt(title, content, tags)
+            self._cur = (res or {}).get("id")
+        self._load()
+
+    def _on_delete(self) -> None:
+        if not self._cur:
+            return
+        ans = QMessageBox.question(
+            self, "删除提示词", "确定删除这条提示词？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._api.delete_prompt(self._cur)
+        self._cur = None
+        self._load()
+
+
+class _PromptPicker(QDialog):
+    """快速插入提示词：搜索 + 列表，双击或「插入」填进输入框。"""
+
+    def __init__(self, api, parent=None):
+        super().__init__(parent)
+        self._api = api
+        self.setWindowTitle("插入提示词")
+        self.setObjectName("PromptPicker")
+        self.setMinimumSize(440, 380)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("搜索标题 / 标签 / 内容…")
+        self._list = QListWidget()
+        self._list.setObjectName("PromptList")
+        self._list.itemDoubleClicked.connect(self._insert)
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        manage = QPushButton("管理提示词库…")
+        manage.setObjectName("BarBtn")
+        manage.setCursor(Qt.PointingHandCursor)
+        manage.clicked.connect(self._manage)
+        self._insert_btn = QPushButton("插入")
+        self._insert_btn.setObjectName("BarBtn")
+        self._insert_btn.setCursor(Qt.PointingHandCursor)
+        self._insert_btn.clicked.connect(self._insert)
+        btns.addStretch(1)
+        btns.addWidget(manage)
+        btns.addWidget(self._insert_btn)
+        lay.addWidget(self._search)
+        lay.addWidget(self._list, 1)
+        lay.addLayout(btns)
+        self._search.textChanged.connect(self._load)
+        self._load()
+
+    def _load(self) -> None:
+        kw = self._search.text().strip().lower()
+        self._list.blockSignals(True)
+        self._list.clear()
+        for p in (self._api.prompts() or []):
+            if not isinstance(p, dict):
+                continue
+            hay = f"{p.get('title')} {','.join(p.get('tags') or [])} " \
+                  f"{p.get('content')}".lower()
+            if kw and kw not in hay:
+                continue
+            item = QListWidgetItem(p.get("title") or "未命名提示词")
+            item.setData(Qt.UserRole, p)
+            item.setToolTip((p.get("content") or "")[:160])
+            self._list.addItem(item)
+        self._list.blockSignals(False)
+
+    def _insert(self, _item=None) -> None:
+        row = self._list.currentItem()
+        if row is None:
+            return
+        p = row.data(Qt.UserRole) or {}
+        text = (p.get("content") or "").strip()
+        if text and isinstance(self.parent(), AssistantPage):
+            self.parent()._insert_prompt(text)   # type: ignore[attr-defined]
+        self.accept()
+
+    def _manage(self) -> None:
+        dlg = _PromptManagerDialog(self._api, self)
+        dlg.exec()
+        self._load()
+
+
+class _EnhanceDialog(QDialog):
+    """✨ 用模型把当前输入润色成更好的提示词（临时会话，用完即删）。"""
+
+    _ENHANCE_INSTR = (
+        "请在不改变用户原意的前提下，把下面这段用户输入优化成更清晰、更具体、"
+        "更利于大模型理解的提示词。只输出优化后的提示词本身，不要任何解释、"
+        "不要前后缀、不要引号：\n\n")
+
+    def __init__(self, api, gateway_url, api_key, text, parent=None):
+        super().__init__(parent)
+        self._api = api
+        self._gateway_url = gateway_url
+        self._api_key = api_key
+        self._text = text
+        self._stream = None
+        self._temp_sid = ""
+        self.setWindowTitle("优化提示词")
+        self.setObjectName("EnhanceDialog")
+        self.setMinimumSize(520, 360)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        src = QPlainTextEdit(text)
+        src.setObjectName("EnhanceSrc")
+        src.setReadOnly(True)
+        src.setMaximumHeight(90)
+        self._out = QPlainTextEdit()
+        self._out.setObjectName("EnhanceOut")
+        self._out.setPlaceholderText("正在生成优化后的提示词…")
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.setObjectName("BarBtn")
+        self._cancel_btn.clicked.connect(self.reject)
+        self._adopt_btn = QPushButton("采用")
+        self._adopt_btn.setObjectName("BarBtn")
+        self._adopt_btn.setEnabled(False)
+        self._adopt_btn.clicked.connect(self._adopt)
+        btns.addStretch(1)
+        btns.addWidget(self._cancel_btn)
+        btns.addWidget(self._adopt_btn)
+        lay.addWidget(QLabel("原文"))
+        lay.addWidget(src)
+        lay.addWidget(QLabel("优化后"))
+        lay.addWidget(self._out, 1)
+        lay.addLayout(btns)
+        self._start()
+
+    def _start(self) -> None:
+        try:
+            sess = self._api.new_session()
+            if not isinstance(sess, dict) or not sess.get("id"):
+                self._out.setPlainText("（创建优化会话失败）")
+                return
+            self._temp_sid = str(sess["id"])
+            payload = {
+                "session_id": self._temp_sid,
+                "message": self._ENHANCE_INSTR + self._text,
+                "mode": "chat", "stream": True,
+                "provider": "", "model": "",
+            }
+            from ui.pages.assistant_page import AssistantStream   # noqa: F401
+            self._stream = AssistantStream(
+                self._gateway_url, self._api_key, payload)
+            self._stream.event.connect(self._on_event)
+            self._stream.failed.connect(
+                lambda m: self._out.setPlainText(f"（优化失败：{m}）"))
+            self._stream.closed.connect(lambda: self._adopt_btn.setEnabled(True))
+            self._stream.start()
+        except Exception as e:  # noqa: BLE001
+            self._out.setPlainText(f"（优化失败：{e}）")
+
+    def _on_event(self, ev: Dict[str, Any]) -> None:
+        if not isinstance(ev, dict):
+            return
+        kind = ev.get("type")
+        if kind == "delta":
+            self._out.appendPlainText(ev.get("text") or "")
+        elif kind == "replace":
+            self._out.setPlainText(ev.get("text") or "")
+
+    def _adopt(self) -> None:
+        text = self._out.toPlainText().strip()
+        if text and isinstance(self.parent(), AssistantPage):
+            self.parent()._input.setPlainText(text)   # type: ignore[attr-defined]
+        self._cleanup()
+        self.accept()
+
+    def _cleanup(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            self._stream = None
+        if self._temp_sid:
+            try:
+                self._api.delete_session(self._temp_sid)
+            except Exception:  # noqa: BLE001
+                pass
+            self._temp_sid = ""
+
+    def closeEvent(self, ev) -> None:       # noqa: N802 - Qt 回调
+        self._cleanup()
+        super().closeEvent(ev)
+
+
 def _compact_chip(btn) -> None:
     """把底栏 chip 压成文字宽度，避免 QPushButton 默认 81px 的最小宽把底栏顶爆。
 
@@ -449,6 +814,9 @@ class AssistantPage(QWidget):
         self._nav_task_btns: Dict[str, QPushButton] = {}
         self._nav_spaces: List[Dict[str, Any]] = []
         self._nav_rows: Optional[List[Dict[str, Any]]] = None   # 左栏用的任务快照
+        self._expanded_spaces: set = set()        # 左栏已展开的空间（path 集合）
+        self._current_space: str = ""             # 当前空间（= 活跃工作区目录）
+        self._space_loading = False
 
         self._build_ui()
         # 注意：不在这里调 refresh()。构造函数运行在 QApplication.exec() 之前，
@@ -963,6 +1331,15 @@ class AssistantPage(QWidget):
         self._mcp_btn.clicked.connect(self._show_mcp_menu)
         bar.addWidget(self._mcp_btn)
 
+        # [提示词]：全局可复用提示词库，点击从库里插入到输入框（1.0.11）
+        self._prompt_btn = QPushButton("📝 提示词")
+        self._prompt_btn.setObjectName("BarChip")
+        _compact_chip(self._prompt_btn)
+        self._prompt_btn.setCursor(Qt.PointingHandCursor)
+        self._prompt_btn.setToolTip("从提示词库插入 / 管理提示词")
+        self._prompt_btn.clicked.connect(self._open_prompt_picker)
+        bar.addWidget(self._prompt_btn)
+
         # 多技能挂载区：每个已挂载技能一个可移除 chip（最多 5 个）。
         # ④ ≥3 个时 reparent 到输入框上方（`_reparent_skill_chips`），
         #    否则会顶出底栏 504px 门禁。
@@ -1040,6 +1417,16 @@ class AssistantPage(QWidget):
         self._send_btn.clicked.connect(self._on_send_clicked)
         bar.addWidget(self._send_btn)
 
+        # ✨ 优化（1.0.11）：把当前输入框里的文字交给模型润色成更好的提示词
+        self._enhance_btn = QPushButton("✨")
+        self._enhance_btn.setObjectName("GuideBtn")
+        self._enhance_btn.setStyleSheet("padding: 0px;")
+        self._enhance_btn.setFixedSize(26, 26)
+        self._enhance_btn.setCursor(Qt.PointingHandCursor)
+        self._enhance_btn.setToolTip("用模型优化当前输入（润色成更好的提示词）")
+        self._enhance_btn.clicked.connect(self._enhance_prompt)
+        bar.addWidget(self._enhance_btn)
+
         lay.addLayout(bar)
 
         self._spin_timer = QTimer(self)
@@ -1052,6 +1439,36 @@ class AssistantPage(QWidget):
         self._spin_i = (self._spin_i + 1) % len(SPIN_FRAMES)
         self._busy_lbl.setText(SPIN_FRAMES[self._spin_i])
 
+    # ---------------- 提示词库（1.0.11，对齐 WorkBuddy ✨/提示词） ----------------
+    def _open_prompt_picker(self) -> None:
+        """从全局提示词库插入到输入框；可跳转「管理提示词库」。"""
+        dlg = _PromptPicker(self._assist, self)
+        dlg.exec()
+
+    def _enhance_prompt(self) -> None:
+        """✨ 用模型把当前输入框文字润色成更好的提示词（临时会话）。"""
+        text = self._input.toPlainText().strip()
+        if not text:
+            QMessageBox.information(
+                self, "优化提示词", "输入框是空的，先写点内容再优化吧。")
+            return
+        dlg = _EnhanceDialog(
+            self._assist, self.config.gateway_url(), self.config.api_key,
+            text, self)
+        dlg.exec()
+
+    def _insert_prompt(self, text: str) -> None:
+        """把所选提示词插入输入框：已有内容则换行追加。"""
+        if not text:
+            return
+        cur = self._input.toPlainText()
+        if cur.strip():
+            new = cur.rstrip() + "\n\n" + text
+        else:
+            new = text
+        self._input.setPlainText(new)
+        self._input.moveCursor(QTextCursor.End)
+
     def _start_spin(self) -> None:
         self._spin_i = 0
         self._busy_lbl.setText(SPIN_FRAMES[0])
@@ -1063,18 +1480,21 @@ class AssistantPage(QWidget):
         self._busy_lbl.setVisible(False)
 
     # ---------------- 挂载 chip：≥3 个折行到输入框上方（宽度压缩规则 ④） ----------------
-    #: 底栏可用宽度（逻辑 720 → 左栏 200 → 右栏 520 → 扣内边距）。
+    #: 底栏可用宽度（单一来源：测试从本类导入，不各自硬编码字面量）。
     #:
-    #: 门禁常量的单一来源：测试从本类导入，不再各自硬编码字面量。
-    #: 实测（逻辑 720 窗口）右栏**容器**实际可用 522（idle 474 / busy 522），
-    #: 底栏 busy 实测 510（≤522，未裁切）。架构 §4 原定 504 是「保守基线」，
-    #: 但 busy 态 510 已超它 6px，若继续用 504 当硬门禁会误报。按真实右栏
-    #: 可用宽重算：留 8px style 抖动余量 → 522 - 8 = 514，取 514 为门禁。
-    #: （idle 438 / chip 折行后仍远低于此值，三类状态均满足。）
-    BAR_BUDGET_W = 514
+    #: 预算口径（2026-06 重算）：主窗口最小宽 **1000**、左栏 **200** → 右栏
+    #: 最窄约 **770**。底栏实测：空闲态（含 📝提示词 / ✨ 全部按钮带文字）
+    #: **542px**、忙碌态（再 + 运行指示 / 停止 / 引导）**614px**，均远低于 770。
+    #: 取 720 为门禁 = 770 - 50（页面边距 + style 抖动 + 挂载 chip 折行前的缓冲）。
+    #: 三类状态（idle / busy / 5-chip 折行后）都满足 ≤720；芯片 ≥3 个时按本
+    #: 预算提前折行到输入框上方（见 `_chips_width_over_budget`）。
+    #:
+    #: 注：旧的 514 是按「720 逻辑宽」推的保守场景，但本应用最小宽 1000、
+    #: 右栏到不了 520，故 514 已不成立——空底栏本身就 542px，会误报。
+    BAR_BUDGET_W = 720
 
     def _chips_width_over_budget(self, count: int) -> bool:
-        """估算把 `count` 个已挂载技能 chip 留在底栏内联是否会顶爆 504px。
+        """估算把 `count` 个已挂载技能 chip 留在底栏内联是否会顶爆预算。
 
         规则④原话是「≥3 个折行」，但两个长 slug（如 `repo-digest` +
         `code-review`）内联就已经 687px，光靠数量判断不够。这里按 chip 实际
@@ -1090,9 +1510,10 @@ class AssistantPage(QWidget):
             if w is not None:
                 chips_w += w.sizeHint().width()
         chips_w += spacing * max(0, lay.count() - 1)
-        # 底栏其它固定项（+ / 工作区 / 策略 / 技能 / 工具 / MCP / 模型 / 发送…）
-        # 404 是实测的空底栏 sizeHint；留 8px 余量吃掉 style 抖动。
-        base = 404
+        # 底栏其它固定项（+ / 工作区 / 策略 / 技能 / 工具 / MCP / 📝提示词 /
+        # 模型 / 发送 / ✨…）。542 是 1.0.11 实测的空底栏 sizeHint（9 个常驻
+        # 按钮全带文字）；留 8px 余量吃掉 style 抖动。
+        base = 542
         return (base + chips_w + 8) > self.BAR_BUDGET_W
 
     def _reparent_skill_chips(self, count: int) -> None:
@@ -1343,10 +1764,27 @@ class AssistantPage(QWidget):
         add.setObjectName("NavSubAdd")
         add.setFixedSize(20, 20)
         add.setCursor(Qt.PointingHandCursor)
-        add.setToolTip("新建任务")
+        add.setToolTip("在当前空间新建任务")
         add.clicked.connect(lambda: self._new_session())
         head.addWidget(add)
         lay.addLayout(head)
+
+        # 「空间」分组标题行：自带「新建空间」按钮（1.0.11 真实空间实体）
+        shead = QHBoxLayout()
+        shead.setContentsMargins(20, 6, 12, 4)
+        shead.setSpacing(4)
+        self._nav_space_title = QLabel("空间")
+        self._nav_space_title.setObjectName("NavSubTitle")
+        shead.addWidget(self._nav_space_title)
+        shead.addStretch(1)
+        sadd = QPushButton("+")
+        sadd.setObjectName("NavSubAdd")
+        sadd.setFixedSize(20, 20)
+        sadd.setCursor(Qt.PointingHandCursor)
+        sadd.setToolTip("新建空间（具名、可切换、数据隔离）")
+        sadd.clicked.connect(lambda: self._new_space())
+        shead.addWidget(sadd)
+        lay.addLayout(shead)
 
         # 任务区 + 空间区共用一个可滚动容器：左栏高度有限，
         # 窗口矮的时候必须能在内部滚动，而不是把导航按钮挤没。
@@ -1459,7 +1897,14 @@ class AssistantPage(QWidget):
         return out
 
     def _rebuild_nav_tasks(self) -> None:
-        """重画左栏「任务 / 空间」两区（数据变了就整体重建，逻辑最简单）。"""
+        """重画左栏「任务 / 空间」两区。
+
+        1.0.11 起：
+        - 「任务」区 = 跨空间的最近任务（置顶优先），点一条即切换；
+        - 「空间」区 = 真实空间列表，每个空间**可展开**，展开后列出该空间
+          **全部任务**（修复「在空间内建任务会覆盖旧任务」：旧任务仍在磁盘，
+          只是之前导航只露最新一条）。
+        """
         lay = getattr(self, "_nav_body_lay", None)
         if lay is None:
             return
@@ -1467,29 +1912,36 @@ class AssistantPage(QWidget):
         if rows is None:
             rows = self._session_rows or []
         rows = [r for r in rows if isinstance(r, dict)]
-        spaces = self._nav_spaces or self._group_spaces(rows, self._default_ws())
-        default_ws = self._default_ws()
-        # 「任务」区只放默认工作区的任务；其它目录的任务归到「空间」区，
-        # 避免同一批任务上下各列一遍（用户反馈截图）。
-        tasks = [r for r in rows if self._task_ws(r) == default_ws]
-        # 内容签名：refresh 可能被高频触发（状态轮询 / 切页 / 流式结束），
-        # 每次清空重建会让左栏闪烁且丢鼠标 hover 态，签名没变就直接返回。
-        sig = (tuple((r.get("id"), r.get("title"), r.get("pinned"),
-                      r.get("message_count"), r.get("workspace"),
-                      bool(r.get("running"))) for r in tasks),
-               tuple((sp.get("path"), sp.get("count")) for sp in spaces),
-               self._session_id,
-               # 哪些任务正在后台跑（行首 ● 与配色）：状态变了就要重画
-               tuple(sorted(s for s, r in self._runs.items() if r.busy)))
+        # 「任务」区 = 全局最近任务（跨空间），不按工作区过滤，避免重复列
+        tasks = [r for r in rows if not r.get("archived")]
+        spaces = self._nav_spaces or []
+        # 内容签名：expand 状态 / 当前空间 / 各空间任务列表都变了就要重画
+        sig = (
+            tuple((r.get("id"), r.get("title"), r.get("pinned"),
+                   r.get("message_count"), r.get("workspace"),
+                   bool(r.get("running"))) for r in tasks),
+            tuple((sp.get("path"), sp.get("name"), sp.get("count"),
+                   bool(sp.get("current")),
+                   sp.get("path") in self._expanded_spaces,
+                   tuple((t.get("id"), t.get("title"), t.get("pinned"),
+                          bool(t.get("running"))) for t in (sp.get("tasks") or [])))
+                  for sp in spaces),
+            self._session_id,
+            frozenset(self._expanded_spaces),
+            self._current_space,
+            tuple(sorted(s for s, r in self._runs.items() if r.busy)),
+        )
         if sig == getattr(self, "_nav_sig", None):
             return
         self._nav_sig = sig
         self._clear_nav_body()
         if self._nav_task_title is not None:
             self._nav_task_title.setText(f"任务 ({len(tasks)})")
+        if self._nav_space_title is not None:
+            self._nav_space_title.setText(f"空间 ({len(spaces)})")
         lines = 0
 
-        # ---- 任务区：默认工作区的任务（置顶的排最前，后端已排好）----
+        # ---- 任务区：全局最近任务（置顶的排最前，后端已排好）----
         for t in tasks[:NAV_TASK_MAX]:
             lay.addWidget(self._nav_task_row(t))
             lines += 1
@@ -1503,58 +1955,51 @@ class AssistantPage(QWidget):
             lay.addWidget(more)
             lines += 1
         if not tasks:
-            empty = QLabel("默认空间还没有任务，点右上角 + 新建")
+            empty = QLabel("还没有任务，点上方 + 新建")
             empty.setObjectName("NavEmpty")
             empty.setWordWrap(True)
             lay.addWidget(empty)
             lines += 1
 
-        # ---- 空间区：一个空间只留最新的一条任务（用户要求：不用都列）----
-        if spaces:
-            gtitle = QLabel(f"空间 ({len(spaces)})")
-            gtitle.setObjectName("NavGroupTitle")
-            lay.addWidget(gtitle)
-            lines += 1              # 分组标题也占一行，漏算会把最后一行挤出视口
-            for sp in spaces[:NAV_SPACE_MAX]:
-                path = str(sp.get("path") or "")
-                latest = _latest_task(sp.get("tasks") or [])
-                missing = not sp.get("exists", True)
-                row = QPushButton(
-                    f"{'⚠ ' if missing else '📁 '}"
-                    f"{_ellipsis(sp.get('name') or path, 10)}")
-                row.setObjectName("NavSpaceItem")
-                row.setProperty("active",
-                                "true" if latest and
-                                str(latest.get("id")) == self._session_id else "false")
-                row.setCursor(Qt.PointingHandCursor)
-                row.setFixedHeight(NAV_ROW)
-                row.setToolTip(
-                    f"{path}\n{sp.get('count')} 个任务"
-                    + (f"\n最新：{latest.get('title') or '未命名任务'}"
-                       if latest else "")
-                    + ("\n⚠ 目录不存在（可能被删除或移动盘已拔出）" if missing else "")
-                    + "\n点击打开最新任务；右键可新建 / 查看该空间全部任务")
-                row.clicked.connect(
-                    lambda _c=False, p=path: self._open_space_latest(p))
-                row.setContextMenuPolicy(Qt.CustomContextMenu)
-                row.customContextMenuRequested.connect(
-                    lambda pos, p=path, b=row: self._show_space_menu(
-                        p, b.mapToGlobal(pos)))
-                lay.addWidget(row)
-                lines += 1
-                # 只显示该空间**最后一条**任务：再多就靠右键「查看该空间全部任务」
-                if latest:
-                    lay.addWidget(self._nav_task_row(latest, sub=True))
+        # ---- 空间区：每个空间可展开，列出其全部任务 ----
+        for sp in spaces:
+            path = str(sp.get("path") or "")
+            name = sp.get("name") or path
+            count = sp.get("count", 0)
+            expanded = path in self._expanded_spaces
+            missing = not sp.get("exists", True)
+            caret = "▾" if expanded else "▸"
+            row = QPushButton(
+                f"{caret}  {'⚠ ' if missing else '📁 '}"
+                f"{_ellipsis(name, 9)} ({count})")
+            row.setObjectName("NavSpaceItem")
+            row.setProperty("active", "true" if sp.get("current") else "false")
+            row.setCursor(Qt.PointingHandCursor)
+            row.setFixedHeight(NAV_ROW)
+            row.setToolTip(
+                f"{path}\n{count} 个任务"
+                + ("\n⚠ 目录不存在（可能被删除或移动盘已拔出）" if missing else "")
+                + "\n点击展开/收起该空间；右键可重命名 / 删除 / 设为当前空间")
+            row.clicked.connect(
+                lambda _c=False, p=path: self._on_space_header(p))
+            row.setContextMenuPolicy(Qt.CustomContextMenu)
+            row.customContextMenuRequested.connect(
+                lambda pos, p=path, b=row: self._show_space_menu(
+                    p, b.mapToGlobal(pos)))
+            lay.addWidget(row)
+            lines += 1
+            if expanded:
+                sp_tasks = sp.get("tasks") or []
+                if sp_tasks:
+                    for t in sp_tasks:
+                        lay.addWidget(self._nav_task_row(t, sub=True))
+                        lines += 1
+                else:
+                    none = QLabel("（该空间还没有任务，右键「在此空间新建任务」）")
+                    none.setObjectName("NavEmpty")
+                    none.setWordWrap(True)
+                    lay.addWidget(none)
                     lines += 1
-            if len(spaces) > NAV_SPACE_MAX:
-                more_sp = QPushButton(f"其余 {len(spaces) - NAV_SPACE_MAX} 个空间…")
-                more_sp.setObjectName("NavTaskItem")
-                more_sp.setProperty("more", "true")
-                more_sp.setCursor(Qt.PointingHandCursor)
-                more_sp.setFixedHeight(NAV_ROW)
-                more_sp.clicked.connect(lambda _c=False: self.open_manager("sessions"))
-                lay.addWidget(more_sp)
-                lines += 1
 
         lay.addStretch(1)
         self._fit_nav_scroll(lines)
@@ -1780,12 +2225,16 @@ class AssistantPage(QWidget):
             menu.exec(gpos)
 
     def build_space_menu(self, path: str) -> QMenu:
-        """空间右键菜单：在此空间新建任务 / 查看全部任务 / 打开目录。"""
+        """空间右键菜单：新建任务 / 设为当前 / 重命名 / 删除 / 打开目录。"""
         menu = QMenu(self)
         menu.setObjectName("ModelMenu")
         menu.addAction("在此空间新建任务", lambda: self._new_task_in_space(path))
-        # 左栏只显示每个空间最新的一条任务，其余的从清单中心看
-        menu.addAction("查看全部任务清单…", lambda: self.open_manager("sessions"))
+        menu.addAction("设为当前空间", lambda: self._activate_space(path))
+        menu.addSeparator()
+        name = self._space_display(path)
+        menu.addAction("重命名空间…",
+                       lambda: self._rename_space_dialog(path, name))
+        menu.addAction("删除空间…", lambda: self._delete_space(path, name))
         menu.addSeparator()
         act = menu.addAction("在资源管理器中打开",
                              lambda: self._open_space_folder(path))
@@ -1881,6 +2330,7 @@ class AssistantPage(QWidget):
         if not os.path.isdir(ws):
             return
         self._state["workspace"] = ws
+        self._current_space = ws      # 打开任务即把它的空间设为当前
         self._remember_workspace(ws)
         self._refresh_ws_btn(ws)
         w = Worker(self._assist.save_settings, {"workspace": ws})
@@ -3084,8 +3534,8 @@ class AssistantPage(QWidget):
                           if s.get("message_count", 1)
                           or s.get("id") == self._session_id
                           or s.get("running")]
-        self._nav_spaces = self._group_spaces(self._nav_rows, self._default_ws())
-        self._rebuild_nav_tasks()
+        # 空间列表改由后端 GET /spaces 给出（真实具名实体，每个空间带全部任务）
+        self._fill_spaces()
 
         # 管理面板里的完整任务列表（面板未打开时为 None）
         lst = getattr(self, "_all_sess_list", None)
@@ -3110,29 +3560,137 @@ class AssistantPage(QWidget):
                 lst.addItem("（还没有任务）")
             lst.blockSignals(False)
 
+    # ---------------- 空间（具名、可切换、数据隔离） ----------------
+    def _fill_spaces(self) -> None:
+        """拉空间列表（GET /spaces：真实实体，每个空间带全部任务）。"""
+        if self._space_loading:
+            return
+        self._space_loading = True
+        w = Worker(self._assist.spaces)
+        w.result.connect(self._apply_spaces)
+        w.error.connect(lambda _m: setattr(self, "_space_loading", False))
+        w.finished.connect(lambda: setattr(self, "_space_loading", False))
+        w.start()
+
+    def _apply_spaces(self, spaces) -> None:
+        spaces = [s for s in (spaces or []) if isinstance(s, dict)]
+        # 当前空间以注册表 current 为准，否则用当前活跃工作区
+        cur = next((s.get("path") for s in spaces if s.get("current")), "")
+        if cur:
+            self._current_space = _norm_ws(cur)
+        elif not self._current_space:
+            self._current_space = _norm_ws(self._state.get("workspace") or "")
+        self._nav_spaces = spaces
+        self._rebuild_nav_tasks()
+
+    def _space_display(self, path: str) -> str:
+        for sp in self._nav_spaces:
+            if str(sp.get("path")) == path:
+                return sp.get("name") or path
+        return _norm_ws(path).rsplit("/", 1)[-1] or path
+
+    def _on_space_header(self, path: str) -> None:
+        """点空间标题：展开/收起；展开时设为当前空间并跳到最新任务。"""
+        if path in self._expanded_spaces:
+            self._expanded_spaces.discard(path)
+            self._rebuild_nav_tasks()
+            return
+        self._expanded_spaces.add(path)
+        self._activate_space(path)
+        sp = next((s for s in self._nav_spaces
+                   if str(s.get("path")) == path), None)
+        latest = _latest_task(sp.get("tasks") or []) if sp else None
+        self._rebuild_nav_tasks()
+        if latest and latest.get("id"):
+            self._open_task(str(latest["id"]))
+
+    def _activate_space(self, path: str) -> None:
+        """把该空间设为当前（左栏高亮 + 新任务/文件工具默认落它）。"""
+        p = _norm_ws(path)
+        self._current_space = p
+        self._state["workspace"] = p
+        self._refresh_ws_btn(p)
+        self._remember_workspace(p)
+        self._set_status(f"已切换到空间：{self._space_display(p)}")
+        w = Worker(self._assist.activate_space, p)
+        w.result.connect(lambda _r: self.refresh())
+        w.error.connect(lambda m: self._set_status(f"切换空间失败：{m}"))
+        w.start()
+
+    def _new_space(self) -> None:
+        """新建空间：弹对话框要名字（可选目录），后端建目录 + 登记。"""
+        dlg = _SpaceDialog(self._dialog_parent())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = (dlg.name or "").strip()
+        ws = (dlg.workspace or "").strip()
+        self._set_status(f"正在新建空间「{name or '未命名'}」…")
+        w = Worker(self._assist.create_space, name, ws)
+        w.result.connect(self._on_space_created)
+        w.error.connect(lambda m: self._set_status(f"新建空间失败：{m}"))
+        w.start()
+
+    def _on_space_created(self, space: Any) -> None:
+        if not isinstance(space, dict) or not space.get("path"):
+            self._set_status("空间创建失败，请确认后端已启动")
+            return
+        p = _norm_ws(space.get("path"))
+        self._expanded_spaces.add(p)
+        self._current_space = p
+        self._set_status(f"已新建空间：{space.get('name') or p}")
+        self.refresh()      # 拉回空间 + 任务，左栏展开显示
+
+    def _rename_space_dialog(self, path: str, cur: str) -> None:
+        text, ok = QInputDialog.getText(
+            self._dialog_parent(), "重命名空间", "空间名称：",
+            QLineEdit.EchoMode.Normal, cur or "")
+        if not ok or not text.strip():
+            return
+        name = text.strip()[:40]
+        self._set_status(f"正在重命名「{name}」…")
+        w = Worker(self._assist.rename_space, path, name)
+        w.result.connect(lambda _r, n=name: self._set_status(f"已重命名：{n}"))
+        w.error.connect(lambda m: self._set_status(f"重命名失败：{m}"))
+        w.start()
+
+    def _delete_space(self, path: str, name: str) -> None:
+        ans = QMessageBox.question(
+            self._dialog_parent(), "删除空间",
+            f"确定注销「{name}」？\n\n只删除空间名称与排序登记，"
+            f"该空间下的任务仍按目录保留、不会丢失。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._set_status(f"正在注销「{name}」…")
+        w = Worker(self._assist.delete_space, path)
+        w.result.connect(lambda _r, n=name: self._set_status(f"已注销空间：{n}"))
+        w.error.connect(lambda m: self._set_status(f"注销失败：{m}"))
+        w.start()
+
     # ------------------------------------------------------------------ #
     # 任务
     # ------------------------------------------------------------------ #
     def _new_session(self, silent: bool = False) -> None:
         # 当前任务本来就是空的（0 条消息）就直接复用，别再建一个：
         # 反复点左栏「+」或来回切页会攒出一长串「新任务（0 条）」。
-        # 例外：空任务在别的空间 —— 左栏「+」的语义是「在系统默认工作区新建」，
-        # 复用会把用户带回那个空间（截图反馈：点 + 后新任务落到 newspace，
-        # 「任务 (0)」永远不变）。
         # 多任务并行补充：当前任务**正在跑**时绝不复用（那会顶掉正在生成的回答）。
         cur = next((s for s in self._session_rows
                     if s.get("id") == self._session_id), None)
+        # 当前空间：用户正在看的空间（= 活跃工作区），+ 新建就落在它下面；
+        # 不强制默认工作区，避免「在 A 空间点 + 却建到默认空间」的割裂感。
+        active_ws = (self._current_space
+                     or _norm_ws(self._state.get("workspace"))
+                     or self._default_ws())
         if (not silent and cur is not None and not cur.get("message_count")
                 and not self._busy
-                and self._task_ws(cur) == self._default_ws()):
+                and self._task_ws(cur) == active_ws):
             self._clear_chat()
             self._greet()
             self._set_status("当前已经是新任务")
             return
-        # 工作区之外新建（左栏 + / 清单中心按钮）→ 落系统默认工作区；
-        # 想落在自定义空间走空间右键「在此空间新建任务」。silent 是后台自动
-        # 建任务（首次进页 / 删任务兜底），跟随后端当前工作区即可。
-        ws = "" if silent else self._default_ws()
+        # silent 是后台自动建任务（首次进页 / 删任务兜底）：跟随后端当前工作区
+        ws = "" if silent else active_ws
         key = _norm_ws(ws) or "__default__"
         if not self._claim_create(key):
             self._set_status("正在创建任务，请稍候…（不要重复点击）")
@@ -3211,6 +3769,9 @@ class AssistantPage(QWidget):
             self._dispose_run(sid)
         self._show_run(sid)
         # 任务属于某个空间：切过去，否则文件工具还在上一个目录里干活
+        ws = _norm_ws(data.get("workspace") or "")
+        if ws:
+            self._current_space = ws
         self._sync_workspace_to_task(str(data.get("workspace") or ""))
         self._clear_chat()
         for m in data.get("messages") or []:
@@ -3640,12 +4201,15 @@ class AssistantPage(QWidget):
             # 每个阶段的思考各起一块（关键修正）：旧实现只建一次，
             # 于是「执行完再思考」的文字会追加到最上面那块里 —— 顺序全乱，
             # 看起来就像思考和执行同时在进行。
+            # 1.0.11：空/纯空白思考不建块（否则循环里会铺出一堆空的「深度思考」）。
+            text = ev.get("text") or ""
             run = self._run()
-            if run.thinking is None:
+            if run.thinking is None and text.strip():
                 # WorkBuddy 形态：灰色「深度思考」+ 正文平铺，不折叠
                 run.thinking = ThinkingBlock()
                 self._append_widget(run.thinking)
-            run.thinking.append(ev.get("text") or "")
+            if run.thinking is not None and text:
+                run.thinking.append(text)
             self._scroll_bottom()
         elif kind == "replace":
             if self._bubble is not None:
@@ -4058,8 +4622,24 @@ class AssistantPage(QWidget):
 
         分组规则：**上一组已经全部返回结果**时另起一组（模型又调了一轮工具），
         否则并入当前组（同一轮里的并行调用合并成一行摘要）。
+
+        1.0.11 防「逐条加载」：若本次调用与当前行**最后一步同名同参**
+        （模型原地打转的典型形态，如反复 skill_list），不再新起行/新起步骤，
+        只把该步的重复计数 +1，显示成「读取技能列表 ×N」。
         """
-        action = self._tool_action(ev.get("name") or "", ev.get("args") or {})
+        name = ev.get("name") or ""
+        args = ev.get("args") or {}
+        action = self._tool_action(name, args)
+        try:
+            sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+        except Exception:
+            sig = (name, "")
+        last = self._proc_steps[-1] if self._proc_steps else None
+        if self._proc is not None and last is not None and last.get("sig") == sig:
+            last["done"] = False
+            last["repeat"] = int(last.get("repeat") or 1) + 1
+            self._proc.bump_repeat(int(last.get("pos") or 0), last["repeat"])
+            return
         done_all = bool(self._proc_steps) and all(s.get("done") for s in self._proc_steps)
         if self._proc is None or done_all:
             self._proc = ProcessLine()
@@ -4067,11 +4647,12 @@ class AssistantPage(QWidget):
             self._append_widget(self._proc)
             self._scroll_bottom()
         pos = self._proc.add_step(action)
-        self._proc_steps.append({"pos": pos, "name": ev.get("name") or "",
-                                 "index": ev.get("index"), "done": False})
+        self._proc_steps.append({"pos": pos, "name": name, "sig": sig,
+                                 "index": ev.get("index"), "done": False,
+                                 "repeat": 1})
 
     def _on_tool_result(self, ev: Dict[str, Any]) -> None:
-        """工具结果 → 回填到进程行（按 index 优先，其次按名称）。"""
+        """工具结果 → 回填到进程行（按 index 优先，其次按名称）+ 展示结果正文。"""
         if self._proc is None or not self._proc_steps:
             return
         idx = ev.get("index")
@@ -4091,7 +4672,9 @@ class AssistantPage(QWidget):
         if target is None:
             return
         target["done"] = True
-        self._proc.set_result(int(target.get("pos") or 0), bool(ev.get("ok")))
+        # 结果正文一并回填（此前只标 ✓/✗，用户看不到「读取技能列表」的内容）
+        self._proc.set_result(int(target.get("pos") or 0), bool(ev.get("ok")),
+                              str(ev.get("content") or ""))
 
     def _on_approval_closed(self, aid: str) -> None:
         """审批卡关闭：从对话流里摘掉，别留一张点过的卡在那儿。"""

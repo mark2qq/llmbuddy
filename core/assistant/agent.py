@@ -20,6 +20,7 @@
     Assistant.stop(session_id)   取消正在跑的轮次
 """
 import json
+import os
 import re
 import threading
 import time
@@ -36,10 +37,13 @@ from core.assistant import tools as tools_mod
 from core.assistant import turn_phase
 from core.assistant.approval import get_approval_manager
 from core.assistant.providers import MAX_TOKENS_CAP, ProviderError, get_provider
-from core.assistant.store import (audit, delete_session, ensure_dirs, get_provider as cfg_provider,
-                                 list_sessions, load_config, load_session, norm_workspace,
-                                 save_config, save_session, space_list as group_spaces,
-                                 update_session as patch_session)
+from core.assistant.store import (audit, delete_prompt, delete_session, delete_space,
+                                 ensure_dirs, get_current_space, get_provider as cfg_provider,
+                                 list_prompts, list_sessions, load_config, load_prompt,
+                                 load_session, move_space, norm_workspace, register_space,
+                                 rename_space, save_config, save_prompt, save_session,
+                                 set_current_space, space_list as group_spaces,
+                                 space_name, update_session as patch_session)
 from core.assistant.tools import ToolRegistry
 
 #: 未压缩时的历史条数上限。压缩生效后由 `context.DEFAULT_KEEP` 决定保留窗口，
@@ -58,6 +62,16 @@ MAX_SKILL_HINTS = 20
 # 单轮总时限（秒）：本地小模型单次调用就可能 30-60s，技能再放大若干倍，
 # 不设上限时一次「卡住」会把会话挂十几分钟，这里兜底强制收尾。
 MAX_TURN_SECONDS = 900
+#: 工具循环熔断：同一「工具名 + 参数」签名在最近 LOOP_WINDOW 轮内出现
+#: LOOP_REPEAT_LIMIT 次，即判定模型陷入循环（本地小模型反复调同一工具、
+#: 参数还一模一样，典型如反复 skill_list），主动中止而不是空转到墙钟。
+#: **这是「不设轮次上限」的正确兜底**：合法多步任务每轮参数都不同、签名会变，
+#: 不会被误伤；只有真正原地打转才命中。
+LOOP_REPEAT_LIMIT = 3
+LOOP_WINDOW = 10
+#: A/B 交替死循环（工具1↔工具2 反复横跳）不会形成「连续相同」，用窗口内
+#: 同签名出现次数兜底；阈值放宽到 6，避免误伤「同命令分多轮执行」类任务。
+LOOP_ALT_LIMIT = 6
 
 POLICY_TEXT = {
     "readonly_auto": "只读操作自动执行；写入、删除、执行命令、外发网络需用户批准",
@@ -219,7 +233,7 @@ class Assistant:
         # 一次读盘，任务列表与空间分组共用（左栏要同时渲染「任务」和「空间」两区）
         rows = list_sessions(500)
         return {
-            "version": "1.0.10",
+            "version": "1.0.11",
             "policy": cfg.get("policy"),
             "policies": [{"id": k, "label": v} for k, v in POLICY_TEXT.items()],
             "workspace": cfg.get("workspace"),
@@ -274,6 +288,12 @@ class Assistant:
         sid = "s" + uuid.uuid4().hex[:12]
         now = time.time()
         cur_ws = norm_workspace(workspace) or norm_workspace(load_config().get("workspace"))
+        # 新建任务时把工作区目录建出来：文件工具（fs_*）直接可用的前提，
+        # 否则在一个全新空间里让助理读写文件会因为目录不存在而失败。
+        try:
+            os.makedirs(cur_ws, exist_ok=True)
+        except OSError:
+            pass
         session = {"id": sid, "title": title or "新任务", "created_at": now,
                    "updated_at": now, "messages": [], "provider": "", "model": "",
                    "workspace": cur_ws, "pinned": False, "archived": False}
@@ -292,14 +312,77 @@ class Assistant:
         return list_sessions(50, include_archived)
 
     def space_list(self, include_archived: bool = False) -> List[Dict[str, Any]]:
-        """按空间（工作区）分组的任务列表。
+        """空间列表（1.0.11 起为真实具名实体）。
 
-        历史任务没有 workspace 字段（1.0.8 之前），统一归到当前工作区名下，
-        否则左栏会多出一个「未归属」组，看着像数据丢了。
+        合并「注册表登记的空间」与「有任务但未登记的工作区」，每个空间带它的
+        全部任务，左栏据此展开显示；不再只露最新一条（修复「建任务覆盖旧任务」）。
         """
         cfg = load_config()
         rows = list_sessions(500, include_archived)
-        return group_spaces(rows, fallback=cfg.get("workspace") or "")
+        return group_spaces(rows, fallback=cfg.get("workspace") or "",
+                             include_archived=include_archived)
+
+    # ---------------- 空间管理（具名、可切换、数据隔离） ----------------
+    def create_space(self, name: str = "", workspace: str = "") -> Dict[str, Any]:
+        """新建空间：没给目录就自动在 assistant/spaces/<slug>/ 下建一个。
+
+        返回 {path, name, ...}，path 即该空间的 workspace（任务据此归属）。
+        """
+        if workspace and workspace.strip():
+            ws = norm_workspace(workspace)
+            # 复用已有目录前，先确保它是个真实目录
+            try:
+                os.makedirs(ws, exist_ok=True)
+            except OSError:
+                pass
+        else:
+            slug = (name or "space").strip().replace(" ", "-") or "space"
+            ws = os.path.join(store_mod.SPACES_DIR, slug)
+            # 重名就加序号
+            base = ws
+            i = 1
+            while os.path.exists(ws):
+                ws = f"{base}-{i}"
+                i += 1
+            try:
+                os.makedirs(ws, exist_ok=True)
+            except OSError:
+                pass
+        entry = register_space(ws, name)
+        return {"path": ws, "name": entry.get("name", name or ""),
+                "created_at": entry.get("created_at", time.time()),
+                "current": get_current_space() == ws}
+
+    def rename_space(self, ws: str, name: str = "",
+                     new_workspace: str = "") -> Dict[str, Any]:
+        ws = norm_workspace(ws)
+        if new_workspace and new_workspace.strip():
+            move_space(ws, norm_workspace(new_workspace))
+            ws = norm_workspace(new_workspace)
+        if name and name.strip():
+            rename_space(ws, name)
+        return {"path": ws, "name": (name or "").strip() or space_name(ws)}
+
+    def delete_space(self, ws: str) -> Dict[str, Any]:
+        delete_space(norm_workspace(ws))
+        return {"deleted": True, "path": norm_workspace(ws)}
+
+    def activate_space(self, ws: str) -> Dict[str, Any]:
+        set_current_space(norm_workspace(ws))
+        return {"current": get_current_space()}
+
+    # ---------------- 提示词库（全局可复用） ----------------
+    def prompt_list(self, limit: int = 200) -> List[Dict[str, Any]]:
+        return list_prompts(limit)
+
+    def prompt_save(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        return save_prompt(body or {})
+
+    def prompt_get(self, pid: str) -> Optional[Dict[str, Any]]:
+        return load_prompt(pid)
+
+    def prompt_delete(self, pid: str) -> bool:
+        return delete_prompt(pid)
 
     def update_session(self, sid: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         s = patch_session(sid, patch or {})
@@ -492,6 +575,9 @@ class Assistant:
             except (TypeError, ValueError):
                 max_rounds = DEFAULT_MAX_TOOL_ROUNDS
             max_rounds = max(0, max_rounds)
+            #: 最近若干轮的工具调用签名（每轮 = 本轮全部调用的 (name,args) 有序元组）。
+            #: 用于「重复调用熔断」：不设轮次上限，但要能识别原地打转。
+            sig_history: List[tuple] = []
             while max_rounds <= 0 or rounds < max_rounds:
                 if self._cancelled(session_id):
                     emit({"type": "stopped"})
@@ -573,6 +659,33 @@ class Assistant:
                               "下面是它的思考原文，仅供参考。"})
                     emit({"type": "done", "content": final_text,
                           "stopped": reply.finish_reason == "cancelled"})
+                    break
+
+                # ---- 重复调用熔断（防死循环）----
+                # 本地小模型常把同一工具（如 skill_list）用完全相同的参数反复调用，
+                # 空转到墙钟/上百步都不收敛。双重判据：
+                #   ① 连续 LOOP_REPEAT_LIMIT 轮签名完全相同 → 必定原地打转，立即停；
+                #   ② 最近 LOOP_WINDOW 轮内同签名出现 LOOP_ALT_LIMIT 次 → 抓 A/B 交替。
+                # 合法多步任务每轮参数不同（签名会变），不会误伤。
+                round_sig = tuple(sorted(
+                    (str(c.get("name") or ""), self._args_json(c))
+                    for c in calls))
+                sig_history.append(round_sig)
+                del sig_history[:max(0, len(sig_history) - LOOP_WINDOW)]
+                trailing = 0
+                for s in reversed(sig_history):
+                    if s != round_sig:
+                        break
+                    trailing += 1
+                window_hits = sig_history.count(round_sig)
+                if trailing >= LOOP_REPEAT_LIMIT or window_hits >= LOOP_ALT_LIMIT:
+                    names = "、".join(sorted({n for n, _ in round_sig if n}))
+                    error = (f"检测到工具「{names or '工具'}」被以完全相同的参数"
+                             f"重复调用 {max(trailing, window_hits)} 次，疑似陷入"
+                             "循环，已自动中止以保护本机。建议：换个问法、把任务"
+                             "拆小，或换用更强的模型；若只是要查看技能/文件清单，"
+                             "可直接在左侧「技能」面板查看，无需让模型反复读取。")
+                    emit({"type": "error", "message": error})
                     break
 
                 # 有工具调用：把本轮 assistant 消息（含调用）加入上下文。

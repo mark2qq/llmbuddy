@@ -46,6 +46,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "AUDIT_DIR", str(root / "audit"))
     monkeypatch.setattr(store_mod, "CONFIG_PATH", str(root / "config.json"))
     monkeypatch.setattr(store_mod, "DEFAULT_WORKSPACE", str(root / "workspace"))
+    # 1.0.11：空间/提示词目录也是 ASSISTANT_DIR 的子目录，必须一并重定向，
+    # 否则会写到真实用户目录，污染本机数据且测试间不隔离。
+    monkeypatch.setattr(store_mod, "SPACES_DIR", str(root / "spaces"))
+    monkeypatch.setattr(store_mod, "SPACES_REGISTRY",
+                        str(root / "spaces" / "registry.json"))
+    monkeypatch.setattr(store_mod, "PROMPTS_DIR", str(root / "prompts"))
+    monkeypatch.setattr(store_mod, "CATALOG_DIR", str(root / "catalog"))
     monkeypatch.setattr(skills_mod, "SKILLS_DIR", str(root / "skills"))
 
     from core.assistant import agent as agent_mod
@@ -335,8 +342,11 @@ def test_agent_tool_rounds_unlimited_by_default(env, monkeypatch):
     会被中途掐断；现在 0=不限制，兜底靠 900s 墙钟 + 用户停止。
     """
     from core.assistant import agent as agent_mod
+    # 每轮参数带自增 n（工具会忽略），保证「签名不同」——本用例只验轮次上限，
+    # 不触发 1.0.11 新增的「重复调用熔断」（那是另一个用例的事）。
     replies = [ChatReply(content="", tool_calls=[{"id": f"c{i}", "name": "fs_list",
-                                                  "arguments": {"path": "."}}])
+                                                  "arguments": {"path": ".",
+                                                                "n": i}}])
                for i in range(20)]                       # 20 轮，旧的 12 上限必杀
     replies.append(ChatReply(content="列了 20 次，收工"))
     provider = FakeProvider(replies)
@@ -356,8 +366,10 @@ def test_agent_tool_rounds_unlimited_by_default(env, monkeypatch):
 def test_agent_tool_rounds_positive_cap_still_enforced(env, monkeypatch):
     """设了正数上限就仍然生效——不搞一刀切，配置可调。"""
     from core.assistant import agent as agent_mod
+    # 同上：每轮签名不同，避免触发重复调用熔断，专注验证「正数上限仍生效」。
     replies = [ChatReply(content="", tool_calls=[{"id": f"c{i}", "name": "fs_list",
-                                                  "arguments": {"path": "."}}])
+                                                  "arguments": {"path": ".",
+                                                                "n": i}}])
                for i in range(10)]                       # 永远调工具，不会自己收尾
     provider = FakeProvider(replies)
     monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
@@ -527,7 +539,55 @@ def test_turn_executes_bare_name_switch_call(env, monkeypatch):
     assert not [e for e in events if e["type"] == "error"]
 
 
-def test_turn_cleans_tool_markup_from_reasoning(env, monkeypatch):
+def test_turn_aborts_on_repeated_identical_tool_call(env, monkeypatch):
+    """模型反复用完全相同参数调同一工具（如 skill_list）：熔断中止，不许空转。
+
+    用户截图里的「读取技能列表」重复上百步、深度思考全空，根因就是不设轮次
+    上限（DEFAULT_MAX_TOOL_ROUNDS=0）时没有任何「原地打转」检测。这里验证
+    同签名在窗口内达到 LOOP_REPEAT_LIMIT 次即中止，且明确报错。
+    """
+    from core.assistant import agent as agent_mod
+    provider = FakeProvider(
+        [ChatReply(content="<tool_call>skill_list</tool_call>") for _ in range(10)])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "你有哪些技能", emit=events.append)
+    assert not res["ok"] and res["error"]
+    errs = [e for e in events if e["type"] == "error"]
+    assert errs, events
+    assert "重复调用" in errs[0]["message"]
+    # 熔断在「执行前」判断：最多真正执行 LOOP_REPEAT_LIMIT-1 次就拿住
+    tcalls = [e for e in events if e["type"] == "tool_call"]
+    assert len(tcalls) < agent_mod.LOOP_REPEAT_LIMIT, tcalls
+    # 模型侧收到的轮次也被限制住（不是把 10 条预设跑完）
+    assert len(provider.calls) <= agent_mod.LOOP_REPEAT_LIMIT
+
+
+def test_turn_distinct_calls_do_not_trip_loop_guard(env, monkeypatch):
+    """合法多步任务：每轮参数不同 → 签名不同，绝不能被熔断误伤。"""
+    from core.assistant import agent as agent_mod
+    provider = FakeProvider([
+        ChatReply(content='<tool_call>fs_list {"path": "."}</tool_call>'),
+        ChatReply(content='<tool_call>fs_list {"path": "sub"}</tool_call>'),
+        ChatReply(content='<tool_call>fs_list {"path": "sub/x"}</tool_call>'),
+        ChatReply(content="共三处，已看完。"),
+    ])
+    monkeypatch.setattr(agent_mod, "get_provider", lambda cfg: provider)
+    store_mod.save_config({"policy": "yolo"})
+
+    ass = agent_mod.get_assistant()
+    session = ass.new_session()
+    events = []
+    res = ass.start_turn(session["id"], "看一下目录", emit=events.append)
+    assert res["ok"], res
+    assert not [e for e in events if e["type"] == "error"]
+
+
+
     """思考里混进工具标记：思考正文也要清干净，不留 <tool_call> 原文。
 
     本地 qwen3 这类思考型模型经常把工具调用写在「思考」里；正文清干净了
@@ -692,7 +752,12 @@ def test_space_missing_dir_flagged(env, tmp_path):
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
     gone = tmp_path / "gone"
-    ass.new_session("x", str(gone))         # 不创建目录
+    # 不创建目录，直接落一条指向它的任务（绕过 new_session 的 makedirs），
+    # 验证空间列表对「目录已不在」的空间会标 exists=False。
+    store_mod.save_session({"id": "sgone", "title": "x", "created_at": 1,
+                            "updated_at": 1, "messages": [],
+                            "workspace": str(gone), "pinned": False,
+                            "archived": False})
     sp = [s for s in ass.space_list() if s["name"] == "gone"]
     assert sp and sp[0]["exists"] is False
 
@@ -721,126 +786,141 @@ def test_http_task_and_space_endpoints(env):
 
 
 # ----------------------------------------------------------------------------
-# 任务 / 空间（1.0.8：会话改叫「任务」，按工作区目录分组成「空间」）
+# 空间管理（1.0.11：具名、可切换、数据隔离的真实实体）
 # ----------------------------------------------------------------------------
-def test_new_task_belongs_to_current_workspace(env):
+def test_create_space_registers_and_creates_dir(env, tmp_path):
+    """新建空间会登记名字并建出工作区目录（数据隔离的物理基础）。"""
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    s = ass.new_session()
-    assert s["title"] == "新任务"
-    assert store_mod.norm_workspace(s["workspace"]) ==         store_mod.norm_workspace(str(env["workspace"]))
-    assert s["pinned"] is False and s["archived"] is False
+    sp = ass.create_space("我的项目", str(tmp_path / "proj"))
+    assert os.path.isdir(sp["path"])
+    assert sp["name"] == "我的项目"
+    reg = store_mod.load_spaces()["by_path"]
+    assert store_mod.norm_workspace(sp["path"]) in reg
+    # 注册表里登记的空空间也会出现（count=0），不会被左栏吞掉
+    lst = [s for s in ass.space_list() if s["path"] == sp["path"]]
+    assert lst and lst[0]["count"] == 0
 
 
-def test_rename_pin_archive_task(env):
+def test_rename_space_updates_name(env, tmp_path):
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    s = ass.new_session()
-    ass.update_session(s["id"], {"title": "  月度报表  ", "pinned": True})
-    got = store_mod.load_session(s["id"])
-    assert got["title"] == "月度报表" and got["pinned"] is True
-    # 归档后默认列表不出现，include_archived 才给
-    ass.update_session(s["id"], {"archived": True})
-    assert s["id"] not in [x["id"] for x in ass.session_list()]
-    assert s["id"] in [x["id"] for x in ass.session_list(include_archived=True)]
+    sp = ass.create_space("旧名", str(tmp_path / "rn"))
+    ass.rename_space(sp["path"], "新名")
+    cur = store_mod.load_spaces()["by_path"].get(sp["path"], {})
+    assert cur.get("name") == "新名"
+    disp = [s for s in ass.space_list() if s["path"] == sp["path"]][0]
+    assert disp["name"] == "新名"
 
 
-def test_update_task_does_not_bump_updated_at(env):
-    """重命名/置顶不该把任务顶到「最近活动」最前面（与 WorkBuddy 一致）。"""
+def test_delete_space_removes_registry_entry(env, tmp_path):
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    s = ass.new_session()
-    before = store_mod.load_session(s["id"])["updated_at"]
-    time.sleep(0.02)
-    ass.update_session(s["id"], {"title": "改名", "pinned": True})
-    assert store_mod.load_session(s["id"])["updated_at"] == before
+    sp = ass.create_space("待删", str(tmp_path / "del"))
+    ass.delete_space(sp["path"])
+    reg = store_mod.load_spaces()["by_path"]
+    assert sp["path"] not in reg
+    # 没任务的空空间删除后从列表消失
+    assert not [s for s in ass.space_list() if s["path"] == sp["path"]]
 
 
-def test_pinned_task_sorts_first(env):
+def test_activate_space_marks_current(env, tmp_path):
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    old = ass.new_session("旧")
-    store_mod.save_session({**store_mod.load_session(old["id"]),
-                            "updated_at": 100.0})
-    pinned = ass.new_session("置顶")
-    store_mod.save_session({**store_mod.load_session(pinned["id"]),
-                            "updated_at": 50.0, "pinned": True})
-    rows = ass.session_list()
-    assert rows[0]["id"] == pinned["id"]
+    sp = ass.create_space("当前空间", str(tmp_path / "cur"))
+    ass.activate_space(sp["path"])
+    assert store_mod.get_current_space() == sp["path"]
+    disp = [s for s in ass.space_list() if s["path"] == sp["path"]][0]
+    assert disp["current"] is True
+    others = [s for s in ass.space_list() if s["path"] != sp["path"]]
+    assert all(not s["current"] for s in others)
 
 
-def test_space_list_groups_tasks_by_workspace(env, tmp_path):
+def test_space_list_includes_empty_registered_space(env):
+    """1.0.11 修复点：空空间也得出现，不能在左栏被吞掉。"""
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    ws1, ws2 = tmp_path / "ws1", tmp_path / "ws2"
-    ws1.mkdir()
-    ws2.mkdir()
-    a = ass.new_session("甲", str(ws1))
-    b = ass.new_session("乙", str(tmp_path / "ws2"))
-    ass.update_session(b["id"], {"pinned": True})
-    spaces = {sp["name"]: sp for sp in ass.space_list()}
-    assert {"ws1", "ws2"} <= set(spaces)
-    assert spaces["ws1"]["count"] == 1
-    assert spaces["ws2"]["tasks"][0]["id"] == b["id"]      # 置顶排组内第一
-    assert spaces["ws1"]["exists"] is True
-    assert a["id"] in [t["id"] for t in spaces["ws1"]["tasks"]]
+    store_mod.register_space(str(env["workspace"]) + "-empty", "空空间")
+    names = [s["name"] for s in ass.space_list()]
+    assert "空空间" in names
 
 
-def test_space_path_normalized(env, tmp_path):
-    """反斜杠写法与正斜杠写法属于同一个空间，不能拆成两条同名目录。"""
+# ----------------------------------------------------------------------------
+# 提示词库（1.0.11：全局可复用，跨空间调用）
+# ----------------------------------------------------------------------------
+def test_prompt_save_load_list_delete(env):
+    """提示词库 CRUD：全局可复用、跨空间。"""
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    ws = tmp_path / "merged"
-    ws.mkdir()
-    alt = str(ws).replace("\\", "/") + "/"
-    ass.new_session("一", str(ws))
-    ass.new_session("二", alt)
-    groups = [sp for sp in ass.space_list() if sp["name"] == "merged"]
-    assert len(groups) == 1 and groups[0]["count"] == 2
+    saved = ass.prompt_save({"title": "写周报", "content": "帮我写本周周报",
+                             "tags": ["写作"]})
+    assert saved.get("id")
+    pid = saved["id"]
+    got = ass.prompt_get(pid)
+    assert got["title"] == "写周报" and got["content"] == "帮我写本周周报"
+    assert any(p["id"] == pid for p in ass.prompt_list())
+    assert ass.prompt_delete(pid) is True
+    assert ass.prompt_get(pid) is None
 
 
-def test_legacy_task_without_workspace_falls_back(env):
-    """1.0.8 之前的老会话没有 workspace 字段，归到当前工作区而不是单列一组。"""
+def test_prompt_update_is_idempotent(env):
     from core.assistant import agent as agent_mod
     ass = agent_mod.get_assistant()
-    store_mod.save_session({"id": "sold", "title": "老任务", "created_at": 1,
-                            "updated_at": 1, "messages": []})
-    spaces = ass.space_list()
-    assert "（未归属）" not in [sp["name"] for sp in spaces]
-    hit = [t for sp in spaces for t in sp["tasks"] if t["id"] == "sold"]
-    assert hit and hit[0]["workspace"] ==         store_mod.norm_workspace(str(env["workspace"]))
+    first = ass.prompt_save({"title": "A", "content": "x"})
+    pid = first["id"]
+    second = ass.prompt_save({"id": pid, "title": "B", "content": "y"})
+    assert second["id"] == pid
+    assert second["title"] == "B"
+    assert ass.prompt_get(pid)["title"] == "B"
 
 
-def test_space_missing_dir_flagged(env, tmp_path):
-    from core.assistant import agent as agent_mod
-    ass = agent_mod.get_assistant()
-    gone = tmp_path / "gone"
-    ass.new_session("x", str(gone))         # 不创建目录
-    sp = [s for s in ass.space_list() if s["name"] == "gone"]
-    assert sp and sp[0]["exists"] is False
-
-
-def test_http_task_and_space_endpoints(env):
+def test_http_space_crud_endpoints(env, tmp_path):
     import asyncio
     from routers import assistant as api
 
-    created = asyncio.run(api.create_session({"title": "接口任务"}))
+    created = asyncio.run(api.create_space({"name": "接口空间",
+                                            "workspace": str(tmp_path / "hs")}))
     assert created["code"] == 0
-    sid = created["data"]["id"]
+    key = created["data"]["path"]
+    assert created["data"]["name"] == "接口空间"
 
-    patch = asyncio.run(api.session_update(sid, {"pinned": True,
-                                                 "title": "接口任务改名"}))
-    assert patch["code"] == 0 and patch["data"]["pinned"] is True
+    renamed = asyncio.run(api.update_space(key, {"name": "改名空间"}))
+    assert renamed["code"] == 0 and renamed["data"]["name"] == "改名空间"
 
-    spaces = asyncio.run(api.spaces())
-    assert spaces["code"] == 0
-    assert any(t["id"] == sid for sp in spaces["data"] for t in sp["tasks"])
+    activated = asyncio.run(api.activate_space(key))
+    assert activated["code"] == 0 and activated["data"]["current"] == key
 
-    state = asyncio.run(api.state())
-    assert any(s["id"] == sid for s in state["data"]["sessions"])
+    deleted = asyncio.run(api.delete_space_endpoint(key))
+    assert deleted["code"] == 0 and deleted["data"]["deleted"] is True
 
-    missing = asyncio.run(api.session_update("nope", {"pinned": True}))
+
+def test_http_prompt_endpoints(env):
+    import asyncio
+    from routers import assistant as api
+
+    created = asyncio.run(api.create_prompt({"title": "T", "content": "C"}))
+    assert created["code"] == 0
+    pid = created["data"]["id"]
+    assert pid
+
+    got = asyncio.run(api.prompt_detail(pid))
+    assert got["code"] == 0 and got["data"]["content"] == "C"
+
+    upd = asyncio.run(api.update_prompt(pid, {"content": "C2"}))
+    assert upd["code"] == 0 and upd["data"]["content"] == "C2"
+
+    missing = asyncio.run(api.prompt_detail("nope"))
     assert missing["code"] != 0
+
+    dele = asyncio.run(api.delete_prompt_endpoint(pid))
+    assert dele["code"] == 0 and dele["data"]["deleted"] is True
+
+
+def test_http_prompt_rejects_empty(env):
+    import asyncio
+    from routers import assistant as api
+    res = asyncio.run(api.create_prompt({"title": "", "content": ""}))
+    assert res["code"] == 2040
 
 
 # ----------------------------------------------------------------------------

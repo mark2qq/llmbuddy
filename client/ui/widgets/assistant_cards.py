@@ -426,13 +426,22 @@ class ProcessLine(QWidget):
     # ---------------- 步骤 ----------------
     def add_step(self, action: str) -> int:
         """追加一步，返回它的序号（页面侧用它回填结果）。"""
-        self._steps.append({"action": action, "ok": None})
+        self._steps.append({"action": action, "ok": None,
+                            "content": "", "repeat": 1})
         self._refresh()
         return len(self._steps) - 1
 
-    def set_result(self, pos: int, ok: bool) -> None:
+    def set_result(self, pos: int, ok: bool, content: str = "") -> None:
+        """回填结果：成功标志 + 结果正文（如技能清单 / 文件内容，展开可见）。"""
         if 0 <= pos < len(self._steps):
             self._steps[pos]["ok"] = bool(ok)
+            self._steps[pos]["content"] = str(content or "")
+        self._refresh()
+
+    def bump_repeat(self, pos: int, repeat: int) -> None:
+        """同一调用（名+参完全相同）重复出现：只累加计数，不再铺一行。"""
+        if 0 <= pos < len(self._steps):
+            self._steps[pos]["repeat"] = max(1, int(repeat))
         self._refresh()
 
     def toggle(self) -> None:
@@ -446,12 +455,16 @@ class ProcessLine(QWidget):
 
     # ---------------- 渲染 ----------------
     def _refresh(self) -> None:
-        acts = [s["action"] for s in self._steps] or ["正在处理"]
-        shown = acts[:self.MAX_ITEMS]
-        if len(acts) > self.MAX_ITEMS:
-            shown.append(f"等 {len(acts)} 项")
+        # 摘要：每个步骤一个标签，重复调用显示「动作 ×N」（不再铺一长串同名行）
+        shown = []
+        for s in self._steps:
+            n = int(s.get("repeat") or 1)
+            shown.append(s["action"] if n == 1 else f"{s['action']} ×{n}")
+        head_items = shown[:self.MAX_ITEMS]
+        if len(shown) > self.MAX_ITEMS:
+            head_items.append(f"等 {len(shown)} 项")
         arrow = "▾" if self._expanded else "›"
-        self.head.setText(f"⚡ {'、'.join(shown)} {arrow}")
+        self.head.setText(f"⚡ {'、'.join(head_items) or '正在处理'} {arrow}")
         self.head.setToolTip("点击展开这一步的过程" if not self._expanded
                              else "点击收起")
 
@@ -462,11 +475,25 @@ class ProcessLine(QWidget):
                 w.deleteLater()
         for s in self._steps:
             mark = "·" if s["ok"] is None else ("✓" if s["ok"] else "✗")
-            lbl = QLabel(f"{mark} {s['action']}")
+            n = int(s.get("repeat") or 1)
+            label = f"{mark} {s['action']}" + (f" ×{n}" if n > 1 else "")
+            lbl = QLabel(label)
             lbl.setObjectName("ProcessStep")
             lbl.setWordWrap(True)
             lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
             self._body_lay.addWidget(lbl)
+            # 结果正文：展开后完整可见（超长截断，避免撑爆布局）。
+            # 这是「读取技能列表」等工具真正的内容——此前只标 ✓ 不显示内容。
+            content = (s.get("content") or "").strip()
+            if content:
+                shown_text = content if len(content) <= 4000 else (
+                    content[:4000] + f"\n…（共 {len(content)} 字，已截断）")
+                det = QLabel(shown_text)
+                det.setObjectName("ProcessStepDetail")
+                det.setWordWrap(True)
+                det.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
+                det.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                self._body_lay.addWidget(det)
 
 
 class ApprovalCard(QFrame):

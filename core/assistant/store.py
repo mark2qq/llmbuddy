@@ -19,6 +19,7 @@
 import os
 import json
 import time
+import uuid
 import shutil
 import threading
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,9 @@ _LOCK = threading.RLock()
 ASSISTANT_DIR = os.path.join(user_data_dir(), "assistant")
 SKILLS_DIR = os.path.join(ASSISTANT_DIR, "skills")
 SESSIONS_DIR = os.path.join(ASSISTANT_DIR, "sessions")
+SPACES_DIR = os.path.join(ASSISTANT_DIR, "spaces")
+SPACES_REGISTRY = os.path.join(SPACES_DIR, "registry.json")
+PROMPTS_DIR = os.path.join(ASSISTANT_DIR, "prompts")
 AUDIT_DIR = os.path.join(ASSISTANT_DIR, "audit")
 CONFIG_PATH = os.path.join(ASSISTANT_DIR, "config.json")
 DEFAULT_WORKSPACE = os.path.join(ASSISTANT_DIR, "workspace")
@@ -181,8 +185,8 @@ def _default_config() -> Dict[str, Any]:
 
 def ensure_dirs() -> None:
     """创建全部工作目录（幂等）。"""
-    for d in (ASSISTANT_DIR, SKILLS_DIR, SESSIONS_DIR, AUDIT_DIR, DEFAULT_WORKSPACE,
-              CATALOG_DIR):
+    for d in (ASSISTANT_DIR, SKILLS_DIR, SESSIONS_DIR, SPACES_DIR, PROMPTS_DIR,
+              AUDIT_DIR, DEFAULT_WORKSPACE, CATALOG_DIR):
         os.makedirs(d, exist_ok=True)
 
 
@@ -407,39 +411,6 @@ def list_sessions(limit: int = 50, include_archived: bool = False,
     return items[:limit]
 
 
-def space_list(sessions: Optional[List[Dict[str, Any]]] = None,
-               fallback: str = "") -> List[Dict[str, Any]]:
-    """把任务按所属空间（工作区目录）分组，供左栏「空间」区渲染。
-
-    sessions 为空时自己读一次；fallback 是当前工作区，历史任务没有记录
-    workspace 字段（1.0.8 之前建的）就归到它名下，避免出现「无归属」空组。
-    """
-    rows = list_sessions(500, False) if sessions is None else sessions
-    fb = norm_workspace(fallback)
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for s in rows:
-        ws = norm_workspace(s.get("workspace")) or fb or "（未归属）"
-        # 归位后的空间写回摘要：前端/外部 API 拿到的任务都带明确归属，
-        # 不必各自再实现一遍 fallback。
-        s = dict(s)
-        s["workspace"] = ws
-        groups.setdefault(ws, []).append(s)
-    out: List[Dict[str, Any]] = []
-    for ws, tasks in groups.items():
-        tasks.sort(key=lambda x: (not x.get("pinned"), -(x.get("updated_at") or 0)))
-        out.append({
-            "path": ws,
-            "name": space_name(ws),
-            "exists": ws == "（未归属）" or os.path.isdir(ws),
-            "count": len(tasks),
-            "pinned": sum(1 for t in tasks if t.get("pinned")),
-            "updated_at": max((t.get("updated_at") or 0) for t in tasks),
-            "tasks": tasks,
-        })
-    out.sort(key=lambda g: -(g.get("updated_at") or 0))
-    return out
-
-
 def update_session(sid: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """改任务属性（标题 / 所属空间 / 置顶 / 归档），返回更新后的整条会话。
 
@@ -466,6 +437,266 @@ def update_session(sid: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def delete_session(sid: str) -> bool:
     path = _session_path(sid)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ----------------------------------------------------------------------------
+# 空间（具名、可切换的工作区目录）
+# ----------------------------------------------------------------------------
+# 1.0.11 起「空间」是真实实体：每个空间有名字、可切换、数据（任务 + 文件）隔离。
+# 内部仍以「工作区目录路径」作为空间的唯一标识（与既有任务/文件工具模型一致，
+# 不动任何 session 文件，老数据无需迁移）。名字/排序/当前空间记在注册表里。
+DEFAULT_SPACE_NAME = "默认空间"
+
+
+def _default_space_name(ws: str) -> str:
+    """没起名时：默认工作区叫「默认空间」，其余叫目录名。"""
+    return DEFAULT_SPACE_NAME if ws == norm_workspace(DEFAULT_WORKSPACE) \
+        else space_name(ws)
+
+
+def load_spaces() -> Dict[str, Any]:
+    """读空间注册表（原子读，缺字段补默认）。"""
+    ensure_dirs()
+    reg = {"by_path": {}, "current": ""}
+    try:
+        if os.path.exists(SPACES_REGISTRY):
+            with open(SPACES_REGISTRY, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                reg["by_path"] = {
+                    norm_workspace(k): v
+                    for k, v in (data.get("by_path") or {}).items()
+                    if isinstance(v, dict)
+                }
+                reg["current"] = norm_workspace(data.get("current") or "")
+    except Exception:
+        pass
+    return reg
+
+
+def save_spaces(reg: Dict[str, Any]) -> None:
+    ensure_dirs()
+    with _LOCK:
+        tmp = SPACES_REGISTRY + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(reg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SPACES_REGISTRY)
+
+
+def register_space(ws: str, name: str = "", order: int = 0) -> Dict[str, Any]:
+    """登记（或补全）一个空间：名字缺省按目录名/默认空间名。"""
+    ws = norm_workspace(ws)
+    reg = load_spaces()
+    entry = reg["by_path"].get(ws) or {
+        "created_at": time.time(), "pinned": False, "order": order}
+    if name and name.strip():
+        entry["name"] = name.strip()[:40]
+    else:
+        entry.setdefault("name", _default_space_name(ws))
+    reg["by_path"][ws] = entry
+    if not reg["current"]:
+        reg["current"] = ws
+    save_spaces(reg)
+    return entry
+
+
+def rename_space(ws: str, name: str) -> None:
+    ws = norm_workspace(ws)
+    reg = load_spaces()
+    entry = reg["by_path"].get(ws) or {
+        "created_at": time.time(), "pinned": False, "order": 0}
+    entry["name"] = (name or "").strip()[:40] or _default_space_name(ws)
+    reg["by_path"][ws] = entry
+    save_spaces(reg)
+
+
+def set_current_space(ws: str) -> None:
+    ws = norm_workspace(ws)
+    reg = load_spaces()
+    if ws in reg["by_path"] or os.path.isdir(ws) or _space_has_sessions(ws):
+        reg["current"] = ws
+        save_spaces(reg)
+
+
+def get_current_space() -> str:
+    return norm_workspace(load_spaces().get("current") or "")
+
+
+def delete_space(ws: str) -> None:
+    """注销空间（只删名字/排序登记，不动任务和目录）。
+
+    该空间下的任务仍按 workspace 归到同名空间继续显示，不会丢；
+    想彻底清掉任务走「删除任务」。
+    """
+    ws = norm_workspace(ws)
+    reg = load_spaces()
+    reg["by_path"].pop(ws, None)
+    if reg["current"] == ws:
+        reg["current"] = ""
+    save_spaces(reg)
+
+
+def _space_has_sessions(ws: str) -> bool:
+    ws = norm_workspace(ws)
+    try:
+        for fn in os.listdir(SESSIONS_DIR):
+            if not fn.endswith(".json"):
+                continue
+            with open(os.path.join(SESSIONS_DIR, fn), "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if norm_workspace(s.get("workspace")) == ws:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def space_list(sessions: Optional[List[Dict[str, Any]]] = None,
+               fallback: str = "", include_archived: bool = False
+               ) -> List[Dict[str, Any]]:
+    """空间列表（真实具名实体）。
+
+    合并两类来源，互不复盖：
+      1) 注册表里登记过的空间（可能还没有任务，count=0）；
+      2) 有任务但没登记的空间（历史/外部建的工作区，按目录名显示）。
+    每个空间带它的全部任务，左栏据此可展开显示，不再只露最新一条。
+    """
+    reg = load_spaces()
+    rows = list_sessions(500, include_archived) if sessions is None else sessions
+    cur = norm_workspace(fallback) or norm_workspace(DEFAULT_WORKSPACE)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for s in rows:
+        ws = norm_workspace(s.get("workspace")) or cur or "（未归属）"
+        s = dict(s)
+        s["workspace"] = ws
+        groups.setdefault(ws, []).append(s)
+    # 注册表里空空间也要出现
+    for ws in reg["by_path"]:
+        groups.setdefault(ws, [])
+    out: List[Dict[str, Any]] = []
+    for ws, tasks in groups.items():
+        tasks.sort(key=lambda x: (not x.get("pinned"),
+                                  -(x.get("updated_at") or 0)))
+        entry = reg["by_path"].get(ws) or {}
+        out.append({
+            "path": ws,
+            "name": entry.get("name") or _default_space_name(ws),
+            "exists": ws == "（未归属）" or os.path.isdir(ws),
+            "count": len(tasks),
+            "pinned": bool(entry.get("pinned")),
+            "order": int(entry.get("order", 0)),
+            "current": ws == reg.get("current"),
+            "updated_at": (max((t.get("updated_at") or 0) for t in tasks)
+                           if tasks else entry.get("created_at", 0)),
+            "tasks": tasks,
+        })
+    out.sort(key=lambda g: (not g.get("pinned"), g.get("order", 0),
+                            -(g.get("updated_at") or 0)))
+    return out
+
+
+def move_space(ws: str, new_ws: str) -> None:
+    """改空间的目录（同时把它的任务迁过去，保证归属一致）。
+
+    用于「重命名空间」里顺带改目录；不改目录时直接调 rename_space。
+    """
+    ws = norm_workspace(ws)
+    new_ws = norm_workspace(new_ws)
+    if not new_ws or new_ws == ws:
+        return
+    # 任务归属批量改
+    for fn in os.listdir(SESSIONS_DIR):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, fn), "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if norm_workspace(s.get("workspace")) == ws:
+                s["workspace"] = new_ws
+                save_session(s)
+        except Exception:
+            continue
+    # 注册表登记迁过去
+    reg = load_spaces()
+    entry = reg["by_path"].pop(ws, None) or {
+        "created_at": time.time(), "pinned": False, "order": 0}
+    reg["by_path"][new_ws] = entry
+    if reg["current"] == ws:
+        reg["current"] = new_ws
+    save_spaces(reg)
+
+
+# ----------------------------------------------------------------------------
+# 提示词库（全局可复用）
+# ----------------------------------------------------------------------------
+def _prompt_path(pid: str) -> str:
+    safe = "".join(c for c in (pid or "") if c.isalnum() or c in "-_")
+    return os.path.join(PROMPTS_DIR, f"{safe}.json")
+
+
+def save_prompt(p: Dict[str, Any]) -> Dict[str, Any]:
+    """新建或更新一条提示词（幂等：有 id 就更新，无则生成）。"""
+    ensure_dirs()
+    os.makedirs(PROMPTS_DIR, exist_ok=True)
+    pid = p.get("id") or ("p" + uuid.uuid4().hex[:12])
+    now = time.time()
+    cur = load_prompt(pid) or {}
+    rec = {
+        "id": pid,
+        "title": (p.get("title") or cur.get("title") or "未命名提示词")[:60],
+        "content": p.get("content")
+        if p.get("content") is not None else cur.get("content", ""),
+        "tags": p.get("tags") if p.get("tags") is not None else cur.get("tags", []),
+        "created_at": cur.get("created_at") or now,
+        "updated_at": now,
+    }
+    with _LOCK:
+        tmp = _prompt_path(pid) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _prompt_path(pid))
+    return rec
+
+
+def load_prompt(pid: str) -> Optional[Dict[str, Any]]:
+    path = _prompt_path(pid)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def list_prompts(limit: int = 200) -> List[Dict[str, Any]]:
+    ensure_dirs()
+    os.makedirs(PROMPTS_DIR, exist_ok=True)
+    out: List[Dict[str, Any]] = []
+    try:
+        for fn in os.listdir(PROMPTS_DIR):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(PROMPTS_DIR, fn), "r", encoding="utf-8") as f:
+                    out.append(json.load(f))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    out.sort(key=lambda x: -(x.get("updated_at") or 0))
+    return out[:limit]
+
+
+def delete_prompt(pid: str) -> bool:
+    path = _prompt_path(pid)
     try:
         if os.path.exists(path):
             os.remove(path)

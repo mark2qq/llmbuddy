@@ -34,11 +34,10 @@ app = QApplication.instance() or QApplication(sys.argv)
 
 #: 底栏宽度门禁：单一来源——直接取被测页面类的常量，禁止在测试里硬编码
 #: 字面量（否则实现悄悄改预算、测试仍按旧值放行/误报，二者漂移）。
-#: 实测依据：逻辑 720 窗口下右栏容器实际可用 522（idle 474 / busy 522），
-#: 底栏 busy 实测 510 ≤ 522 未裁切；预算 = 522 - 8px style 余量 = 514。
+#: 预算口径（2026-06 重算）：主窗口最小宽 1000 → 左栏 200 → 右栏最窄约 770；
+#: 空底栏实测 542 / 忙碌态 614，均 ≤720 门禁。测试改用「真实最窄面板 770」
+#: 的实测可用宽（composer.width-16）做硬断言，BAR_BUDGET_W 仅作文档锚点。
 BAR_BUDGET_W = mod.AssistantPage.BAR_BUDGET_W
-#: 压缩后目标 439px（idle/chip 常态应贴在此附近）
-BAR_TARGET_W = 439
 
 
 # --------------------------------------------------------------------------- #
@@ -148,6 +147,10 @@ class _FakeAssistApi:
         return [{"id": "s1", "title": "历史任务", "message_count": 2,
                  "workspace": "", "pinned": False, "archived": False,
                  "created_at": 1.0, "updated_at": 2.0, "preview": "你好"}]
+
+    def spaces(self):
+        # 清单中心用例不测空间：返回空列表（与默认工作区等价）。
+        return []
 
     def new_session(self, *a, **kw):
         def _make():
@@ -326,26 +329,38 @@ def _bar_width(p) -> int:
     return total
 
 
-def test_bottom_bar_fits_504px_at_logical_720(page):
-    """逻辑 720 宽下，底栏实际占用 ≤ BAR_BUDGET_W（右栏可用宽重算值 514）。"""
+def test_bottom_bar_fits_at_min_window(page):
+    """App 最小宽 1000 → 右栏 ~770：空闲态底栏 ≤ 实际可用宽，且全部按钮恒可见带文字。
+
+    1.0.11 新增 📝提示词 / ✨ 后空底栏实测 542px（9 个常驻按钮全带文字），
+    仍远低于右栏 ~770 的可用宽；旧的 514（720 逻辑宽假设）已不成立，改以
+    真实最窄面板的实测可用宽（composer.width - 16）做硬断言。
+    """
     p, _fake = page
-    p.resize(720, 680)
+    p.resize(770, 680)
     p._skill_slugs = []
     p._refresh_skill_chips()
     _settle()
     w = _bar_width(p)
-    assert w <= BAR_BUDGET_W, f"底栏 {w}px 超 {BAR_BUDGET_W}px 门禁"
-    # 压缩后应在 439px 附近（留 40px 给不同平台的 style 抖动）
-    assert w <= BAR_TARGET_W + 40, f"底栏 {w}px 未压缩到 439px 目标附近"
+    avail = p._composer.width() - 16
+    assert w <= avail, f"空闲态底栏 {w}px 超实际可用宽 {avail}px"
+    assert w <= BAR_BUDGET_W, f"空闲态底栏 {w}px 超门禁 {BAR_BUDGET_W}px"
+    assert w <= BAR_BUDGET_W + 80, "空闲态底栏宽得离谱，疑似布局损坏"
+    # 全部常驻功能按钮：恒可见 + 带文字（规则：绝不按宽度隐藏、不带空文案）
+    for btn in (p._attach_btn, p._ws_btn, p._policy_btn, p._skill_btn,
+                p._tool_btn, p._mcp_btn, p._prompt_btn, p._model_btn,
+                p._send_btn, p._enhance_btn):
+        assert btn.isVisibleTo(p) and not btn.isHidden(), btn.objectName()
+        assert btn.text().strip(), f"{btn.objectName()} 无文字"
 
 
-def test_bottom_bar_fits_504px_in_busy_state(page):
-    """忙碌态多出 运行指示 + 停止 + 引导 三个按钮，仍须 ≤ BAR_BUDGET_W（514）。
+def test_bottom_bar_fits_in_busy_state(page):
+    """忙碌态多出 运行指示 + 停止 + 引导 三按钮，仍 ≤ 实际可用宽（770 右栏）。
 
-    单跑也应通过：busy 实测 510 ≤ 514（不再依赖跨用例样式表 polish）。
+    单跑也应通过：busy 实测 614 ≤ 770 右栏（不再依赖跨用例样式表 polish）。
     """
     p, _fake = page
-    p.resize(720, 680)
+    p.resize(770, 680)
     p._skill_slugs = []
     p._refresh_skill_chips()
     _settle()
@@ -354,7 +369,9 @@ def test_bottom_bar_fits_504px_in_busy_state(page):
     p._guide_btn.setVisible(True)
     _settle()
     w = _bar_width(p)
-    assert w <= BAR_BUDGET_W, f"忙碌态底栏 {w}px 超 {BAR_BUDGET_W}px 门禁"
+    avail = p._composer.width() - 16
+    assert w <= avail, f"忙碌态底栏 {w}px 超实际可用宽 {avail}px"
+    assert w <= BAR_BUDGET_W, f"忙碌态底栏 {w}px 超门禁 {BAR_BUDGET_W}px"
     p._busy_lbl.setVisible(False)
     p._stop_btn.setVisible(False)
     p._guide_btn.setVisible(False)
@@ -362,8 +379,9 @@ def test_bottom_bar_fits_504px_in_busy_state(page):
 
 
 def test_bottom_bar_fits_with_mounted_skill_chips(page):
-    """挂载 1~5 个技能时底栏不得超门禁（规则④：chip 折到输入框上方）。"""
+    """挂载 1~5 个技能时底栏不得超实际可用宽（规则④：≥3 个折到输入框上方）。"""
     p, _fake = page
+    p.resize(770, 680)
     for n, slugs in ((1, ["repo-digest"]),
                      (2, ["repo-digest", "code-review"]),
                      (3, ["a", "b", "c"]),
@@ -372,9 +390,11 @@ def test_bottom_bar_fits_with_mounted_skill_chips(page):
         p._refresh_skill_chips()
         _settle()
         w = _bar_width(p)
+        avail = p._composer.width() - 16
+        assert w <= avail, f"{n} 个技能时底栏 {w}px 超实际可用宽 {avail}px"
         assert w <= BAR_BUDGET_W, f"{n} 个技能时底栏 {w}px 超门禁"
-        if slugs and n >= 2:
-            # 折行后 chip 容器应搬到独立一行，而不是留在底栏
+        # ≥3 个（或超预算）折行到输入框上方独立一行，而不是留在底栏
+        if n >= 3:
             assert p._chips_row == "col", f"{n} 个技能未折行"
 
 

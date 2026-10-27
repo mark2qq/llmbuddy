@@ -83,8 +83,27 @@ class AssistantApi:
         return self.get("/api/v1/assistant/sessions") or []
 
     def spaces(self) -> List[Dict]:
-        """任务按工作区目录分组（左栏「空间」区）。"""
+        """空间列表（1.0.11 起为真实具名实体，每个空间带全部任务）。"""
         return self.get("/api/v1/assistant/spaces") or []
+
+    def create_space(self, name: str = "", workspace: str = "") -> Dict:
+        return self.post("/api/v1/assistant/spaces",
+                         {"name": name, "workspace": workspace}) or {}
+
+    def rename_space(self, key: str, name: str = "",
+                     workspace: str = "") -> Dict:
+        body = {}
+        if name:
+            body["name"] = name
+        if workspace:
+            body["workspace"] = workspace
+        return self.patch(f"/api/v1/assistant/spaces/{key}", body) or {}
+
+    def delete_space(self, key: str) -> Dict:
+        return self.delete(f"/api/v1/assistant/spaces/{key}") or {}
+
+    def activate_space(self, key: str) -> Dict:
+        return self.post(f"/api/v1/assistant/spaces/{key}/activate", {}) or {}
 
     def new_session(self, workspace: str = "") -> Dict:
         return self.post("/api/v1/assistant/sessions",
@@ -99,6 +118,31 @@ class AssistantApi:
 
     def delete_session(self, sid: str) -> Dict:
         return self.delete(f"/api/v1/assistant/sessions/{sid}") or {}
+
+    # ---------------- 提示词库（全局可复用） ----------------
+    def prompts(self) -> List[Dict]:
+        return self.get("/api/v1/assistant/prompts") or []
+
+    def new_prompt(self, title: str, content: str,
+                   tags: Optional[List[str]] = None) -> Dict:
+        return self.post("/api/v1/assistant/prompts",
+                         {"title": title, "content": content,
+                          "tags": tags or []}) or {}
+
+    def update_prompt(self, pid: str, title: str = "", content: str = "",
+                      tags: Optional[List[str]] = None) -> Dict:
+        body: Dict[str, Any] = {}
+        if title:
+            body["title"] = title
+        if content != "" or tags is not None:
+            # 允许清空内容；用显式 key 区分「不更新」与「清空」
+            body["content"] = content
+        if tags is not None:
+            body["tags"] = tags
+        return self.patch(f"/api/v1/assistant/prompts/{pid}", body) or {}
+
+    def delete_prompt(self, pid: str) -> Dict:
+        return self.delete(f"/api/v1/assistant/prompts/{pid}") or {}
 
     def stop(self, sid: str) -> Dict:
         return self.post("/api/v1/assistant/stop", {"session_id": sid}) or {}

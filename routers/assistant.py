@@ -129,8 +129,73 @@ async def create_session(body: Optional[Dict[str, Any]] = None):
 
 @router.get("/spaces")
 async def spaces(include_archived: bool = False):
-    """任务按空间（工作区目录）分组，左栏「空间」区直接用这个结果。"""
+    """空间列表（1.0.11 起为真实具名实体，每个空间带全部任务）。"""
     return ok(get_assistant().space_list(include_archived))
+
+
+#: 空间是一组具名、可切换的工作区目录。`key` 是归一化后的目录路径
+#:（URL 里用 :path 转换器透传斜杠）。
+@router.post("/spaces")
+async def create_space(body: Optional[Dict[str, Any]] = None):
+    """新建空间（具名、可切换的工作区目录）。"""
+    body = body or {}
+    return ok(get_assistant().create_space(body.get("name") or "",
+                                            body.get("workspace") or ""))
+
+
+@router.patch("/spaces/{key:path}")
+async def update_space(key: str, body: Dict[str, Any]):
+    """重命名空间 / 改目录（改目录会同时迁移该空间下的任务）。"""
+    if not isinstance(body, dict) or not body:
+        return fail(2034, "没有要修改的字段")
+    return ok(get_assistant().rename_space(
+        key, body.get("name") or "", body.get("workspace") or ""))
+
+
+@router.delete("/spaces/{key:path}")
+async def delete_space_endpoint(key: str):
+    """注销空间（只删名字/排序登记，不动任务与目录）。"""
+    return ok(get_assistant().delete_space(key))
+
+
+@router.post("/spaces/{key:path}/activate")
+async def activate_space(key: str):
+    """把该空间设为当前（左栏高亮 + 新任务/文件工具默认落它）。"""
+    return ok(get_assistant().activate_space(key))
+
+
+#: 提示词库：全局可复用，跨空间调用。
+@router.get("/prompts")
+async def prompts():
+    return ok(get_assistant().prompt_list())
+
+
+@router.post("/prompts")
+async def create_prompt(body: Optional[Dict[str, Any]] = None):
+    body = body or {}
+    if not (body.get("title") or "").strip() and not (body.get("content") or "").strip():
+        return fail(2040, "提示词标题和内容不能都为空")
+    return ok(get_assistant().prompt_save(body))
+
+
+@router.get("/prompts/{pid}")
+async def prompt_detail(pid: str):
+    p = get_assistant().prompt_get(pid)
+    if p is None:
+        return fail(2041, "提示词不存在")
+    return ok(p)
+
+
+@router.patch("/prompts/{pid}")
+async def update_prompt(pid: str, body: Dict[str, Any]):
+    body = dict(body or {})
+    body["id"] = pid
+    return ok(get_assistant().prompt_save(body))
+
+
+@router.delete("/prompts/{pid}")
+async def delete_prompt_endpoint(pid: str):
+    return ok({"deleted": get_assistant().prompt_delete(pid)})
 
 
 @router.get("/sessions/{sid}")

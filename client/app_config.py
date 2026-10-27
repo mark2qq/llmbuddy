@@ -44,7 +44,7 @@ CLIENT_DIR = _base_dir()
 
 # 产品名与版本号（窗口标题 / 导航标题 / 托盘提示统一取用）
 APP_NAME = "llmBuddy"
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 APP_TITLE = f"{APP_NAME}  v{APP_VERSION}"
 
 # 用户数据目录名（%LOCALAPPDATA% 下）：2026-10-20 起由 LLMDesktop 更名为 llmBuddy。
