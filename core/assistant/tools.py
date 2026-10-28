@@ -84,11 +84,11 @@ def _risk_rank(r: str) -> int:
 
 #: 内置工具的分组（清单中心 / 文档展示用，不影响下发）
 TOOL_GROUPS = (("fs_", "文件"), ("shell_", "命令"), ("web_", "网络"),
-               ("skill_", "技能"))
+               ("skill_", "技能"), ("memory_", "记忆"))
 
 
 def tool_group(name: str) -> str:
-    """按工具名前缀归组：文件 / 命令 / 网络 / 技能 / 其它。"""
+    """按工具名前缀归组：文件 / 命令 / 网络 / 技能 / 记忆 / 其它。"""
     low = str(name or "").lower()
     for prefix, label in TOOL_GROUPS:
         if low.startswith(prefix):
@@ -466,6 +466,39 @@ class ToolRegistry:
             "medium", self._t_skill_run,
             summarize=lambda a: f"运行技能 {a.get('name')}：{str(a.get('task'))[:80]}")
 
+        # ---------------- 记忆类（1.0.12） ----------------
+        # WorkBuddy 同款「长期记忆」：全局 MEMORY.md + 空间 MEMORY.md + 每日日志，
+        # 见 core/assistant/memory.py。读取是只读（low），写入落本机 Markdown
+        # （medium，readonly_auto 策略下仍需确认——记忆会跨轮次影响后续行为）。
+        reg("memory_read",
+            "读取长期记忆：scope=space 本空间记忆（默认）/ global 全局记忆 / "
+            "log 某天的工作日志（不给 date 则返回可读日志清单）。",
+            {"type": "object", "properties": {
+                "scope": {"type": "string", "enum": ["space", "global", "log"]},
+                "date": {"type": "string",
+                         "description": "scope=log 时的日期，格式 YYYY-MM-DD"}},
+             "required": []},
+            "low", self._t_memory_read,
+            summarize=lambda a: f"读取记忆 {a.get('scope') or 'space'}"
+                                + (f" {a.get('date')}" if a.get("date") else ""))
+
+        reg("memory_append",
+            "把一条值得长期保留的偏好/约定/结论写进记忆（默认追加到本空间今天的"
+            "工作日志）。只记事、不复述聊天；不要写密码密钥等敏感信息。",
+            {"type": "object", "properties": {
+                "text": {"type": "string", "description": "要记住的内容（一句话说清）"},
+                "scope": {"type": "string", "enum": ["space", "global"],
+                          "description": "space=本空间（默认），global=跨空间全局"},
+                "to": {"type": "string", "enum": ["log", "memory"],
+                       "description": "log=当天日志（默认，流水）；"
+                                      "memory=写进 MEMORY.md（长期结论）"},
+                "date": {"type": "string",
+                         "description": "补记到某天日志，格式 YYYY-MM-DD，默认今天"}},
+             "required": ["text"]},
+            "medium", self._t_memory_append,
+            summarize=lambda a: "记住："
+                                + str(a.get("text") or "")[:60])
+
         # ---------------- 默认工具标记（1.0.12） ----------------
         # 内置工具全部是「默认工具」：装好即下发、不需要用户逐个挂载。
         # `default=True` 是给 UI（清单中心打「默认」标）与文档用的元数据，
@@ -739,6 +772,47 @@ class ToolRegistry:
         result = run_skill(skill, task, sub_ctx)
         return ToolResult(bool(result.get("ok")), content=result.get("answer", ""),
                           data=result, error=result.get("error", ""))
+
+    # ------------------------------------------------------------------ #
+    # 记忆工具实现（core/assistant/memory.py）
+    # ------------------------------------------------------------------ #
+    def _t_memory_read(self, args, ctx) -> ToolResult:
+        """读全局 / 空间记忆或某天日志。
+
+        默认读**当前工作区**的记忆——工作区就是空间，与左栏「空间」一致；
+        空工作区时 `memory.read_any` 返回空内容而不是报错（没记忆不算失败）。
+        """
+        from core.assistant import memory
+        scope = str(args.get("scope") or "space")
+        date = str(args.get("date") or "")
+        got = memory.read_any(self.workspace, scope=scope, date=date)
+        text = str(got.get("text") or "").strip()
+        if not text:
+            logs = got.get("logs")
+            if logs:
+                body = "\n".join(f"- {x.get('date')}  {x.get('preview') or ''}"
+                                 f"（{x.get('chars')} 字）" for x in logs)
+                return ToolResult(True, content="可读的工作日志：\n" + body,
+                                  data=got)
+            return ToolResult(True, content=f"（{scope} 记忆还是空的）",
+                              data=got)
+        return ToolResult(True, content=text, data=got)
+
+    def _t_memory_append(self, args, ctx) -> ToolResult:
+        """写一条记忆。落盘路径回给模型（它能据此告诉用户记到哪了）。"""
+        from core.assistant import memory
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return ToolResult(False, error="text 不能为空")
+        got = memory.write_any(
+            self.workspace, text,
+            scope=str(args.get("scope") or "space"),
+            to=str(args.get("to") or "log"),
+            date=str(args.get("date") or ""))
+        if not got.get("ok"):
+            return ToolResult(False, error="写入记忆失败（目录不可写？）")
+        return ToolResult(True, content=f"已记住，写入 {got.get('path')}",
+                          data=got)
 
 
 def build_registry(workspace: str) -> ToolRegistry:

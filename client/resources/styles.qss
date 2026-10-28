@@ -827,6 +827,9 @@ QTabBar::tab:hover { color: #d6dbe8; }
 /* ---------- 左栏二级栏目（智能助理下面直接显示） ---------- */
 #NavSubHost { background: transparent; border: none; }
 #NavSub { background: transparent; border: none; }
+/* 「空间」标题行现在排在滚动体里（紧跟任务列表）：全局 QWidget 底色是深色，
+ * 这里必须显式透明，否则标题行会变成一条黑色横带 */
+#NavSpaceHead { background: transparent; border: none; }
 #NavSubTitle {
     color: #6d7585;
     font-size: 13px;
@@ -1097,3 +1100,10 @@ QComboBox#Pill QAbstractItemView { font-size: 12px; padding: 2px; }
 #HubDetail { font-size: 13px; }
 #HubHeadCount { font-size: 13px; }
 #HubSearch, #HubCombo { font-size: 13px; }
+
+/* 记忆对话框（1.0.12）：左侧条目 + 右侧 Markdown 编辑器 */
+#MemTitle { font-size: 16px; font-weight: 600; }
+#MemHint { color: #8b93a7; font-size: 12px; }
+#MemMeta { color: #8b93a7; font-size: 11px; }
+#MemList { font-size: 13px; }
+#MemEdit { font-size: 13px; }

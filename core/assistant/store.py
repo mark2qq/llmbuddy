@@ -188,6 +188,11 @@ def _default_config() -> Dict[str, Any]:
         # 两个 key 必须在这里声明，否则老 config.json 读不到（同 1.0.8 的坑）。
         "auto_skill_off": [],
         "auto_skill_limit": 2,
+        # ---- 1.0.12：长期记忆（core/assistant/memory.py）----
+        # True = 每轮把「全局记忆 + 空间记忆 + 最近日志」注入 system，并下发
+        # memory_read / memory_append 两个工具；False = 完全不注入（历史数据保留）。
+        # 同上面的坑：必须在这里声明，否则老 config.json 读不到。
+        "memory_enabled": True,
         "profiles": _default_profiles(),
         "catalog": _default_catalog(),
         "skill_sources": {},         # slug -> {kind, repo, ref, dir, commit, ...}

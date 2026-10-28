@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QWidget)
 
 from core.assistant_client import AssistantApi, AssistantStream
-from core import model_info, model_pricing, local_endpoints
+from core import model_info, model_pricing, local_endpoints, online_endpoints
 from core.task_runner import Worker
 from core.theme import is_light
 from ui.widgets.assistant_cards import (ApprovalCard, AutoLoadPrompt, ChatBubble,
@@ -69,6 +69,7 @@ from ui.widgets.busy_spinner import BusySpin
 from ui.widgets.context_meter import ContextMeter
 from ui.widgets.image_composer import (IMAGE_EXTS, AttachmentBar, PasteImageEdit,
                                        save_image)
+from ui.widgets.memory_dialog import MemoryDialog
 #: 在线目录徽标文案的单一来源在在线窗口模块（两边共用一套，避免文案漂移）
 from ui.widgets.online_catalog_dialog import CLASS_BADGE as CATALOG_CLASS_BADGE
 from ui.widgets.queue_item import QueueItemRow
@@ -1230,6 +1231,7 @@ class AssistantPage(QWidget):
         self._input.image_pasted.connect(self._on_image_pasted)
         # 提示词库入口（底栏不再放按钮）：输入框右键 →「插入提示词…」
         self._input.prompt_requested.connect(self._open_prompt_picker)
+        self._input.memory_requested.connect(self._open_memory)
         # ✨ 显隐跟随输入内容（空 → 隐藏；有字 → 出现），见 `_sync_enhance_visible`
         self._input.textChanged.connect(self._sync_enhance_visible)
         lay.addWidget(self._input)
@@ -1396,6 +1398,38 @@ class AssistantPage(QWidget):
         """从全局提示词库插入到输入框；可跳转「管理提示词库」。"""
         dlg = _PromptPicker(self._assist, self)
         dlg.exec()
+
+    # ---------------- 长期记忆（1.0.12，对齐 WorkBuddy） ----------------
+    def _open_memory(self) -> None:
+        """打开「记忆」对话框：全局 / 当前空间 / 每日日志，可直接编辑。
+
+        记忆是**本机 Markdown**（`%LOCALAPPDATA%\\llmBuddy\\assistant\\memory`），
+        每轮对话开始时注入 system。这里先拉快照（后台线程），再弹窗。
+        """
+        ws = (self._current_space or _norm_ws(self._state.get("workspace"))
+              or self._default_ws())
+        self._set_status("正在读取记忆…")
+        w = Worker(self._assist.memory, ws)
+        w.result.connect(lambda data: self._show_memory_dialog(data))
+        w.error.connect(lambda m: self._set_status(f"读取记忆失败：{m}"))
+        w.start()
+
+    def _show_memory_dialog(self, data: Any) -> None:
+        if not isinstance(data, dict) or not data:
+            self._set_status("读取记忆失败：后端没有返回内容")
+            return
+        ws = str(data.get("workspace") or "")
+        dlg = MemoryDialog(
+            self, data,
+            on_save=lambda scope, date, text: self._assist.save_memory(
+                scope, text, workspace=ws, date=date))
+        dlg.saved.connect(lambda _r: self.refresh())
+        dlg.exec()
+        st = (data.get("stats") or {})
+        self._set_status(
+            f"记忆：全局 {st.get('global_chars', 0)} 字 · "
+            f"本空间 {st.get('space_chars', 0)} 字 · "
+            f"{st.get('logs', 0)} 天日志")
 
     def _enhance_prompt(self) -> None:
         """✨ 用**当前模型**把输入框内容原地改写成增强版提示词。
@@ -1833,14 +1867,15 @@ class AssistantPage(QWidget):
     def build_nav_panel(self) -> QWidget:
         """一级「智能助理」下面的二级栏目，语义与 WorkBuddy 一致：
 
-            任务 (N)                跨空间的最近任务，置顶优先，点一条即切换
+            任务 (N)                系统默认空间的任务，置顶优先，点一条即切换
               · 任务标题
-            空间 (M)                任务按所属工作区目录分组，点空间展开 / 收起
-              ▸ 📁 llm-service  2
+            空间 (M)                具名空间（默认空间不在这里重复出现）
+              ▸ 📁 llm-service  2     点空间展开 / 收起，展开后列该空间全部任务
                   · 任务标题
 
         「任务」= 一次对话（后端仍叫 session，数据格式不变），
-        「空间」= 任务所属的工作区目录，等价于 WorkBuddy 里挂在某个文件夹下的任务。
+        「空间」= 任务所属的具名工作区目录，等价于 WorkBuddy 里挂在某个文件夹下的任务。
+        归属口径：在某空间内新建 → 该空间；不在空间内新建 → 系统默认空间（任务区）。
         """
         panel = QWidget()
         panel.setObjectName("NavSub")
@@ -1856,33 +1891,26 @@ class AssistantPage(QWidget):
         head.setSpacing(4)
         self._nav_task_title = QLabel("任务")
         self._nav_task_title.setObjectName("NavSubTitle")
+        self._nav_task_title.setToolTip(
+            "系统默认空间的任务。\n"
+            "点上方 + 新建的任务会落在这里；其他空间的任务在下面「空间」里展开看")
         head.addWidget(self._nav_task_title)
         head.addStretch(1)
         add = QPushButton("+")
         add.setObjectName("NavSubAdd")
         add.setFixedSize(20, 20)
         add.setCursor(Qt.PointingHandCursor)
-        add.setToolTip("在当前空间新建任务")
+        # 口径（对齐 WorkBuddy）：任务区的 + 只在「当前没有进入某个空间」时
+        # 建到系统默认空间；已经在某空间里工作时建到该空间。
+        # 想明确指定空间：空间行右键「在此空间新建任务」。
+        add.setToolTip("新建任务（默认落在系统默认空间；在某空间内则落在该空间）")
         add.clicked.connect(lambda: self._new_session())
         head.addWidget(add)
         lay.addLayout(head)
 
-        # 「空间」分组标题行：自带「新建空间」按钮（1.0.11 真实空间实体）
-        shead = QHBoxLayout()
-        shead.setContentsMargins(20, 6, 12, 4)
-        shead.setSpacing(4)
-        self._nav_space_title = QLabel("空间")
-        self._nav_space_title.setObjectName("NavSubTitle")
-        shead.addWidget(self._nav_space_title)
-        shead.addStretch(1)
-        sadd = QPushButton("+")
-        sadd.setObjectName("NavSubAdd")
-        sadd.setFixedSize(20, 20)
-        sadd.setCursor(Qt.PointingHandCursor)
-        sadd.setToolTip("新建空间（具名、可切换、数据隔离）")
-        sadd.clicked.connect(lambda: self._new_space())
-        shead.addWidget(sadd)
-        lay.addLayout(shead)
+        # 「空间」标题行不在这里：它要跟着空间列表一起排（否则「任务」的条目会
+        # 出现在「空间」标题**下面**，看起来像空间任务）。见 `_nav_space_head_row()`。
+        self._nav_space_title = None
 
         # 任务区 + 空间区共用一个可滚动容器：左栏高度有限，
         # 窗口矮的时候必须能在内部滚动，而不是把导航按钮挤没。
@@ -1905,6 +1933,32 @@ class AssistantPage(QWidget):
         return panel
 
     # ---------------- 左栏：任务 / 空间 渲染 ----------------
+    def _nav_space_head_row(self) -> QWidget:
+        """「空间 (M) +」标题行——**放在滚动体里**，紧跟任务列表之后。
+
+        1.0.12：原来这一行在滚动体外面，导致「任务」的条目出现在「空间」标题
+        下面（看起来像空间里的任务），两区的分组语义完全看不见。现在按
+        「任务标题 → 任务条目 → 空间标题 → 空间条目」的顺序排。
+        """
+        row = QWidget()
+        row.setObjectName("NavSpaceHead")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(20, 6, 12, 4)
+        lay.setSpacing(4)
+        title = QLabel("空间")
+        title.setObjectName("NavSubTitle")
+        lay.addWidget(title)
+        lay.addStretch(1)
+        add = QPushButton("+")
+        add.setObjectName("NavSubAdd")
+        add.setFixedSize(20, 20)
+        add.setCursor(Qt.PointingHandCursor)
+        add.setToolTip("新建空间（具名、可切换、数据隔离）")
+        add.clicked.connect(lambda _c=False: self._new_space())
+        lay.addWidget(add)
+        self._nav_space_title = title
+        return row
+
     def _clear_nav_body(self) -> None:
         lay = getattr(self, "_nav_body_lay", None)
         if lay is None:
@@ -1916,6 +1970,7 @@ class AssistantPage(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._nav_task_btns = {}
+        self._nav_space_title = None
 
     def _task_tip(self, t: Dict[str, Any]) -> str:
         ts = t.get("updated_at") or 0
@@ -2040,8 +2095,6 @@ class AssistantPage(QWidget):
         self._clear_nav_body()
         if self._nav_task_title is not None:
             self._nav_task_title.setText(f"任务 ({len(tasks)})")
-        if self._nav_space_title is not None:
-            self._nav_space_title.setText(f"空间 ({len(spaces)})")
         lines = 0
 
         # ---- 任务区：全局最近任务（置顶的排最前，后端已排好）----
@@ -2058,14 +2111,18 @@ class AssistantPage(QWidget):
             lay.addWidget(more)
             lines += 1
         if not tasks:
-            empty = QLabel("默认工作区还没有任务，点上方 + 新建"
-                           "（其他空间的任务见下方）")
+            empty = QLabel("系统默认空间还没有任务，点上方 + 新建"
+                           "（其他空间的任务在下面「空间」里展开看）")
             empty.setObjectName("NavEmpty")
             empty.setWordWrap(True)
             lay.addWidget(empty)
             lines += 1
 
         # ---- 空间区：每个空间可展开，列出其全部任务 ----
+        lay.addWidget(self._nav_space_head_row())
+        if self._nav_space_title is not None:
+            self._nav_space_title.setText(f"空间 ({len(spaces)})")
+        lines += 1
         for sp in spaces:
             path = str(sp.get("path") or "")
             name = sp.get("name") or path
@@ -2429,12 +2486,15 @@ class AssistantPage(QWidget):
         「在 A 空间的任务里让助理改文件，结果改到了 B 目录」。
         """
         ws = _norm_ws(path)
-        if not ws or ws == _norm_ws(self._state.get("workspace")):
+        if not ws or not os.path.isdir(ws):
             return
-        if not os.path.isdir(ws):
+        # 任务的归属空间就是「当前空间」——不管要不要切工作区都先记下来。
+        # 旧实现在 ws 已经等于全局工作区时提前返回，于是 `_current_space` 还停在
+        # 上一个空间，接着点 + 会建到那个空间里去（2026-10-28 修）。
+        self._current_space = ws
+        if ws == _norm_ws(self._state.get("workspace")):
             return
         self._state["workspace"] = ws
-        self._current_space = ws      # 打开任务即把它的空间设为当前
         self._remember_workspace(ws)
         self._refresh_ws_btn(ws)
         w = Worker(self._assist.save_settings, {"workspace": ws})
@@ -3727,12 +3787,15 @@ class AssistantPage(QWidget):
 
     def _apply_spaces(self, spaces) -> None:
         spaces = [s for s in (spaces or []) if isinstance(s, dict)]
-        # 当前空间以注册表 current 为准，否则用当前活跃工作区
-        cur = next((s.get("path") for s in spaces if s.get("current")), "")
-        if cur:
-            self._current_space = _norm_ws(cur)
-        elif not self._current_space:
-            self._current_space = _norm_ws(self._state.get("workspace") or "")
+        # **不要**用注册表里的 current 覆盖 `_current_space`（2026-10-28 修）：
+        # `_current_space` 表达的是「用户此刻在哪个空间里工作」，由打开任务 /
+        # 点空间标题决定；注册表的 current 是「上次激活的空间」，跟着它走会让
+        # 用户回到任务区后新建的任务又落回老空间（用户反馈的核心症状）。
+        if not self._current_space:
+            self._current_space = self._default_ws()
+        # 默认空间的任务只在「任务」区显示；再在「空间」区列一遍就是重复。
+        dws = self._default_ws()
+        spaces = [s for s in spaces if _norm_ws(s.get("path")) != dws]
         # 展开区也过滤「0 条消息」的僵尸任务：后端按 workspace 全量分组下发，
         # 连反复点「+」/ 自动兜底攒出来的空任务一起带回来，左栏就会显示成
         # 一串「新任务」——看上去像删不掉的幽灵。保留三类：有内容的、正在跑的、
@@ -3846,11 +3909,13 @@ class AssistantPage(QWidget):
         # 多任务并行补充：当前任务**正在跑**时绝不复用（那会顶掉正在生成的回答）。
         cur = next((s for s in self._session_rows
                     if s.get("id") == self._session_id), None)
-        # 当前空间：用户正在看的空间（= 活跃工作区），+ 新建就落在它下面；
-        # 不强制默认工作区，避免「在 A 空间点 + 却建到默认空间」的割裂感。
-        active_ws = (self._current_space
-                     or _norm_ws(self._state.get("workspace"))
-                     or self._default_ws())
+        # 归属口径（2026-10-28，对齐 WorkBuddy）：
+        #   ① 用户正在某个空间里工作（`_current_space` 有值）→ 新任务落在该空间；
+        #   ② 不在任何空间内 → 落**系统默认空间**，左栏「任务」区就是它的列表。
+        # 旧实现会退回 `state["workspace"]`（全局工作区，可能被设置页改成任意
+        # 目录），于是「不在空间内新建」的任务既不进任务区、也不进具名空间，
+        # 看起来像凭空消失。现在只认这两个来源，不再看全局工作区。
+        active_ws = self._current_space or self._default_ws()
         if (not silent and cur is not None and not cur.get("message_count")
                 and not self._busy
                 and self._task_ws(cur) == active_ws):
@@ -3858,8 +3923,8 @@ class AssistantPage(QWidget):
             self._greet()
             self._set_status("当前已经是新任务")
             return
-        # silent 是后台自动建任务（首次进页 / 删任务兜底）：跟随后端当前工作区
-        ws = "" if silent else active_ws
+        # silent 也显式带 workspace：交给后端「当前工作区」会落到别处去
+        ws = active_ws
         key = _norm_ws(ws) or "__default__"
         if not self._claim_create(key):
             self._set_status("正在创建任务，请稍候…（不要重复点击）")
@@ -5169,11 +5234,13 @@ class AssistantPage(QWidget):
         act.setToolTip("从官方价格页重新拉取每个模型的输入/输出单价（24 小时缓存），"
                        "刷新后菜单里的「免费 / ¥x→y」才是最新的")
         act.triggered.connect(lambda: self._refresh_pricing())
-        # 1.0.10：本机免 Key 端点（Ollama / LM Studio）一键接入
-        act = menu.addAction("检测本机免 Key 端点…")
-        act.setToolTip("探测本机 Ollama(11434) / LM Studio(1234)，发现即自动接入；"
-                       "这类模型完全跑在本机，不需要任何 Key")
-        act.triggered.connect(lambda: self._detect_local_endpoints())
+        # 1.0.12：在线免 Key 端点检测（原「检测本机免 Key 端点」升级而来）
+        act = menu.addAction("检测在线免 Key 端点…")
+        act.setToolTip("验证在线免 Key 端点（如 Pollinations）现在还能不能免 Key "
+                       "对话，可用即自动接入；顺带探测本机 Ollama / LM Studio。"
+                       "判定用「/models + 一次最小对话」双探针，"
+                       "只有 /models 公开可读但对话要 Key 的端点会被标成「需要 Key」")
+        act.triggered.connect(lambda: self._detect_keyless())
         if self._active_provider != "local":
             act = menu.addAction("配置密钥与端点…")
             act.triggered.connect(self._edit_provider)
@@ -5376,40 +5443,95 @@ class AssistantPage(QWidget):
         w.error.connect(lambda m: self._set_status(f"保存失败：{m}"))
         w.start()
 
-    # ---------------- 免 Key 端点（1.0.10） ----------------
-    def _detect_local_endpoints(self) -> None:
-        """探测本机 Ollama / LM Studio：发现即自动接入（都无需 API Key）。"""
-        self._set_status("正在探测本机免 Key 端点（Ollama 11434 / LM Studio 1234）…")
-        w = Worker(local_endpoints.probe)
-        w.result.connect(self._apply_local_endpoints)
-        w.error.connect(lambda m: self._set_status(f"探测失败：{m}"))
+    # ---------------- 免 Key 端点（1.0.10 本机 → 1.0.12 在线） ----------------
+    def _detect_keyless(self) -> None:
+        """「检测在线免 Key 端点…」：验在线端点，顺带发现本机端点。
+
+        1.0.12（用户需求）：菜单从「检测**本机**免 Key」改成「检测**在线**免 Key」。
+        本机 Ollama / LM Studio 仍然探测，但只是附带结果，不再占一个菜单项。
+
+        判定在子线程做（每个候选两条 HTTP 往返），主线程只负责落库与提示。
+        """
+        self._set_status("正在检测在线免 Key 端点（本机端点同时探测）…")
+        providers = [dict(p) for p in (self._state.get("providers") or [])]
+        w = Worker(self._detect_keyless_job, providers)
+        w.result.connect(self._apply_keyless)
+        w.error.connect(lambda m: self._set_status(f"检测失败：{m}"))
         w.start()
 
-    def _apply_local_endpoints(self, found: Any) -> None:
-        found = [f for f in (found or []) if isinstance(f, dict) and f.get("id")]
-        if not found:
-            self._set_status(
-                "未发现本机免 Key 端点：装并启动 Ollama（ollama serve）或 "
-                "LM Studio 的 Local Server 后重试；也可直接用「Pollinations 免 Key」")
-            return
+    @staticmethod
+    def _detect_keyless_job(providers: Any) -> Dict[str, Any]:
+        """子线程里跑：在线（/models + 最小对话）+ 本机（11434 / 1234）。"""
+        try:
+            online = online_endpoints.probe(providers)
+        except Exception as e:                              # noqa: BLE001
+            online = [{"id": "pollinations", "label": "Pollinations",
+                       "status": "error", "detail": f"{type(e).__name__}: {e}",
+                       "base_url": "", "models": []}]
+        try:
+            local = local_endpoints.probe()
+        except Exception:                                   # noqa: BLE001
+            local = []
+        return {"online": online, "local": local}
+
+    def _apply_keyless(self, res: Any) -> None:
+        """落库探测结果：可用端点写入 providers 并启用，不可用的给出原因。"""
+        res = res if isinstance(res, dict) else {}
+        online = [x for x in (res.get("online") or []) if isinstance(x, dict)]
+        local = [x for x in (res.get("local") or []) if isinstance(x, dict)]
         providers = [dict(p) for p in (self._state.get("providers") or [])]
-        names = []
-        for f in found:
-            pid = str(f.get("id"))
-            models = [str(m) for m in (f.get("models") or []) if m]
+        added: List[str] = []
+
+        def _upsert(pid: str, label: str, base: str, models: List[str],
+                    model: str = "") -> None:
             target = next((p for p in providers if p.get("id") == pid), None)
             if target is None:
-                target = {"id": pid, "label": f.get("label") or pid,
-                          "kind": "openai", "api_key": "", "keyless": True}
+                target = {"id": pid, "label": label, "kind": "openai",
+                          "api_key": "", "keyless": True}
                 providers.append(target)
             target.update({"enabled": True, "keyless": True,
-                           "base_url": f.get("base_url") or "",
-                           "model": models[0] if models else ""})
-            names.append(f"{f.get('label') or pid}（{len(models)} 个模型）")
+                           "base_url": base or target.get("base_url") or "",
+                           "model": model or (models[0] if models else
+                                              target.get("model") or "")})
+
+        for f in online:
+            if f.get("status") != "ok":
+                continue
+            pid = str(f.get("id") or "").strip()
+            if not pid:
+                continue
+            models = [str(m) for m in (f.get("models") or []) if m]
+            _upsert(pid, str(f.get("label") or pid), str(f.get("base_url") or ""),
+                    models, str(f.get("model") or ""))
+            added.append(f"{f.get('label') or pid}（{len(models)} 个模型）")
+        for f in local:
+            pid = str(f.get("id") or "").strip()
+            if not pid:
+                continue
+            models = [str(m) for m in (f.get("models") or []) if m]
+            _upsert(pid, str(f.get("label") or pid), str(f.get("base_url") or ""),
+                    models)
+            added.append(f"{f.get('label') or pid}（本机，{len(models)} 个模型）")
+
+        report = "\n".join(
+            f"· {x.get('label') or x.get('id')}："
+            f"{online_endpoints.STATUS_TEXT.get(str(x.get('status')), '未知')}"
+            + (f"（{x.get('detail')}）" if x.get("detail") else "")
+            for x in online)
+        if not added:
+            if online:
+                QMessageBox.information(
+                    self, "检测在线免 Key 端点",
+                    "没有找到现在就能免 Key 使用的端点：\n\n" + report
+                    + "\n\n提示：免 Key 端点随时可能收紧，可用「添加自定义模型…」"
+                      "接入任何 OpenAI 兼容端点（需 Key 的填 Key 即可）。")
+            self._set_status("在线免 Key：没有可用端点")
+            return
         w = Worker(self._assist.save_settings, {"providers": providers})
         w.result.connect(
-            lambda _r, t="、".join(names): (self._set_status(f"已接入本机免 Key 端点：{t}"),
-                                           self.refresh()))
+            lambda _r, t="、".join(added): (
+                self._set_status(f"已接入免 Key 端点：{t}"),
+                self.refresh()))
         w.error.connect(lambda m: self._set_status(f"接入失败：{m}"))
         w.start()
 

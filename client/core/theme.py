@@ -337,6 +337,8 @@ QComboBox#Pill QLineEdit { color: #1f2430; background: transparent; }
 #ModelChip:hover { background-color: #eceff6; color: #12161f; }
 #BusySpin { color: #4d5567; }
 #ComposerMeta { color: #6b7385; }
+#MemTitle { color: #1f2430; }
+#MemHint, #MemMeta { color: #6b7385; }
 #SendBtn { background-color: #1b2130; color: #ffffff; }
 #SendBtn:hover { background-color: #2b3242; }
 #SendBtn:disabled { background-color: #e6eaf2; color: #aab1c0; }

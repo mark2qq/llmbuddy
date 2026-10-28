@@ -53,6 +53,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from core.assistant import catalog as catalog_mod
 from core.assistant import context as context_mod
 from core.assistant import enhance as enhance_mod
+from core.assistant import memory as memory_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
 from core.assistant import store as store_mod
@@ -199,6 +200,62 @@ async def update_prompt(pid: str, body: Dict[str, Any]):
 @router.delete("/prompts/{pid}")
 async def delete_prompt_endpoint(pid: str):
     return ok({"deleted": get_assistant().prompt_delete(pid)})
+
+
+#: 长期记忆（1.0.12）：全局 MEMORY.md + 空间 MEMORY.md + 每日工作日志。
+#: 三个都是本机 Markdown 文件，界面「记忆…」对话框直接读写这三份内容。
+@router.get("/memory")
+async def memory_get(workspace: str = ""):
+    """读记忆快照。
+
+    `workspace` 留空 = 当前工作区（= 当前空间）。返回三部分正文 + 日志清单 +
+    体量统计；`enabled` 来自配置 `memory_enabled`（关掉后界面显示「已停用」，
+    但文件仍在，随时可以再打开）。
+    """
+    cfg = load_config()
+    ws = store_mod.norm_workspace(workspace or cfg.get("workspace") or "")
+    snap = memory_mod.snapshot(ws, enabled=memory_mod.enabled_from(cfg))
+    return ok(snap)
+
+
+@router.put("/memory")
+async def memory_put(body: Dict[str, Any]):
+    """保存记忆。scope：global / space / log（log 需带 date）。
+
+    `text` 传空串 = 清空该文件（不删文件，保留占位避免路径消失）。
+    """
+    if not isinstance(body, dict):
+        return fail(2050, "缺少请求体")
+    text = body.get("text")
+    if text is None:
+        return fail(2050, "text 不能为空")
+    text = str(text)
+    if len(text) > memory_mod.MAX_WRITE_CHARS:
+        return fail(2051, f"记忆内容过长（上限 {memory_mod.MAX_WRITE_CHARS} 字符）")
+    cfg = load_config()
+    ws = store_mod.norm_workspace(body.get("workspace") or cfg.get("workspace") or "")
+    scope = str(body.get("scope") or "global").strip().lower()
+    if scope in ("global", "user"):
+        saved = memory_mod.save_global(text)
+        path = memory_mod.GLOBAL_MD
+    elif scope in ("log", "logs"):
+        if not ws:
+            return fail(2052, "没有工作区，无法写日志")
+        day = str(body.get("date") or "")
+        saved = memory_mod.save_log(ws, text, date=day)
+        path = memory_mod.log_path(ws, day)
+    elif scope in ("space", "space_md", "md"):
+        if not ws:
+            return fail(2052, "没有工作区，无法写空间记忆")
+        saved = memory_mod.save_space(ws, text)
+        path = memory_mod.space_md(ws)
+    else:
+        return fail(2053, f"未知的 scope：{scope}")
+    if not saved:
+        return fail(2054, "写入失败（目录不可写？）")
+    audit("memory_save", scope=scope, path=path, chars=len(text))
+    return ok({"path": path, "chars": len(text), "scope": scope,
+               "stats": memory_mod.stats(ws)})
 
 
 @router.get("/sessions/{sid}")

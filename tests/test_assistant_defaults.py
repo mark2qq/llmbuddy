@@ -316,7 +316,8 @@ def test_builtin_tools_marked_default(env):
     assert builtin, "内置工具不能为空"
     for row in builtin:
         assert row["meta"].get("default") is True, row["name"]
-        assert row["meta"].get("group") in ("文件", "命令", "网络", "技能"), row["name"]
+        assert row["meta"].get("group") in ("文件", "命令", "网络", "技能",
+                                           "记忆"), row["name"]
 
 
 def test_prefer_orders_schemas_but_keeps_all(env):

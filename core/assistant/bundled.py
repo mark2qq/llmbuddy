@@ -29,7 +29,8 @@ BUNDLE_VERSION = 2
 #: 在用户禁用其中某个时给出明确提示；**不做白名单裁剪**）
 CORE_TOOLS = ("fs_list", "fs_read", "fs_glob", "fs_grep", "fs_info",
               "fs_write", "fs_edit", "fs_mkdir", "fs_move",
-              "web_fetch", "shell_run", "skill_list", "skill_run")
+              "web_fetch", "shell_run", "skill_list", "skill_run",
+              "memory_read", "memory_append")
 
 #: 默认工具清单（内置工具全集，`Tool.meta["default"]` 由注册处标注）
 DEFAULT_TOOL_NAMES = CORE_TOOLS + ("fs_delete",)

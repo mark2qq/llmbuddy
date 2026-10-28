@@ -144,6 +144,22 @@ class AssistantApi:
     def delete_prompt(self, pid: str) -> Dict:
         return self.delete(f"/api/v1/assistant/prompts/{pid}") or {}
 
+    # ---------------- 长期记忆（1.0.12） ----------------
+    def memory(self, workspace: str = "") -> Dict:
+        """读记忆快照：{enabled, workspace, global, space, logs, stats}。"""
+        params = {"workspace": workspace} if workspace else None
+        return self.get("/api/v1/assistant/memory", params) or {}
+
+    def save_memory(self, scope: str, text: str, workspace: str = "",
+                    date: str = "") -> Dict:
+        """保存记忆。scope：global / space / log（log 需带 date）。"""
+        body: Dict[str, Any] = {"scope": scope, "text": text}
+        if workspace:
+            body["workspace"] = workspace
+        if date:
+            body["date"] = date
+        return self.put("/api/v1/assistant/memory", body) or {}
+
     def stop(self, sid: str) -> Dict:
         return self.post("/api/v1/assistant/stop", {"session_id": sid}) or {}
 

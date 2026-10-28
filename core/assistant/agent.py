@@ -32,6 +32,7 @@ from core.assistant import store as store_mod
 from core.assistant import context as context_mod
 from core.assistant import defaults as defaults_mod
 from core.assistant import mcp as mcp_mod
+from core.assistant import memory as memory_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
 from core.assistant import tools as tools_mod
@@ -254,6 +255,8 @@ class Assistant:
                           for p in cfg.get("providers") or []],
             "tools": self.registry().list(),
             "skills": skills_mod.list_skills(),
+            # 记忆体量（1.0.12）：界面在「记忆…」菜单项上显示「全局 N 字 · M 天日志」
+            "memory": self._memory_state(cfg),
             "mcp": self._mcp.status(),
             "sessions": rows[:50],
             "spaces": group_spaces(rows, fallback=cfg.get("workspace") or ""),
@@ -261,6 +264,18 @@ class Assistant:
             "orchestrator": "langgraph" if _has_langgraph() else "sequential",
             "running": self.running_ids(),
         }
+
+    def _memory_state(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """记忆体量快照（给 UI 用，不下发正文；正文走 GET /memory）。"""
+        ws = norm_workspace(cfg.get("workspace") or "")
+        enabled = memory_mod.enabled_from(cfg)
+        try:
+            st = memory_mod.stats(ws)
+        except Exception:
+            st = {"global_chars": 0, "space_chars": 0, "logs": 0, "log_chars": 0}
+        out = {"enabled": enabled, "workspace": ws}
+        out.update(st)
+        return out
 
     def _maybe_autostart_mcp(self) -> None:
         """首次状态查询时自动连接 enabled 的 MCP 服务器（失败不阻塞）。"""
@@ -1022,6 +1037,15 @@ class Assistant:
             # 不再 [:80] 截断：max_tools 上限 64 < 80，天然收敛（A3 说明 2）
             tool_list="\n".join(tools_desc) or "（暂无工具）")
         system += self._skills_hint(cfg, profile, mounted_skills, auto_skills)
+        # 记忆段（1.0.12）：全局 + 当前空间 + 最近日志，超预算截断。
+        # 放在技能段之后、历史之前：只进 system，不进 message 正文。
+        try:
+            system += memory_mod.build_hint(
+                norm_workspace(session.get("workspace")
+                               or cfg.get("workspace") or ""),
+                enabled=memory_mod.enabled_from(cfg))
+        except Exception:
+            pass
 
         msgs: List[Dict[str, Any]] = [{"role": "system", "content": system}]
         history = [m for m in (session.get("messages") or [])

@@ -115,17 +115,22 @@ class PasteImageEdit(QTextEdit):
 
     image_pasted = Signal(object)   # QImage
     prompt_requested = Signal()     # 右键菜单「插入提示词…」被点
+    memory_requested = Signal()     # 右键菜单「记忆…」被点
 
     def contextMenuEvent(self, ev) -> None:      # noqa: N802 (Qt 命名)
-        """标准右键菜单 + 一条「插入提示词…」。
+        """标准右键菜单 + 「插入提示词…」+「记忆…」。
 
         底栏不再放「📝 提示词」按钮（用户要求收紧底栏），提示词库入口改到这里：
-        输入框右键 → 插入提示词，功能不失联，也不占底栏宽度。
+        输入框右键 → 插入提示词，功能不失联，也不占底栏宽度。记忆同理（1.0.12）：
+        它是「关于这个助理/这个空间长期记住什么」的配置，不属于任务操作。
         """
         menu = self.createStandardContextMenu()
         menu.addSeparator()
         act = menu.addAction("插入提示词…")
         act.triggered.connect(self.prompt_requested.emit)
+        act = menu.addAction("记忆…")
+        act.setToolTip("查看 / 编辑长期记忆（全局 MEMORY.md、当前空间记忆、每日日志）")
+        act.triggered.connect(self.memory_requested.emit)
         menu.exec(ev.globalPos())
         menu.deleteLater()
 

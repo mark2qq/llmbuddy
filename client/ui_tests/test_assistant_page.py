@@ -231,6 +231,8 @@ class _FakeAssistApi:
             "version": "1.0.8",
             "policy": "readonly_auto",
             "workspace": r"E:\tmp\ws",
+            # 1.0.12：后端下发系统默认工作区，左栏「任务」区按它过滤
+            "default_workspace": r"E:\tmp\ws",
             "active_provider": "local",
             "orchestrator": "langgraph",
             "providers": [
@@ -1060,7 +1062,7 @@ def test_space_expansion_hides_zero_message_ghost_task(page):
     """空间展开区不列 0 条消息的「新任务」幽灵（当前任务除外）。"""
     p, _fake = page
     p._session_id = "live"
-    ws = r"E://tmp//ws"
+    ws = r"E://tmp//ws2"          # 非默认空间（默认空间的任务只在「任务」区）
     p._apply_spaces([{
         "path": ws, "name": "ws", "exists": True, "current": True, "count": 2,
         "tasks": [
@@ -1223,10 +1225,11 @@ def test_space_click_opens_latest_task(page):
 
 
 def test_task_area_lists_only_default_workspace_tasks(page):
-    """「任务」区只列**默认工作区**的任务，其他空间的任务只在「空间」区出现。
+    """「任务」区只列**系统默认空间**的任务，其他空间的任务只在「空间」区出现。
 
     两区同时列同一个任务会让用户误以为「建了 2 个新任务」（用户截图反馈）。
-    「空间内建任务像覆盖」由空间行可展开列全部任务解决，不靠任务区兜。
+    1.0.12 起连默认空间本身也从「空间」区移除（它的任务就是「任务」区的全部内容），
+    两区彻底不重叠。
     """
     p, fake = page
     default = p._default_ws()
@@ -1242,9 +1245,9 @@ def test_task_area_lists_only_default_workspace_tasks(page):
     assert _pump(lambda: "d1" in p._nav_task_btns)
     assert "w1" not in p._nav_task_btns, "跨空间任务不应再重复进「任务」区"
     assert p._nav_task_title.text() == "任务 (1)"
-    # 但它仍在「空间」区里（other-ws 与默认工作区都算空间候选）
-    assert _pump(lambda: {sp["name"] for sp in p._nav_spaces}
-                 >= {"other-ws", default.rsplit("/", 1)[-1]})
+    # 默认空间不再出现在「空间」区（否则同一批任务上下各列一遍）
+    assert _pump(lambda: {sp["name"] for sp in p._nav_spaces} >= {"other-ws"})
+    assert all(_norm_ws(sp["path"]) != default for sp in p._nav_spaces)
     texts = [b.text() for b in p._nav_body.findChildren(QPushButton)]
     assert any("默认区任务" in t for t in texts)
     assert not any("空间任务" in t for t in texts)   # 未展开空间时不铺子行
@@ -1311,6 +1314,89 @@ def test_new_session_recreates_in_default_when_empty_task_in_other_space(page):
     p._new_session()
     assert _pump(lambda: fake.created == before + 1)
     assert fake.created_ws == _norm_ws(p._default_ws())
+
+
+def test_nav_orders_tasks_before_space_header(page):
+    """「空间」标题必须排在任务条目**之后**（1.0.12 修）。
+
+    原来空间标题行在滚动体外面，视觉上「任务」的条目全落在「空间」标题下面，
+    看起来像空间里的任务，两区分组语义完全丢失。
+    """
+    p, fake = page
+    default = p._default_ws()
+    fake.tasks = [
+        {"id": "d1", "title": "默认区任务", "message_count": 2,
+         "workspace": default, "updated_at": 100.0},
+        {"id": "a1", "title": "空间任务", "message_count": 2,
+         "workspace": r"E://space-a", "updated_at": 200.0},
+    ]
+    p._apply_sessions([dict(t) for t in fake.tasks])
+    assert _pump(lambda: "d1" in p._nav_task_btns)
+    lay = p._nav_body_lay
+    order = [lay.itemAt(i).widget().objectName()
+             for i in range(lay.count())
+             if lay.itemAt(i).widget() is not None]
+    assert "NavSpaceHead" in order
+    assert order.index("NavTaskItem") < order.index("NavSpaceHead")
+    assert order.index("NavSpaceHead") < order.index("NavSpaceItem")
+    # 空间标题在滚动体里，数量与过滤后的空间数一致
+    assert p._nav_space_title is not None
+    assert p._nav_space_title.text() == f"空间 ({len(p._nav_spaces)})"
+
+
+def test_new_session_ignores_global_workspace(page, tmp_path):
+    """「不在空间内新建」→ 落系统默认空间，**不看**全局工作区。
+
+    1.0.12 用户口径：工作空间之外新建的任务归系统默认空间，并显示在「任务」区。
+    旧实现会退回 `state["workspace"]`（设置里可能被改成任意目录），于是新任务
+    既不进任务区、也不进任何具名空间，像是消失了。
+    """
+    default = tmp_path / "def-ws"
+    other = tmp_path / "some-other-dir"
+    default.mkdir()
+    other.mkdir()
+    p, fake = page
+    p._current_space = ""                       # 不在任何空间内
+    p._state["default_workspace"] = str(default)
+    p._state["workspace"] = str(other)          # 全局工作区指向别处
+    before = fake.created
+    p._new_session()
+    assert _pump(lambda: fake.created == before + 1)
+    assert fake.created_ws == _norm_ws(str(default))
+
+
+def test_new_session_in_space_goes_to_that_space(page, tmp_path):
+    """在某空间里工作（`_current_space` 有值）→ + 建到该空间。"""
+    ws = tmp_path / "space-a"
+    ws.mkdir()
+    p, fake = page
+    p._current_space = _norm_ws(str(ws))
+    before = fake.created
+    p._new_session()
+    assert _pump(lambda: fake.created == before + 1)
+    assert fake.created_ws == _norm_ws(str(ws))
+
+
+def test_apply_spaces_does_not_steal_current_space(page, tmp_path):
+    """刷新空间列表不能把 `_current_space` 拽回注册表里的「上次激活空间」。
+
+    这正是「回到任务区后点 + 又建到老空间」的根因：`_apply_spaces` 旧实现用
+    后端 `current` 覆盖了 `_current_space`，每次 refresh 都把用户拖回老空间。
+    """
+    a = tmp_path / "space-a"
+    b = tmp_path / "space-b"
+    a.mkdir()
+    b.mkdir()
+    p, _fake = page
+    p._current_space = _norm_ws(str(b))
+    p._apply_spaces([
+        {"path": _norm_ws(str(a)), "name": "space-a", "count": 1,
+         "current": True, "exists": True, "tasks": [
+             {"id": "x", "title": "t", "message_count": 1, "updated_at": 1.0}]},
+        {"path": _norm_ws(str(b)), "name": "space-b", "count": 0,
+         "current": False, "exists": True, "tasks": []},
+    ])
+    assert p._current_space == _norm_ws(str(b))
 
 
 def test_state_error_silent_on_first_load(page):
@@ -2796,12 +2882,14 @@ def test_model_menu_shows_price_tag_for_paid_model(page):
 
 
 def test_model_menu_has_pricing_refresh_entry(page):
-    """菜单里有「更新价格与免费标识…」入口（服务商调价后不用等新版本）。"""
+    """菜单里有「更新价格与免费标识…」与「检测在线免 Key 端点…」（1.0.12 改名）。"""
     p, _fake = page
     menu = p._build_model_menu()
     texts = [a.text() for a in menu.actions() if a.text()]
     assert "更新价格与免费标识…" in texts
-    assert "检测本机免 Key 端点…" in texts
+    assert "检测在线免 Key 端点…" in texts
+    # 旧文案必须消失（用户明确要求把「本机」改成「在线」）
+    assert "检测本机免 Key 端点…" not in texts
 
 
 def test_refresh_pricing_result_reports_counts(page, monkeypatch):
@@ -2843,24 +2931,61 @@ def test_keyless_models_labelled_in_menu(page):
     assert "免 Key" in item
 
 
-def test_detect_local_endpoints_none_gives_actionable_hint(page, monkeypatch):
-    """本机没装/没启动 → 状态栏给出可执行提示，而不是静默。"""
+def test_detect_keyless_none_gives_actionable_hint(page, monkeypatch):
+    """在线端点全不可用 → 弹窗列出每条的结论（需要 Key / 连不上），不静默。"""
+    from ui.pages import assistant_page as mod
     p, _fake = page
-    p._apply_local_endpoints([])
-    msg = p._status.text()
-    assert "未发现" in msg and ("Ollama" in msg or "ollama" in msg)
+    shown = []
+
+    class _MB:
+        @staticmethod
+        def information(parent, title, text, *a, **kw):
+            shown.append((title, text))
+
+    monkeypatch.setattr(mod, "QMessageBox", _MB)
+    p._apply_keyless({"online": [
+        {"id": "pollinations", "label": "Pollinations", "status": "unreachable",
+         "detail": "ConnectTimeout", "base_url": "https://x", "models": []},
+        {"id": "airforce", "label": "AirForce", "status": "auth",
+         "detail": "HTTP 401", "base_url": "https://y", "models": []},
+    ], "local": []})
+    assert shown, "没有可用端点时必须说清楚原因"
+    text = shown[-1][1]
+    assert "Pollinations" in text and "连不上" in text
+    assert "AirForce" in text and "需要 Key" in text
+    assert "在线免 Key" in p._status.text()
 
 
-def test_detect_local_endpoints_saves_into_providers(page):
-    """发现本机端点 → 以同一次 save 写入 enabled/base_url/model（免 Key）。"""
+def test_detect_keyless_saves_only_usable_endpoints(page):
+    """只有 status=ok 的在线端点写进 providers，需 Key 的不接。"""
     p, fake = page
     before = len(fake.save_calls)
-    p._apply_local_endpoints([
-        {"id": "ollama", "label": "Ollama", "base_url": "http://127.0.0.1:11434/v1",
-         "models": ["qwen3:4b", "llama3:8b"]}])
+    p._apply_keyless({"online": [
+        {"id": "pollinations", "label": "Pollinations", "status": "ok",
+         "base_url": "https://text.pollinations.ai/openai",
+         "models": ["openai-fast"], "model": "openai-fast", "detail": "",
+         "latency_ms": 300},
+        {"id": "airforce", "label": "AirForce", "status": "auth",
+         "base_url": "https://api.airforce/v1", "models": [], "detail": "HTTP 401"},
+    ], "local": []})
     assert _pump(lambda: len(fake.save_calls) > before)
-    saved = fake.save_calls[-1]
-    provs = {x["id"]: x for x in saved.get("providers") or []}
+    provs = {x["id"]: x for x in fake.save_calls[-1].get("providers") or []}
+    assert provs["pollinations"]["enabled"] is True
+    assert provs["pollinations"]["keyless"] is True
+    assert provs["pollinations"]["model"] == "openai-fast"
+    assert provs["pollinations"]["base_url"].endswith("/openai")
+    assert "airforce" not in provs, "需要 Key 的端点不能当免 Key 接进来"
+
+
+def test_detect_keyless_keeps_local_endpoints(page):
+    """本机端点仍会被顺带接入（能力不退化），但状态文案以在线为主。"""
+    p, fake = page
+    before = len(fake.save_calls)
+    p._apply_keyless({"online": [], "local": [
+        {"id": "ollama", "label": "Ollama", "base_url": "http://127.0.0.1:11434/v1",
+         "models": ["qwen3:4b", "llama3:8b"]}]})
+    assert _pump(lambda: len(fake.save_calls) > before)
+    provs = {x["id"]: x for x in fake.save_calls[-1].get("providers") or []}
     assert provs["ollama"]["enabled"] is True
     assert provs["ollama"]["keyless"] is True
     assert provs["ollama"]["model"] == "qwen3:4b"
