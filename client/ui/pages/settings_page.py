@@ -54,7 +54,10 @@ class SettingsPage(QWidget):
         self._engine_port.setRange(1, 65535)
         self._models_dir = QLineEdit()
         self._n_ctx = QSpinBox()
-        self._n_ctx.setRange(512, 131072)
+        # 上限放到 1M：本地引擎上下文窗口可随显存拉到 300K~1M（KV cache 随 n_ctx
+        # 线性膨胀，需足够显存）；助理侧 context_window 预算默认 300K，会按本处
+        # n_ctx 再封顶，二者配合即「默认 300K、在线 1M」。
+        self._n_ctx.setRange(512, 1000000)
         self._n_threads = QSpinBox()
         # 下限必须允许 0：config 里 0 = 按 CPU 核数自动。曾写成 setRange(1, 256)，
         # 打开设置页再点保存就把「自动」悄悄改成 1 线程（性能腰斩，并且触发一次

@@ -34,8 +34,50 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-#: 默认上下文窗口（tokens）。8k 是本地 4B~8B 模型的常见档位。
-DEFAULT_LIMIT = 8192
+#: 默认（本地/未知）上下文预算（tokens）。这是「目标预算」：实际发给模型的量
+#: 还会被运行时硬上限（引擎 n_ctx / 在线模型原生窗口）再封顶一次，见
+#: `context_limit(hard_cap=...)`，避免预算大于真实窗口导致上游 400 超限。
+DEFAULT_LIMIT = 300000
+
+#: 在线模型的上下文预算（tokens）。在线模型（Gemini 等）原生支持到 1M，
+#: 故默认可用上限按 1M 设定；未知在线模型会被 `native_window` 封到安全值。
+ONLINE_LIMIT = 1000000
+
+#: 未知在线模型的安全封顶（tokens）：认不出原生窗口时，宁可少给也不冒 400。
+SAFE_ONLINE_CAP = 128000
+
+#: 已知在线模型的原生上下文窗口（tokens）。给 `hard_cap` 用，避免把超窗口请求
+#: 发给上游。未收录且认不出来的模型由 `native_window` 回退到 SAFE_ONLINE_CAP。
+CTX_SNAPSHOT: Dict[str, int] = {
+    "Qwen/Qwen2.5-72B-Instruct-128K": 128000,
+    "Qwen/Qwen3-VL-32B-Instruct": 128000,
+    "Qwen/Qwen3-VL-32B-Thinking": 128000,
+}
+
+
+def native_window(model_id: str) -> Optional[int]:
+    """在线模型原生窗口（tokens）；认不出返回 None（调用方用 SAFE_ONLINE_CAP）。
+
+    只做「名字 → 窗口」的粗映射，不引入联网查询：
+      · 命中 CTX_SNAPSHOT 直接返回；
+      · 按家族关键字启发式（gemini 1M / claude 200K / kimi·longcat 256K）；
+      · 其余返回 None，由 agent 用 SAFE_ONLINE_CAP 兜底，防止超窗口 400。
+    """
+    if not model_id:
+        return None
+    mid = str(model_id)
+    if mid in CTX_SNAPSHOT:
+        return CTX_SNAPSHOT[mid]
+    low = mid.lower()
+    if "gemini" in low:
+        return 1_000_000
+    if "claude" in low:
+        return 200_000
+    if "kimi" in low or "moonshot" in low:
+        return 256_000
+    if "longcat" in low:
+        return 256_000
+    return None
 
 #: 压缩后保留的最近消息条数（太少接不上话，太多压了等于没压）
 DEFAULT_KEEP = 6
@@ -108,21 +150,37 @@ def messages_tokens(messages: List[Dict[str, Any]]) -> int:
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
-def context_limit(cfg: Optional[Dict[str, Any]] = None) -> int:
-    """上下文窗口（tokens）。支持 8192 / "8k" / "32k" 三种写法。"""
-    raw = (cfg or {}).get("context_window")
+def context_limit(cfg: Optional[Dict[str, Any]] = None,
+                  hard_cap: Optional[int] = None,
+                  online: bool = False) -> int:
+    """上下文窗口（tokens）。
+
+    预算口径：
+      - online=False → 读 `context_window`（本地/默认），缺省 DEFAULT_LIMIT(300k)
+      - online=True  → 读 `context_window_online`，缺省 ONLINE_LIMIT(1M)
+    运行时硬上限：若给出 `hard_cap`（引擎 n_ctx / 在线模型原生窗口），最终取
+      min(预算, hard_cap)。这一步保证「目标预算」永不超过模型真实窗口，
+      防止长对话把超窗口请求打给上游引发 400 超限。
+    """
+    key = "context_window_online" if online else "context_window"
+    raw = (cfg or {}).get(key)
     if raw is None or raw == "":
-        return DEFAULT_LIMIT
-    if isinstance(raw, (int, float)):
-        return max(1024, int(raw))
-    text = str(raw).strip().lower().replace(" ", "")
-    m = re.match(r"^(\d+(?:\.\d+)?)k$", text)
-    if m:
-        return max(1024, int(float(m.group(1)) * 1024))
-    try:
-        return max(1024, int(float(text)))
-    except ValueError:
-        return DEFAULT_LIMIT
+        budget = ONLINE_LIMIT if online else DEFAULT_LIMIT
+    elif isinstance(raw, (int, float)):
+        budget = max(1024, int(raw))
+    else:
+        text = str(raw).strip().lower().replace(" ", "")
+        m = re.match(r"^(\d+(?:\.\d+)?)k$", text)
+        if m:
+            budget = max(1024, int(float(m.group(1)) * 1024))
+        else:
+            try:
+                budget = max(1024, int(float(text)))
+            except ValueError:
+                budget = ONLINE_LIMIT if online else DEFAULT_LIMIT
+    if hard_cap:
+        budget = min(budget, max(1024, int(hard_cap)))
+    return budget
 
 
 def history_of(session: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -133,9 +191,14 @@ def history_of(session: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def usage(session: Dict[str, Any],
-          cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """当前上下文占用：给前端显示「上下文 32% · 2.6k/8k」。"""
-    limit = context_limit(cfg)
+          cfg: Optional[Dict[str, Any]] = None,
+          hard_cap: Optional[int] = None,
+          online: bool = False) -> Dict[str, Any]:
+    """当前上下文占用：给前端显示「上下文 X% · used/limit」。
+
+    `limit` 已含运行时硬上限（引擎 n_ctx / 在线模型原生窗口），详见 `context_limit`。
+    """
+    limit = context_limit(cfg, hard_cap=hard_cap, online=online)
     history = history_of(session)
     ctx = session.get("context") or {}
     if ctx.get("summary"):
@@ -194,13 +257,15 @@ def _llm_summary(messages: List[Dict[str, Any]],
 def maybe_compress(session: Dict[str, Any],
                    cfg: Optional[Dict[str, Any]],
                    provider: Any = None,
-                   force: bool = False) -> Optional[Dict[str, Any]]:
+                   force: bool = False,
+                   hard_cap: Optional[int] = None,
+                   online: bool = False) -> Optional[Dict[str, Any]]:
     """必要时压缩历史，返回事件字典（未压缩返回 None）。
 
     压缩只在「超出触发线」时发生；已经压过的会话再次超线时做**滚动压缩**：
     把「旧摘要 + 新一批较早消息」再压一次，摘要不会无限增长。
     """
-    limit = context_limit(cfg)
+    limit = context_limit(cfg, hard_cap=hard_cap, online=online)
     history = history_of(session)
     if not history:
         return None

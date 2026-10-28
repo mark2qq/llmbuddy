@@ -173,6 +173,14 @@ def _default_config() -> Dict[str, Any]:
         "approval_timeout": 300,     # 审批等待上限（秒），超时按拒绝处理
         "temperature": 0.3,
         "max_tokens": 2048,
+        # ---- 1.0.12：上下文预算（core/assistant/context.py）----
+        # context_window：本地/默认的目标预算（tokens），默认 300k；实际发给模型的量
+        #   会被运行时硬上限（引擎 n_ctx）再封顶，避免超过模型真实窗口。
+        # context_window_online：在线模型的目标预算（tokens），默认 1M（Gemini 等原生
+        #   支持 1M）；未知在线模型会被 native_window 封到安全值。两者都必须声明在这里，
+        # 否则老 config.json 读不到（同 1.0.8 的坑：load_config 按 key 过滤）。
+        "context_window": 300000,
+        "context_window_online": 1000000,
         # MCP 服务器列表由 MCPManager 负责读写。这里必须声明 key，否则
         # load_config() 的 `if k in cfg` 过滤会把它丢掉（1.0.8 修复：
         # mcp_add / mcp_install 写盘后 servers() 读回空列表）。

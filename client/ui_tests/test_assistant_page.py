@@ -1365,16 +1365,26 @@ def test_new_session_ignores_global_workspace(page, tmp_path):
     assert fake.created_ws == _norm_ws(str(default))
 
 
-def test_new_session_in_space_goes_to_that_space(page, tmp_path):
-    """在某空间里工作（`_current_space` 有值）→ + 建到该空间。"""
+def test_new_session_non_space_entry_ignores_current_space(page, tmp_path):
+    """任务区 + / 清单中心「新建任务」是**非空间入口** → 落系统默认空间，
+
+    不再继承上一次激活的空间（`_current_space`）：这正是用户截图反馈的
+    「在任务区点 +，输入框却选中了 newspace」的根因。要落具体空间请走空间
+    右键「在此空间新建任务」（见 `test_new_task_in_space_passes_workspace`）。
+    """
     ws = tmp_path / "space-a"
     ws.mkdir()
+    default = tmp_path / "def-ws"
+    default.mkdir()
     p, fake = page
-    p._current_space = _norm_ws(str(ws))
+    p._state["default_workspace"] = str(default)
+    p._current_space = _norm_ws(str(ws))   # 上一次还停在 space-a
     before = fake.created
     p._new_session()
     assert _pump(lambda: fake.created == before + 1)
-    assert fake.created_ws == _norm_ws(str(ws))
+    assert fake.created_ws == _norm_ws(str(default))
+    # 输入框工作区立即指回默认空间（可见反馈，不等人建完）
+    assert _norm_ws(p._state["workspace"]) == _norm_ws(str(default))
 
 
 def test_apply_spaces_does_not_steal_current_space(page, tmp_path):
@@ -2111,6 +2121,68 @@ def test_workspace_falls_back_to_local_memory(page, tmp_path):
     p._apply_state(st)
     assert p._ws_btn.text() == _ellipsis("newws", 4)
     assert _pump(lambda: {"workspace": target} in fake.save_calls)
+
+
+def test_workspace_menu_lists_default_and_all_spaces(page, tmp_path):
+    """输入框工作区按钮是「空间选择器」：列出系统默认空间 + 全部已登记空间。
+
+    对齐 WorkBuddy：非空间入口新建的任务默认在默认空间，但用户可从这里切到
+    任意现有空间（或修改切回去）。
+    """
+    default = _mkdir(tmp_path, "def-ws")
+    sp1 = _mkdir(tmp_path, "space-one")
+    sp2 = _mkdir(tmp_path, "space-two")
+    p, fake = page
+    p._state["default_workspace"] = str(default)
+    p._current_space = ""                 # 模拟「没有激活任何空间」
+    p._nav_spaces = [
+        {"path": str(sp1), "name": "space-one", "count": 1, "tasks": []},
+        {"path": str(sp2), "name": "space-two", "count": 2, "tasks": []},
+    ]
+    menu = p.build_workspace_menu()
+    texts = _menu_texts(menu)
+    assert any("系统默认空间" in t for t in texts), texts
+    assert "space-one" in texts
+    assert "space-two" in texts
+    assert "其他目录…" in texts
+    # 默认空间当前被选中（没有激活其他空间）
+    default_action = next(a for a in menu.actions() if "系统默认空间" in a.text())
+    assert default_action.isChecked()
+    # 当前激活空间在菜单里被勾选：切到 space-one 后重建菜单应勾它
+    p._current_space = str(sp1)
+    menu2 = p.build_workspace_menu()
+    checked = [a.text() for a in menu2.actions() if a.isChecked()]
+    assert "space-one" in checked
+    assert not any("系统默认空间" in c for c in checked)
+
+
+def test_workspace_menu_pick_switches_current_task(page, tmp_path):
+    """点选择器切到某空间：当前任务改归属该空间 + 文件沙箱根同步。"""
+    default = _mkdir(tmp_path, "def-ws")
+    sp = _mkdir(tmp_path, "space-x")
+    p, fake = page
+    p._state["default_workspace"] = str(default)
+    p._session_id = "cur"
+    p._session_rows = [{"id": "cur", "title": "当前任务", "message_count": 1,
+                        "workspace": str(default)}]
+    p._switch_current_task_to_space(str(sp))
+    # 当前空间 / 文件沙箱根 / 按钮都指过去
+    assert _norm_ws(p._current_space) == _norm_ws(str(sp))
+    assert _norm_ws(p._state["workspace"]) == _norm_ws(str(sp))
+    # 真实任务：改写它的 workspace，导航随后按新空间重新分组
+    assert _pump(lambda: ("cur", {"workspace": _norm_ws(str(sp))}) in fake.patches)
+    assert "已切换到空间" in p._status.text()
+
+
+def test_workspace_menu_other_dir_falls_back_to_picker(page, tmp_path, monkeypatch):
+    """「其他目录…」走原生目录选择框（支持未登记的新目录）。"""
+    p, fake = page
+    called = {}
+    monkeypatch.setattr(p, "_choose_workspace", lambda: called.setdefault("hit", True))
+    other = next(a for a in p.build_workspace_menu().actions() if a.text() == "其他目录…")
+    p._on_workspace_menu_pick(other)
+    assert called.get("hit") is True
+
 
 
 def test_workspace_sync_runs_only_once(page, tmp_path):

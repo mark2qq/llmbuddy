@@ -448,10 +448,19 @@ class Assistant:
         provider_cfg = cfg_provider(cfg, provider_id)
         provider = get_provider(provider_cfg)
 
+        # 提前解析本轮模型名：本地需据此取引擎 n_ctx 作为上下文硬上限；在线需据此
+        # 查原生窗口。解析失败直接报错返回（连用户消息都不落库，避免脏数据）。
+        try:
+            model_name = provider.resolve_model(model or provider_cfg.get("model") or "")
+        except ProviderError as e:
+            emit({"type": "error", "message": str(e)})
+            with self._lock:
+                self._running[session_id] = False
+            return {"ok": False, "error": str(e)}
+
         session = load_session(session_id) or self.new_session()
         session["id"] = session.get("id") or session_id
         session.setdefault("messages", [])
-        # 老任务没有所属空间：补记当前工作区，左栏「空间」区才能把它归位
         if not session.get("workspace"):
             session["workspace"] = norm_workspace(cfg.get("workspace"))
         with self._lock:
@@ -495,13 +504,28 @@ class Assistant:
         # ---- 上下文压缩（WorkBuddy 同款：超阈值就把较早对话压成摘要）----
         # 放在 build_messages 之前，压完直接用新窗口；失败绝不影响本轮。
         try:
-            cur = context_mod.usage(session, cfg)
+            # 运行时硬上限：本地取引擎真实 n_ctx；在线取模型原生窗口（认不出用安全值）。
+            # 与预算（context_window / context_window_online）取 min，防止超窗口 400。
+            is_local = bool(getattr(provider, "is_local", False))
+            hard_cap = None
+            if is_local:
+                try:
+                    from core.pool import get_model_pool
+                    _entry = get_model_pool().get(model_name)
+                    _n = int(getattr(_entry.instance, "n_ctx", 0) or 0)
+                    hard_cap = _n or None
+                except Exception:  # noqa: BLE001
+                    hard_cap = None
+            else:
+                hard_cap = context_mod.native_window(model_name) or context_mod.SAFE_ONLINE_CAP
+            cur = context_mod.usage(session, cfg, hard_cap=hard_cap, online=not is_local)
             emit({"type": "context", "used": cur["used"], "limit": cur["limit"],
                   "ratio": cur["ratio"], "compressed": False})
             if cur["used"] > cur["limit"] * context_mod.TRIGGER_RATIO:
                 emit({"type": "compact", "phase": "start",
                       "message": "上下文接近上限，正在压缩较早的对话…"})
-                ev = context_mod.maybe_compress(session, cfg, provider)
+                ev = context_mod.maybe_compress(session, cfg, provider,
+                                                hard_cap=hard_cap, online=not is_local)
                 if ev:
                     save_session(session)
                     emit(ev)
@@ -519,17 +543,10 @@ class Assistant:
         final_text = ""
         error = ""
         rounds = 0
-        model_name = ""
 
-        try:
-            model_name = provider.resolve_model(model or provider_cfg.get("model") or "")
-            emit({"type": "model", "model": model_name,
-                  "provider": provider_cfg.get("id")})
-        except ProviderError as e:
-            emit({"type": "error", "message": str(e)})
-            with self._lock:
-                self._running[session_id] = False
-            return {"ok": False, "error": str(e)}
+        # model_name 已在前面解析（含 ProviderError 处理）；这里只下发模型事件。
+        emit({"type": "model", "model": model_name,
+              "provider": provider_cfg.get("id")})
 
         def on_delta(channel: str, piece: str) -> None:
             if channel == "reset":

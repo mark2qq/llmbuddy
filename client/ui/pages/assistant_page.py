@@ -1257,8 +1257,8 @@ class AssistantPage(QWidget):
         self._ws_btn.setObjectName("BarChip")
         _compact_chip(self._ws_btn)
         self._ws_btn.setCursor(Qt.PointingHandCursor)
-        self._ws_btn.setToolTip("切换文件工具可访问的工作区")
-        self._ws_btn.clicked.connect(self._choose_workspace)
+        self._ws_btn.setToolTip("选择任务所属空间（点击切换；其他目录…可选未登记目录）")
+        self._ws_btn.clicked.connect(self._show_workspace_menu)
         bar.addWidget(self._ws_btn)
 
         self._policy_btn = QPushButton("⊘ 自动")
@@ -1900,10 +1900,11 @@ class AssistantPage(QWidget):
         add.setObjectName("NavSubAdd")
         add.setFixedSize(20, 20)
         add.setCursor(Qt.PointingHandCursor)
-        # 口径（对齐 WorkBuddy）：任务区的 + 只在「当前没有进入某个空间」时
-        # 建到系统默认空间；已经在某空间里工作时建到该空间。
-        # 想明确指定空间：空间行右键「在此空间新建任务」。
-        add.setToolTip("新建任务（默认落在系统默认空间；在某空间内则落在该空间）")
+        # 口径（对齐 WorkBuddy）：任务区的 + 一律建到「系统默认空间」，
+        # 不再继承上一次激活的空间（避免「回到任务区点 + 又建到老空间」）。
+        # 想落进具体空间：空间行右键「在此空间新建任务」，或建完后点输入框
+        # 左侧工作区选择器切到其他现有空间。
+        add.setToolTip("新建任务（落在系统默认空间；下方输入框可切换到其他空间）")
         add.clicked.connect(lambda: self._new_session())
         head.addWidget(add)
         lay.addLayout(head)
@@ -3903,19 +3904,24 @@ class AssistantPage(QWidget):
     # ------------------------------------------------------------------ #
     # 任务
     # ------------------------------------------------------------------ #
-    def _new_session(self, silent: bool = False) -> None:
+    def _new_session(self, silent: bool = False, space: str = "") -> None:
         # 当前任务本来就是空的（0 条消息）就直接复用，别再建一个：
         # 反复点左栏「+」或来回切页会攒出一长串「新任务（0 条）」。
         # 多任务并行补充：当前任务**正在跑**时绝不复用（那会顶掉正在生成的回答）。
         cur = next((s for s in self._session_rows
                     if s.get("id") == self._session_id), None)
-        # 归属口径（2026-10-28，对齐 WorkBuddy）：
-        #   ① 用户正在某个空间里工作（`_current_space` 有值）→ 新任务落在该空间；
-        #   ② 不在任何空间内 → 落**系统默认空间**，左栏「任务」区就是它的列表。
-        # 旧实现会退回 `state["workspace"]`（全局工作区，可能被设置页改成任意
-        # 目录），于是「不在空间内新建」的任务既不进任务区、也不进具名空间，
-        # 看起来像凭空消失。现在只认这两个来源，不再看全局工作区。
-        active_ws = self._current_space or self._default_ws()
+        # 归属口径（2026-10-28 修，2026-10-28 再对齐用户反馈）：
+        #   - 显式指定空间（space 非空，来自空间右键「在此空间新建任务」）→ 落该空间；
+        #   - 否则（任务区 + / 清单中心「新建任务」等非空间入口）→ 落**系统默认空间**。
+        # 不再看 `_current_space`：那是「上一次激活的空间」，会让非空间入口的新建
+        # 凭空落到老空间（用户截图反馈：在任务区点 +，输入框却选中了 newspace）。
+        active_ws = _norm_ws(space) or self._default_ws()
+        # 非空间入口立即把输入框工作区指回默认空间，给出可见反馈（建完后再由
+        # `_sync_workspace_to_task` 兜底同步一次，值相同不冲突）。
+        if not space:
+            self._current_space = ""
+            self._state["workspace"] = active_ws
+            self._refresh_ws_btn(active_ws)
         if (not silent and cur is not None and not cur.get("message_count")
                 and not self._busy
                 and self._task_ws(cur) == active_ws):
@@ -5571,6 +5577,88 @@ class AssistantPage(QWidget):
         w.start()
         label = next((lb for p, lb, _t in POLICY_ITEMS if p == pid), pid)
         self._set_status(f"审批策略已更新：{label}")
+
+    # ------------------------------------------------------------------ #
+    # 工作区 / 空间选择器（输入框底栏「工作区」按钮）
+    # ------------------------------------------------------------------ #
+    def build_workspace_menu(self) -> "QMenu":
+        """工作区选择器：列出「系统默认空间」+ 当前所有已登记空间。
+
+        对齐 WorkBuddy：输入框左侧的工作区按钮是一枚**空间选择器**，点选即把
+        当前任务改归属到该空间（同步文件工具沙箱根）。「其他目录…」仍走原生
+        自绘目录框，支持选一个尚未登记成空间的新目录。
+        """
+        menu = QMenu(self._dialog_parent())
+        menu.setObjectName("WorkspaceMenu")
+        menu.setToolTipsVisible(True)
+        default = self._default_ws()
+        cur = _norm_ws(self._current_space) or default
+        # ① 系统默认空间（非空间入口新建的任务都落这里）
+        dname = os.path.basename(default.rstrip("\\/")) or default
+        a = menu.addAction(f"系统默认空间 · {dname}")
+        a.setObjectName("WsDefault")
+        a.setCheckable(True)
+        a.setChecked(cur == default)
+        a.setData(default)
+        a.setToolTip(f"系统默认工作区：{default}\n（任务区 + 新建的任务都落这里）")
+        # ② 已登记的全部空间（不含默认空间本身，避免重复）
+        for sp in sorted(self._nav_spaces,
+                         key=lambda s: str(s.get("name") or "")):
+            path = _norm_ws(sp.get("path") or "")
+            if not path or path == default:
+                continue
+            act = menu.addAction(str(sp.get("name") or path))
+            act.setCheckable(True)
+            act.setChecked(cur == path)
+            act.setData(path)
+            act.setToolTip(f"空间：{path}")
+        menu.addSeparator()
+        other = menu.addAction("其他目录…")
+        other.setObjectName("WsOther")
+        other.setData("")          # 空 data = 走原生目录选择框
+        other.setToolTip("选择未登记的工作区目录")
+        menu.triggered.connect(self._on_workspace_menu_pick)
+        return menu
+
+    def _show_workspace_menu(self) -> None:
+        self.build_workspace_menu().exec(
+            self._ws_btn.mapToGlobal(self._ws_btn.rect().bottomLeft()))
+
+    def _on_workspace_menu_pick(self, action) -> None:
+        if action is None:
+            return
+        path = action.data()
+        if not path:                # 「其他目录…」
+            self._choose_workspace()
+            return
+        self._switch_current_task_to_space(str(path))
+
+    def _switch_current_task_to_space(self, path: str) -> None:
+        """把当前任务改归属到指定空间，并同步文件工具沙箱根。
+
+        非空间入口（任务区 + / 清单中心）新建的任务默认在默认空间；用户可在
+        输入框左侧工作区选择器里把它切到任意已登记空间，等价于 WorkBuddy 把
+        任务挂到某个文件夹下。
+        """
+        p = _norm_ws(path)
+        if not p:
+            return
+        name = os.path.basename(p.rstrip("\\/")) or p
+        self._current_space = p
+        self._state["workspace"] = p
+        self._refresh_ws_btn(p)
+        self._remember_workspace(p)
+        self._set_status(f"已切换到空间：{name}")
+        sid = self._session_id
+        if sid:
+            # 真实任务：把它的 workspace 字段改写，导航随即按新空间重新分组
+            w = Worker(self._assist.update_session, sid, {"workspace": p})
+            w.result.connect(lambda _r: self.refresh())
+            w.error.connect(lambda m: self._set_status(f"切换空间失败：{m}"))
+            w.start()
+        else:
+            # 草稿态（还没有任务）：仅切换文件沙箱根显示，等真正建任务时再归属
+            self._fill_sessions()
 
     def _choose_workspace(self) -> None:
         """切换工作区（文件工具的沙箱根）。
