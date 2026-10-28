@@ -53,7 +53,14 @@ class SkillError(RuntimeError):
 # 解析
 # ----------------------------------------------------------------------------
 def parse_skill_md(text: str) -> Dict[str, Any]:
-    """解析 SKILL.md：返回 {meta, body}。frontmatter 非法时 meta 为空。"""
+    """解析 SKILL.md：返回 {meta, body}。frontmatter 非法时 meta 为空。
+
+    除 `name / description / tools` 外，还规整三类「默认技能」字段
+    （1.0.12，见 docs/智能助理-默认技能与工具-架构设计.md）：
+      - `triggers`：自动加载的触发词（list 或 "a, b" 或 "a、b"）
+      - `auto_load`：是否参与按需自动加载（默认技能包为 true）
+      - `priority`：同分时的优先级（数值大者先）
+    """
     meta: Dict[str, Any] = {}
     body = text or ""
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", body, re.S)
@@ -77,7 +84,45 @@ def parse_skill_md(text: str) -> Dict[str, Any]:
     meta["name"] = name
     meta["description"] = desc
     meta["tools"] = [str(t) for t in tools] if isinstance(tools, list) else []
+    meta["triggers"] = _as_list(meta.get("triggers"))
+    meta["auto_load"] = _as_bool(meta.get("auto_load"), default=False)
+    meta["default"] = bool(meta.get("builtin")) or _as_bool(meta.get("default"))
+    meta["priority"] = _as_int(meta.get("priority"), 0)
+    meta["bundle_version"] = _as_int(meta.get("bundle_version"), 0)
     return {"meta": meta, "body": body.strip()}
+
+
+def _as_list(raw: Any) -> List[str]:
+    """frontmatter 里的列表字段：兼容 YAML list / 逗号 / 顿号 / 全角逗号。"""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip().strip("[]")
+        text = text.replace("，", ",").replace("、", ",")
+        raw = [t for t in text.split(",")]
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: List[str] = []
+    for item in raw:
+        val = str(item).strip().strip('"').strip("'")
+        if val and val not in out:
+            out.append(val)
+    return out
+
+
+def _as_bool(raw: Any, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "是")
+
+
+def _as_int(raw: Any, default: int = 0) -> int:
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def _dir_size(path: str) -> int:
@@ -119,6 +164,12 @@ def list_skills() -> List[Dict[str, Any]]:
             "tools": meta.get("tools") or [],
             "version": str(meta.get("version") or "1.0.0"),
             "builtin": bool(meta.get("builtin")),
+            # ---- 默认技能 / 自动加载（1.0.12）----
+            "default": bool(meta.get("default")),
+            "auto_load": bool(meta.get("auto_load")),
+            "triggers": list(meta.get("triggers") or []),
+            "priority": int(meta.get("priority") or 0),
+            "bundle_version": int(meta.get("bundle_version") or 0),
             "files": sorted(os.listdir(d)),
             "size": _dir_size(d),
             "updated_at": os.path.getmtime(md),
@@ -613,89 +664,66 @@ def install_from_url(bundle: Dict[str, Any], slug: str = "",
 
 
 # ----------------------------------------------------------------------------
-# 内置示例技能（首次运行时落地，用户可改可删）
+# 默认技能包（WorkBuddy 初始基础技能，首次运行落地 / 升级时按版本覆盖）
+#
+# 内容与元数据单一来源在 `core/assistant/bundled.py`（slug / 触发词 / 正文）。
+# 这里只负责落盘：缺失就写、`bundle_version` 更小就升级、**用户自建的同名
+# 技能（frontmatter 没有 builtin: true）一律不碰**。
 # ----------------------------------------------------------------------------
-BUILTIN_SKILLS: Dict[str, str] = {
-    "workspace-organizer": """---
-name: workspace-organizer
-description: 把工作区里散落的文件按类型归档到子目录，并生成归档报告
-tools: [fs_list, fs_read, fs_info, fs_move, fs_mkdir]
-version: 1.0.0
-builtin: true
----
-# 目标
-把当前工作区根目录下散落的文件，按「文档 / 图片 / 表格 / 代码 / 压缩包 / 其它」
-六类归档到对应子目录，并输出一份归档清单。
+def install_default_skills() -> List[str]:
+    """落地 / 升级随包默认技能，返回本次真正写入的 slug 列表（幂等）。"""
+    from core.assistant import bundled
 
-# 执行要求
-1. 用 fs_list 查看工作区根目录（recursive=false），先弄清有哪些文件；
-2. 只处理文件，不处理已存在的子目录，也不要动 .trash；
-3. 目标目录名固定为：文档、图片、表格、代码、压缩包、其它；
-4. 用 fs_move 逐个移动；移动前如果目标目录不存在，先 fs_mkdir；
-5. 最后输出 Markdown 表格：原文件名 | 类型 | 去向；并给出总计数量。
-
-# 约束
-- 不删除任何文件；
-- 不确定类型的文件放进「其它」；
-- 遇到同名冲突时在文件名后加 -1、-2。
-""",
-    "repo-digest": """---
-name: repo-digest
-description: 扫描一个代码目录，产出结构、技术栈、关键模块与风险的摘要报告
-tools: [fs_list, fs_glob, fs_read, fs_grep]
-version: 1.0.0
-builtin: true
----
-# 目标
-对指定目录做一次代码库体检，输出一份可直接给人看的中文摘要。
-
-# 执行要求
-1. fs_list 看顶层结构；fs_glob 找 README*、package.json、pyproject.toml、
-   requirements.txt、*.sln、pom.xml 等项目标识文件；
-2. 读 2-4 个最关键的入口文件（main / app / serve / index），不要通读全库；
-3. 归纳：做了什么、技术栈、目录职责、启动方式、明显风险（硬编码密钥、
-   缺失测试、异常吞噬等）；
-4. 输出结构：一句话定位 / 技术栈 / 目录地图 / 关键流程 / 风险清单 / 建议。
-
-# 约束
-- 单文件读取不超过 200 行；
-- 不修改任何文件；
-- 没有证据的结论不要写。
-""",
-    "web-brief": """---
-name: web-brief
-description: 抓取一个网页并提炼要点，输出中文简报
-tools: [web_fetch]
-version: 1.0.0
-builtin: true
----
-# 目标
-把给定 URL 的内容压缩成 200-400 字的中文简报。
-
-# 执行要求
-1. web_fetch 抓取正文（max_chars 12000）；
-2. 提炼：主题、3-6 条关键信息、对读者有用的结论或行动项；
-3. 输出格式：标题 / 三行摘要 / 要点列表 / 原文链接。
-
-# 约束
-- 只基于抓到的正文，不编造；
-- 页面抓取失败时直接说明失败原因。
-""",
-}
-
-
-def ensure_builtin_skills() -> None:
-    """首次运行时落地内置技能（不覆盖用户已修改的同名技能）。"""
     ensure_dirs()
-    for slug, content in BUILTIN_SKILLS.items():
+    written: List[str] = []
+    for slug, text in bundled.skill_files().items():
         d = os.path.join(SKILLS_DIR, slug)
-        if os.path.isdir(d):
-            continue
+        md = os.path.join(d, "SKILL.md")
+        if os.path.isfile(md):
+            try:
+                with open(md, "r", encoding="utf-8", errors="replace") as f:
+                    cur = parse_skill_md(f.read())["meta"]
+            except OSError:
+                continue
+            if not cur.get("builtin"):
+                continue            # 用户自己的同名技能：绝不覆盖
+            cur_ver = int(cur.get("bundle_version") or 0)
+            if cur_ver >= int(bundled.BUNDLE_VERSION):
+                continue            # 已是最新
         try:
             os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
-                f.write(content)
+            with open(md, "w", encoding="utf-8") as f:
+                f.write(text)
+            written.append(slug)
         except OSError:
             continue
-    # 安装覆盖会累积 `.backup-<ts>`；启动时收敛到最近 5 份，避免无限增长
+    if written:
+        audit("default_skills_installed", slugs=written,
+              version=int(bundled.BUNDLE_VERSION))
+    return written
+
+
+def _default_skill_files() -> Dict[str, str]:
+    """随包默认技能全文（导入期即算好，兼容旧调用方读 `BUILTIN_SKILLS`）。
+
+    `bundled` 不反向依赖本模块，所以这里没有循环导入；万一 `bundled` 坏了，
+    退化为空表——默认技能装不上，但技能管理本身照常工作。
+    """
+    try:
+        from core.assistant import bundled
+        return dict(bundled.skill_files())
+    except Exception:
+        return {}
+
+
+#: 兼容旧名字：`{slug: SKILL.md}` 全量（1.0.11 及以前是手写的 3 个）
+BUILTIN_SKILLS: Dict[str, str] = _default_skill_files()
+
+def ensure_builtin_skills() -> None:
+    """启动自检：补齐 / 升级默认技能，并把安装备份收敛到最近 5 份。"""
+    try:
+        install_default_skills()
+    except Exception:
+        # 默认技能装不上不能拖垮整个助理模块（用户自己装的技能照常可用）
+        pass
     prune_backups()

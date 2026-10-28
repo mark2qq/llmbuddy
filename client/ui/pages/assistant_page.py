@@ -3506,12 +3506,17 @@ class AssistantPage(QWidget):
             slug = str(s.get("slug") or "")
             name = s.get("name") or slug
             ver = str(s.get("version") or "1.0.0")
-            badge = {"builtin": "[内置]", "online": "[在线]",
-                     "local": "[已装]"}.get(self._skill_source_of(s), "[已装]")
+            badge = ("[默认]" if s.get("default")
+                     else {"builtin": "[内置]", "online": "[在线]",
+                           "local": "[已装]"}.get(self._skill_source_of(s), "[已装]"))
             desc = str(s.get("description") or "").strip() or "（无描述）"
             item = QListWidgetItem(f"{badge} {name} · v{ver}\n{desc}")
             item.setData(Qt.UserRole, slug)
+            trig = "、".join(s.get("triggers") or [])
+            auto_note = ("是" if s.get("auto_load") else "否") + (
+                f"（触发词：{trig}）" if trig else "")
             item.setToolTip(f"{name}\n{desc}\n来源：{badge}\n"
+                            f"按需自动加载：{auto_note}\n"
                             f"工具：{'、'.join(s.get('tools') or []) or '（未限制）'}")
             lst.addItem(item)
             if slug and slug == keep:
@@ -3561,7 +3566,13 @@ class AssistantPage(QWidget):
             cb.setToolTip(f"启用 / 禁用「{name}」（禁用后不下发给模型）")
             cb.toggled.connect(lambda on, n=name: self._toggle_tool(n, on))
             row_lay.addWidget(cb)
-            text = QLabel(f"{name}   {risk}   {src}")
+            meta = t.get("meta") if isinstance(t.get("meta"), dict) else {}
+            tags = []
+            if meta.get("default"):
+                tags.append("默认")
+            if meta.get("group"):
+                tags.append(str(meta.get("group")))
+            text = QLabel("   ".join([name, risk, src] + tags))
             text.setObjectName("HubToolName")
             if name in over:
                 text.setToolTip("超出上限未下发（提高上限或在工具清单里调整顺序）")
@@ -4510,15 +4521,27 @@ class AssistantPage(QWidget):
         if self._cur_sid == self._active_sid:
             self._set_status(PHASE_TEXT.get(phase, "助理正在工作…"))
 
-    # ---------------- 自动加载（1.0.8，P0-6） ----------------
+    # ---------------- 自动加载（1.0.8，P0-6；1.0.12 加默认技能） ----------------
     def _on_auto_loaded(self, info: Dict[str, Any]) -> None:
-        """`start.auto_loaded` → 1.0.9 起不再在对话流里提示。
+        """`start.auto_loaded` → 对话流里仍然不提示，只在状态行交代一句。
 
-        参照 WorkBuddy：技能 / 工具的加载过程对用户不可见（后台静默装配，
-        细节在管理面板与审计页可查）。这里保留接缝与 `_auto_off` 语义，
-        但不渲染任何 widget、不打扰对话流。
+        参照 WorkBuddy：技能 / 工具的装配过程对用户不可见（后台静默完成，
+        细节在管理面板与审计页可查）。1.0.12 起默认技能会自动加载，用户需要
+        知道「为什么这次回答里有技能味」，所以在输入框上方的状态行写一行
+        「已自动加载技能：文档撰写」——不进对话流、不建 widget、不刷屏。
         """
-        return
+        if not isinstance(info, dict) or info.get("source") != "default":
+            return
+        if not self._auto_load_on():
+            return
+        names = [str(n) for n in (info.get("names") or []) if str(n).strip()]
+        if not names:
+            names = [str(s) for s in (info.get("skills") or []) if str(s).strip()]
+        if not names:
+            return
+        self._set_status(
+            f"已自动加载技能：{'、'.join(names)}"
+            "（可在 [技能] 菜单里关闭自动加载）")
 
     def _auto_load_on(self) -> bool:
         """自动加载是否开启（本会话 _auto_off 优先，其次 GET /profiles 快照）。"""
@@ -5534,9 +5557,10 @@ class AssistantPage(QWidget):
 
         # ---- 自动加载开关（PRD §5.4.3 第 3 条）----
         on = self._auto_load_on()
-        auto = menu.addAction(f"自动加载：{'开' if on else '关'}")
-        auto.setToolTip("按需求自动挂载常用技能并收紧工具白名单。\n"
-                        "关闭后本轮与后续都不再自动加载（可在设置里重新打开）")
+        auto = menu.addAction(f"默认技能自动加载：{'开' if on else '关'}")
+        auto.setToolTip("装好即用的默认技能（文档撰写 / 表格分析 / 多源调研…）"
+                        "会按本轮需求自动加载，并把这些技能建议的工具排到最前。\n"
+                        "关闭后本轮与后续都不再自动加载（profile 与默认技能一并停用）")
         auto.triggered.connect(lambda _c=False: self._set_auto_load(not on))
         menu.addSeparator()
 
@@ -5563,6 +5587,10 @@ class AssistantPage(QWidget):
                 elif full:
                     tip = f"{tip}\n已挂载 {self.MAX_SKILLS} 个，先移除一个" if tip \
                         else f"已挂载 {self.MAX_SKILLS} 个，先移除一个"
+                if s.get("auto_load") and not mounted:
+                    trig = "、".join((s.get("triggers") or [])[:5])
+                    tip += ("\n默认技能：命中需求会自动加载"
+                            + (f"（如 {trig}）" if trig else ""))
                 act.setToolTip(tip)
                 act.setCheckable(True)
                 act.setChecked(mounted)
@@ -5606,8 +5634,14 @@ class AssistantPage(QWidget):
         return menu
 
     def _skill_badge(self, s: Dict[str, Any]) -> str:
-        """技能的来源徽标：内置 `[内置]` / 在线已装 `[在线]`（PRD §5.2 前置标识）。"""
+        """技能的来源徽标：默认 `[默认]` / 内置 `[内置]` / 在线已装 `[在线]`。
+
+        1.0.12：随包默认技能打 `[默认]`（它们会按需求自动加载），
+        用户自己装的技能保持 `[内置]/[在线]` 语义不变。
+        """
         slug = str(s.get("slug") or "")
+        if s.get("default"):
+            return "  [默认]"
         if s.get("builtin"):
             return "  [内置]"
         src = (self._state.get("skill_sources") or {}).get(slug) or {}

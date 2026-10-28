@@ -20,7 +20,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import pytest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFileDialog  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel  # noqa: E402
 
 from ui.widgets import assistant_cards as cards_mod  # noqa: E402
 from ui.widgets.assistant_cards import AutoLoadPrompt, StepLine  # noqa: E402
@@ -1195,3 +1195,55 @@ def test_bottom_bar_fits_with_context_meter(page):
     w = _bar_width(p)
     avail = p._composer.width() - 16      # 减去 composer 左右内边距
     assert w <= avail, f"带上下文占用的忙碌态底栏 {w}px 超可用宽 {avail}px"
+
+
+# --------------------------------------------------------------------------- #
+# 1.0.12：默认技能 / 默认工具标记
+# --------------------------------------------------------------------------- #
+def test_default_skill_badge(page):
+    """随包默认技能打 [默认]，用户自建的（builtin 但非 default）仍是 [内置]。"""
+    p, _fake = page
+    assert p._skill_badge({"slug": "doc-writer", "default": True}) == "  [默认]"
+    assert p._skill_badge({"slug": "x", "builtin": True}) == "  [内置]"
+    assert p._skill_badge({"slug": "my", "builtin": False}) == ""
+
+
+def test_default_tool_rows_marked(page):
+    """工具行标出「默认」与分组（meta.default / meta.group 来自后端）。"""
+    p, _fake = page
+    dlg = ManagerDialog(p)
+    try:
+        dlg.show_tab("tools")
+        rows = [{"name": "fs_read", "description": "读文件", "risk": "low",
+                 "source": "builtin", "enabled": True,
+                 "meta": {"default": True, "group": "文件"}},
+                {"name": "shell_run", "description": "执行命令", "risk": "high",
+                 "source": "builtin", "enabled": True,
+                 "meta": {"default": True, "group": "命令"}}]
+        p._fill_tools(rows)
+        _settle()
+        texts = [w.text() for w in p._tool_list.findChildren(QLabel)]
+        assert any("默认" in t and "fs_read" in t for t in texts), texts
+        assert any("命令" in t for t in texts), texts
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+        _settle()
+
+
+def test_skill_menu_marks_auto_load_defaults(page):
+    """技能菜单里的默认技能带 [默认] 且 tooltip 说明会自动加载。"""
+    p, _fake = page
+    p._state["skills"] = [{"slug": "doc-writer", "name": "文档撰写",
+                           "description": "写文档", "tools": ["fs_write"],
+                           "auto_load": True, "default": True,
+                           "triggers": ["周报", "写报告"]}]
+    menu = p._build_skill_menu()
+    try:
+        texts = [a.text() for a in menu.actions() if a.text()]
+        assert any("文档撰写" in t and "[默认]" in t for t in texts), texts
+        tip = [a.toolTip() for a in menu.actions() if "文档撰写" in a.text()][0]
+        assert "自动加载" in tip and "周报" in tip
+    finally:
+        menu.deleteLater()
+        _settle()

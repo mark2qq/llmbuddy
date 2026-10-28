@@ -82,21 +82,24 @@ class _FakeResp:
 def test_default_config_has_new_keys(env):
     """5 个新字段必须在 _default_config() 里，否则 load_config 读不到（D7）。"""
     cfg = store_mod.load_config()
-    for key in ("tool_prefs", "auto_load", "profiles", "catalog", "skill_sources"):
+    for key in ("tool_prefs", "auto_load", "profiles", "catalog", "skill_sources",
+                "auto_skill_off", "auto_skill_limit"):
         assert key in cfg, key
+    assert cfg["auto_skill_off"] == [] and cfg["auto_skill_limit"] == 2
     assert cfg["tool_prefs"]["max_tools"] == store_mod.DEFAULT_MAX_TOOLS
     assert cfg["tool_prefs"]["disabled"] == []
     assert cfg["auto_load"] is True
-    assert isinstance(cfg["profiles"], list) and len(cfg["profiles"]) == 3
+    assert isinstance(cfg["profiles"], list) and len(cfg["profiles"]) == 4
     assert {p["id"] for p in cfg["profiles"]} == {"file-organize", "code-read",
-                                                  "web-research"}
+                                                  "code-detail", "web-research"}
     assert cfg["catalog"]["ttl_hours"]["gh_skills"] == 168
     assert cfg["skill_sources"] == {}
     # 落盘后 json 文件里也必须有（save_config 不能把新字段吞掉）
     store_mod.save_config({})
     with open(store_mod.CONFIG_PATH, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    for key in ("tool_prefs", "auto_load", "profiles", "catalog", "skill_sources"):
+    for key in ("tool_prefs", "auto_load", "profiles", "catalog", "skill_sources",
+                "auto_skill_off", "auto_skill_limit"):
         assert key in raw, key
 
 
@@ -617,8 +620,10 @@ def test_match_profile_blank_text():
 
 
 def test_match_profile_is_case_insensitive():
+    # 1.0.12 起「review」同时命中 code-read / code-detail，同分取 priority 高的
+    # code-detail（25 > 20）；这里只验大小写不敏感，具体归属由下面的用例守。
     got = profiles_mod.match_profile("please REVIEW this", None, ALL_SKILLS)
-    assert got is not None and got["id"] == "code-read"
+    assert got is not None and "review" in got["matched"]
 
 
 def test_ensure_builtin_profiles_does_not_overwrite(env):

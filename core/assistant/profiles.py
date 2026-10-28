@@ -25,7 +25,7 @@ def _builtin() -> List[Dict[str, Any]]:
     return _default_profiles()
 
 
-#: 3 个内置 profile（随包落地，`ensure_builtin_profiles` 首次写入 config.json）
+#: 4 个内置 profile（随包落地，`ensure_builtin_profiles` 首次写入 config.json）
 BUILTIN_PROFILES: List[Dict[str, Any]] = _builtin()
 
 
@@ -33,7 +33,7 @@ def ensure_builtin_profiles() -> None:
     """首次运行把内置 profile 落到 `config.json.profiles`，不覆盖用户改动。
 
     "不覆盖" 的口径：
-      - `profiles` 不存在 / 不是 list / 空 list -> 写入 3 个内置；
+      - `profiles` 不存在 / 不是 list / 空 list -> 写入 4 个内置；
       - 已存在：只**补**缺失的 id（老配置里少一个内置 profile 时补上），
         已存在的同 id 条目整个保留（用户改过的 triggers/tools 不回退）。
     任何异常都吞掉：配置补字段失败不能让整个助理模块起不来。

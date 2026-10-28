@@ -1078,6 +1078,11 @@ def _profiles_payload(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not isinstance(profiles, list) or not profiles:
         profiles = profiles_mod.BUILTIN_PROFILES
     return {"auto_load": bool(cfg.get("auto_load", True)),
+            # 1.0.12：默认技能按需自动加载的细粒度开关
+            #   auto_skill_off   用户停用自动加载的技能 slug
+            #   auto_skill_limit 单轮最多自动加载几个（0 = 关掉默认技能匹配）
+            "auto_skill_off": [str(s) for s in (cfg.get("auto_skill_off") or [])],
+            "auto_skill_limit": int(cfg.get("auto_skill_limit") or 2),
             "profiles": profiles}
 
 
@@ -1094,6 +1099,17 @@ async def put_profiles(body: Dict[str, Any]):
     patch: Dict[str, Any] = {}
     if "auto_load" in body:
         patch["auto_load"] = bool(body.get("auto_load"))
+    if "auto_skill_off" in body:
+        raw = body.get("auto_skill_off")
+        if not isinstance(raw, list):
+            return fail(2002, "auto_skill_off 必须是字符串数组")
+        patch["auto_skill_off"] = [str(s).strip() for s in raw if str(s).strip()]
+    if "auto_skill_limit" in body:
+        try:
+            val = int(body.get("auto_skill_limit"))
+        except (TypeError, ValueError):
+            return fail(2002, "auto_skill_limit 必须是整数")
+        patch["auto_skill_limit"] = max(0, min(val, 4))
     if "profiles" in body:
         incoming = body.get("profiles")
         if not isinstance(incoming, list):

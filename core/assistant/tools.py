@@ -82,6 +82,20 @@ def _risk_rank(r: str) -> int:
     return {"low": 0, "medium": 1, "high": 2}.get((r or "low").lower(), 0)
 
 
+#: 内置工具的分组（清单中心 / 文档展示用，不影响下发）
+TOOL_GROUPS = (("fs_", "文件"), ("shell_", "命令"), ("web_", "网络"),
+               ("skill_", "技能"))
+
+
+def tool_group(name: str) -> str:
+    """按工具名前缀归组：文件 / 命令 / 网络 / 技能 / 其它。"""
+    low = str(name or "").lower()
+    for prefix, label in TOOL_GROUPS:
+        if low.startswith(prefix):
+            return label
+    return "其它"
+
+
 class ToolRegistry:
     """工具集合。MCP / 技能会往这里动态注册。"""
 
@@ -199,15 +213,25 @@ class ToolRegistry:
 
     def select_schemas(self, disabled: Optional[Any] = None,
                        allow: Optional[Any] = None,
-                       max_tools: Optional[int] = None) -> List[Dict[str, Any]]:
+                       max_tools: Optional[int] = None,
+                       prefer: Optional[Any] = None) -> List[Dict[str, Any]]:
         """**下发的唯一出口**（架构 §5 A3）：过滤 + 排序 + 裁到 max_tools -> schema。
 
         参数全 None 时用 `set_filter()` 存的值；显式传入时以传入值为准
         （profile 收窄白名单用）。`max_tools <= 0` 表示不裁剪。
+
+        `prefer`（1.0.12）：本轮自动加载的默认技能建议使用的工具名集合。
+        命中者**排到最前**，让 `max_tools` 真的不够时被裁掉的是更边缘的工具
+        （MCP / 高危写入），而不是技能正需要的那几个。**只调整顺序，不增不减**
+        ——默认技能不裁剪工具是刻意的安全选择（见 bundled.py 说明）。
         """
         if max_tools is None:
             max_tools = self._filter.get("max_tools")
         tools = self.active(disabled=disabled, allow=allow)
+        pref = {str(x) for x in (prefer or []) if str(x).strip()}
+        if pref:
+            tools.sort(key=lambda t: (0 if t.name in pref else 1,
+                                      self._priority_key(t)))
         try:
             limit = int(max_tools)
         except (TypeError, ValueError):
@@ -441,6 +465,16 @@ class ToolRegistry:
              "required": ["name", "task"]},
             "medium", self._t_skill_run,
             summarize=lambda a: f"运行技能 {a.get('name')}：{str(a.get('task'))[:80]}")
+
+        # ---------------- 默认工具标记（1.0.12） ----------------
+        # 内置工具全部是「默认工具」：装好即下发、不需要用户逐个挂载。
+        # `default=True` 是给 UI（清单中心打「默认」标）与文档用的元数据，
+        # 不影响下发逻辑——下发只由 disabled / allow / max_tools 决定。
+        with self._lock:
+            for tool in self._tools.values():
+                if str(tool.source or "builtin") == "builtin":
+                    tool.meta.setdefault("default", True)
+                    tool.meta.setdefault("group", tool_group(tool.name))
 
     # ------------------------------------------------------------------ #
     # 文件工具实现

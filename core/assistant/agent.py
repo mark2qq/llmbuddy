@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core.assistant import store as store_mod
 from core.assistant import context as context_mod
+from core.assistant import defaults as defaults_mod
 from core.assistant import mcp as mcp_mod
 from core.assistant import profiles as profiles_mod
 from core.assistant import skills as skills_mod
@@ -451,9 +452,16 @@ class Assistant:
         mounted = [str(s) for s in (mounted_skills or []) if str(s).strip()]
         images = [str(p) for p in (attachments or []) if str(p).strip()]
 
-        # ---- 按需求自动加载（架构 §5 A3 + A4，PRD §5.4）----
+        # ---- 按需求自动加载（架构 §5 A3 + A4，PRD §5.4；1.0.12 加默认技能）----
+        # 优先级：用户手动挂载 > profile > 默认技能匹配 > L3 清单
         profile = self._match_profile(cfg, text, registry)
-        auto_loaded = self._auto_loaded_payload(profile, registry, cfg)
+        auto = self._auto_defaults(cfg, text, mounted, profile)
+        prefer: List[str] = []
+        for slug in auto.get("skills") or []:
+            meta = self._default_skill_metas([slug]).get(slug) or {}
+            prefer.extend(meta.get("tools") or [])
+        auto_loaded = self._auto_loaded_payload(profile, registry, cfg,
+                                               auto=auto, prefer=prefer)
 
         # 记录用户消息（原文，无前缀）；粘贴的图片挂在 images 上供历史回看
         user_msg: Dict[str, Any] = {"role": "user", "content": text,
@@ -487,12 +495,12 @@ class Assistant:
                   "compressed": False, "note": f"上下文统计失败：{e}"})
 
         # ---- 同源（A3）：schemas 只算一次，provider 与系统提示共用同一份 ----
-        schemas = self._select_schemas(cfg, registry, profile)
+        schemas = self._select_schemas(cfg, registry, profile, prefer=prefer)
         # 文本兜底协议的工具名白名单：模型幻觉出来的名字不能被当成调用执行
         tool_names = {str(t.get("name")) for t in registry.list() if t.get("name")}
         messages = self._build_messages(session, registry, cfg, schemas,
                                         mounted_skills=mounted, profile=profile,
-                                        attachments=images)
+                                        attachments=images, auto_skills=auto)
         final_text = ""
         error = ""
         rounds = 0
@@ -856,32 +864,55 @@ class Assistant:
     @staticmethod
     def _auto_loaded_payload(profile: Optional[Dict[str, Any]],
                              registry: ToolRegistry,
-                             cfg: Dict[str, Any]) -> Dict[str, Any]:
+                             cfg: Dict[str, Any],
+                             auto: Optional[Dict[str, Any]] = None,
+                             prefer: Optional[List[str]] = None,
+                             ) -> Dict[str, Any]:
         """`start.auto_loaded` 的载荷；未命中 -> 空 dict。
 
-        字段名是跨端接缝（任务分解 S3）：`profile / name / skills / tools`。
+        字段名是跨端接缝（任务分解 S3）：`profile / name / skills / tools`，
+        1.0.12 增补 `source`（`profile` / `default`）与 `names`（默认技能中文名），
+        老客户端只读前面四个字段，不受影响。
+
         `tools` 取**实际下发条数**，与同源裁剪一致，不重复计算。
         """
-        if profile is None:
-            return {}
         prefs = cfg.get("tool_prefs") if isinstance(cfg.get("tool_prefs"), dict) else {}
-        allow = profile.get("tools") or None
-        schemas = registry.select_schemas(
-            disabled=set(prefs.get("disabled") or []),
-            allow=allow,
-            max_tools=int(prefs.get("max_tools") or tools_mod.DEFAULT_MAX_TOOLS))
-        return {"profile": str(profile.get("id") or ""),
-                "name": str(profile.get("name") or ""),
-                "skills": [str(s) for s in (profile.get("skills") or [])][:MAX_AUTO_SKILLS],
-                "tools": len(schemas)}
+        disabled = set(prefs.get("disabled") or [])
+        try:
+            max_tools = int(prefs.get("max_tools") or tools_mod.DEFAULT_MAX_TOOLS)
+        except (TypeError, ValueError):
+            max_tools = tools_mod.DEFAULT_MAX_TOOLS
+        if profile is not None:
+            allow = profile.get("tools") or None
+            schemas = registry.select_schemas(disabled=disabled, allow=allow,
+                                              max_tools=max_tools)
+            return {"profile": str(profile.get("id") or ""),
+                    "name": str(profile.get("name") or ""),
+                    "skills": [str(s) for s in (profile.get("skills") or [])][:MAX_AUTO_SKILLS],
+                    "tools": len(schemas),
+                    "source": "profile"}
+        slugs = [str(s) for s in ((auto or {}).get("skills") or []) if str(s).strip()]
+        if not slugs:
+            return {}
+        schemas = registry.select_schemas(disabled=disabled, max_tools=max_tools,
+                                          prefer=prefer or ())
+        payload = defaults_mod.summarize(auto or {}, {})
+        payload.update({"profile": "", "name": "",
+                        "tools": len(schemas)})
+        payload["skills"] = slugs[:MAX_AUTO_SKILLS]
+        return payload
 
     def _select_schemas(self, cfg: Dict[str, Any], registry: ToolRegistry,
-                        profile: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                        profile: Optional[Dict[str, Any]],
+                        prefer: Optional[List[str]] = None,
+                        ) -> List[Dict[str, Any]]:
         """下发的**唯一** schema 列表（A3：provider 与系统提示共用）。
 
         过滤条件来自 `tool_prefs`；命中 profile 时额外收窄白名单
         （`allow=profile.tools`）。顺带 `set_filter()`，让 `/state` 的
         `enabled` 字段与本次下发口径一致（时序图图 2 第 15 步）。
+
+        `prefer`：本轮自动加载的默认技能建议的工具，排到最前（只调顺序）。
         """
         prefs = cfg.get("tool_prefs") if isinstance(cfg.get("tool_prefs"), dict) else {}
         disabled = {str(x) for x in (prefs.get("disabled") or [])}
@@ -892,14 +923,68 @@ class Assistant:
         allow = (profile.get("tools") or None) if profile else None
         registry.set_filter(disabled=disabled, allow=allow, max_tools=max_tools)
         return registry.select_schemas(disabled=disabled, allow=allow,
-                                       max_tools=max_tools)
+                                       max_tools=max_tools, prefer=prefer or ())
+
+    def _auto_defaults(self, cfg: Dict[str, Any], text: str,
+                       mounted: List[str],
+                       profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """按需求挑默认技能（1.0.12，见 core/assistant/defaults.py）。
+
+        优先级（高 → 低）在这里落地：
+          ① `mounted` 非空（用户手动挂载）→ 不自动加载，尊重用户显式选择；
+          ② 命中 profile → 不叠加（profile 已带技能 + 工具白名单，两套指令会打架）；
+          ③ `auto_load=false`（全局开关）→ 不加载；
+          ④ 否则按触发词打分，取 top-N。
+
+        Returns:
+            `{"skills": [...], "matched": {...}, "scores": {...}, "limit": n}`
+            或空 dict（不加载）。任何异常都退化为空 dict —— 不能让「锦上添花」
+            的自动加载把一轮对话搞挂。
+        """
+        if mounted or profile is not None:
+            return {}
+        if not bool(cfg.get("auto_load", True)):
+            return {}
+        try:
+            items = skills_mod.list_skills()
+        except Exception:
+            return {}
+        off = cfg.get("auto_skill_off") or []
+        if not isinstance(off, (list, tuple, set)):
+            off = []
+        try:
+            limit = int(cfg.get("auto_skill_limit") or defaults_mod.DEFAULT_LIMIT)
+        except (TypeError, ValueError):
+            limit = defaults_mod.DEFAULT_LIMIT
+        try:
+            return defaults_mod.select(text, items, off=off, limit=limit)
+        except Exception:
+            return {}
+
+    def _default_skill_metas(self, slugs: List[str]) -> Dict[str, Dict[str, Any]]:
+        """`{slug: {name, tools, description}}` —— 注入 system 用。"""
+        out: Dict[str, Dict[str, Any]] = {}
+        for slug in slugs or []:
+            try:
+                skill = skills_mod.load_skill(slug)
+            except Exception:
+                skill = None
+            if not skill:
+                out[slug] = {"name": slug, "tools": []}
+                continue
+            meta = skill.get("meta") or {}
+            out[slug] = {"name": str(meta.get("name") or slug),
+                         "tools": [str(t) for t in (meta.get("tools") or [])],
+                         "description": str(meta.get("description") or "")}
+        return out
 
     def _build_messages(self, session: Dict[str, Any], registry: ToolRegistry,
                         cfg: Dict[str, Any],
                         schemas: Optional[List[Dict[str, Any]]] = None,
                         mounted_skills: Optional[List[str]] = None,
                         profile: Optional[Dict[str, Any]] = None,
-                        attachments: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                        attachments: Optional[List[str]] = None,
+                        auto_skills: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """组装 messages（system + 压缩摘要 + 历史）。
 
         **工具清单从 `schemas` 渲染**（架构 §5 A3）：`registry.list()` 返回的是
@@ -936,7 +1021,7 @@ class Assistant:
             now=time.strftime("%Y-%m-%d %H:%M:%S"),
             # 不再 [:80] 截断：max_tools 上限 64 < 80，天然收敛（A3 说明 2）
             tool_list="\n".join(tools_desc) or "（暂无工具）")
-        system += self._skills_hint(cfg, profile, mounted_skills)
+        system += self._skills_hint(cfg, profile, mounted_skills, auto_skills)
 
         msgs: List[Dict[str, Any]] = [{"role": "system", "content": system}]
         history = [m for m in (session.get("messages") or [])
@@ -972,8 +1057,14 @@ class Assistant:
 
     def _skills_hint(self, cfg: Dict[str, Any],
                      profile: Optional[Dict[str, Any]],
-                     mounted_skills: Optional[List[str]] = None) -> str:
-        """system 尾部的技能段：命中 profile -> 指定技能；否则 -> 可用技能清单。
+                     mounted_skills: Optional[List[str]] = None,
+                     auto_skills: Optional[Dict[str, Any]] = None) -> str:
+        """system 尾部的技能段。四种情况，互斥且有序：
+
+        ① 命中 profile → 「本轮指定技能」（profile 自带的）
+        ② 用户手动挂载 → 「本轮指定技能」（用户挂的）
+        ③ 默认技能命中 → 「本轮自动加载的默认技能」+ 首个技能正文摘录
+        ④ 都没有 → 「可用技能」清单（L3 降级，让模型自己决定）
 
         只写进 system，**不进 message 正文**（架构 §5 A4：历史保持干净）。
         """
@@ -994,6 +1085,22 @@ class Assistant:
             return ("\n## 本轮指定技能\n用户明确指定使用技能："
                     + "、".join(mounted[:MAX_AUTO_SKILLS])
                     + "。请优先调用 skill_run 执行它们。\n")
+        # ---- 默认技能自动加载（1.0.12）----
+        auto_slugs = [str(s) for s in ((auto_skills or {}).get("skills") or [])
+                      if str(s).strip()]
+        if auto_slugs and bool(cfg.get("auto_load", True)):
+            metas = self._default_skill_metas(auto_slugs)
+            body = ""
+            try:
+                skill = skills_mod.load_skill(auto_slugs[0])
+                if skill:
+                    body = defaults_mod.excerpt(skill.get("body") or "")
+            except Exception:
+                body = ""
+            prefs = cfg.get("tool_prefs") if isinstance(cfg.get("tool_prefs"), dict) else {}
+            return defaults_mod.build_hint(
+                auto_skills or {}, metas, excerpt_body=body,
+                disabled_tools=prefs.get("disabled") or [])
         if not bool(cfg.get("auto_load", True)):
             return ""
         try:

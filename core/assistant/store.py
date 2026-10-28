@@ -76,7 +76,7 @@ MAX_MAX_TOOLS = 64
 
 
 def _default_profiles() -> List[Dict[str, Any]]:
-    """3 个内置 profile 的**拷贝**（PRD §5.4.2）。
+    """4 个内置 profile 的**拷贝**（PRD §5.4.2；1.0.12 新增 code-detail）。
 
     刻意不走 profiles.BUILTIN_PROFILES 的引用：store 是最底层的模块，
     import profiles 会形成循环依赖；两份常量的一致性由 profiles 的兜底逻辑
@@ -97,6 +97,17 @@ def _default_profiles() -> List[Dict[str, Any]]:
          "skills": ["repo-digest"],
          "tools": ["fs_list", "fs_glob", "fs_grep", "fs_read", "fs_info",
                    "skill_run"]},
+        # 1.0.12：把「审一段代码」从「体检整个仓库」里拆出来。原来 code-read 的
+        # 触发词「代码」「review」把「看看这段代码有没有 bug」也吞了，结果挂上
+        # 的是 repo-digest（整仓体检）——答非所问还慢。这里用更具体的触发词 +
+        # 更高 priority，让片段级审查命中 code-review 技能。
+        {"id": "code-detail", "name": "代码审查", "enabled": True,
+         "priority": 25,
+         "triggers": ["代码审查", "审查代码", "看看这段代码", "这段代码",
+                      "这段逻辑", "有没有bug", "有没有 bug", "重构建议",
+                      "代码质量", "review"],
+         "skills": ["code-review"],
+         "tools": ["fs_read", "fs_glob", "fs_grep", "fs_list", "skill_run"]},
         {"id": "web-research", "name": "网页调研", "enabled": True,
          "priority": 30,
          "triggers": ["网页", "链接", "文章", "抓取", "调研", "总结一下这",
@@ -171,6 +182,12 @@ def _default_config() -> Dict[str, Any]:
         # 这 5 个新字段必须在这里，否则老 config.json 读不到（架构 §1.1 D7）。
         "tool_prefs": {"disabled": [], "max_tools": DEFAULT_MAX_TOOLS},
         "auto_load": True,
+        # ---- 1.0.12：默认技能按需自动加载 ----
+        # auto_load=false 是总开关（关掉后 profile 与默认技能都不加载）；
+        # 只想停掉个别默认技能就把它加进 auto_skill_off（技能名 slug）。
+        # 两个 key 必须在这里声明，否则老 config.json 读不到（同 1.0.8 的坑）。
+        "auto_skill_off": [],
+        "auto_skill_limit": 2,
         "profiles": _default_profiles(),
         "catalog": _default_catalog(),
         "skill_sources": {},         # slug -> {kind, repo, ref, dir, commit, ...}

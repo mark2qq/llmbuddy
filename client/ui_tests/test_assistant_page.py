@@ -1411,6 +1411,47 @@ def test_space_menu_has_new_task_action(page):
 # ---------------------------------------------------------------------------
 # 1.0.11 新增：空间创建 / 提示词库（插入 + 管理 + ✨优化）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 1.0.12：默认技能自动加载
+# ---------------------------------------------------------------------------
+def test_auto_loaded_default_skill_reports_in_status_not_chat(page):
+    """默认技能自动加载 → 只在状态行交代一句，不往对话流里塞 widget。"""
+    p, _fake = page
+    p._auto_tips.clear()
+    p._set_status("")
+    before = p._msg_layout.count()
+    p._on_event({"type": "start", "session_id": "s1",
+                 "auto_loaded": {"source": "default",
+                                 "skills": ["doc-writer"],
+                                 "names": ["文档撰写"], "tools": 14}})
+    _pump(lambda: False, timeout=0.1)
+    assert p._status.text().startswith("已自动加载技能：文档撰写")
+    assert p._msg_layout.count() == before
+
+
+def test_auto_loaded_profile_source_keeps_status_quiet(page):
+    """profile 命中（1.0.8 老行为）仍然完全静默，状态行不动。"""
+    p, _fake = page
+    p._set_status("")
+    p._on_event({"type": "start", "session_id": "s1",
+                 "auto_loaded": {"source": "profile", "profile": "file-organize",
+                                 "name": "文件整理", "skills": [], "tools": 7}})
+    _pump(lambda: False, timeout=0.1)
+    assert p._status.text() == ""
+
+
+def test_auto_loaded_silent_when_auto_load_off(page):
+    """本会话关掉自动加载后，即使后端说加载了默认技能也不提示。"""
+    p, _fake = page
+    p._auto_off = True
+    p._set_status("")
+    p._on_event({"type": "start", "session_id": "s1",
+                 "auto_loaded": {"source": "default", "skills": ["doc-writer"],
+                                 "names": ["文档撰写"], "tools": 14}})
+    _pump(lambda: False, timeout=0.1)
+    assert p._status.text() == ""
+
+
 def test_composer_has_enhance_button_and_ctx_meter_moved_below(page):
     """底栏不再有「📝 提示词」；✨ 留在底栏，上下文占用改到输入框下方。"""
     p, _fake = page

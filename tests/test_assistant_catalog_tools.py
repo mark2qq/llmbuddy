@@ -979,7 +979,7 @@ def test_profiles_roundtrip(env):
     assert get["code"] == 0
     assert get["data"]["auto_load"] is True
     assert {p["id"] for p in get["data"]["profiles"]} == {
-        "file-organize", "code-read", "web-research"}
+        "file-organize", "code-read", "code-detail", "web-research"}
 
     put = asyncio.run(api.put_profiles({"auto_load": False}))
     assert put["code"] == 0 and put["data"]["auto_load"] is False
